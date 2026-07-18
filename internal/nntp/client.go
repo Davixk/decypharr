@@ -329,6 +329,12 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		// returnOrReleaseConn always releases the right semaphore slot.
 		var currentConn = conn
 		var currentProvider = connProvider
+		// errorProvider tracks the provider that produced the terminal callback
+		// error. currentProvider may already point at a freshly-acquired retry
+		// connection that has not executed fn yet, while connProvider always points
+		// at the first provider in this outer round. Neither is sufficient on its
+		// own once retries switch providers.
+		var errorProvider = connProvider
 		// Healthy streaming is the overwhelmingly common case. Avoid building
 		// retry configuration and invoking retry.Do unless the first execution
 		// actually fails. When it does fail, pendingErr lets the retry closure
@@ -350,6 +356,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				if execErr == nil {
 					return nil
 				}
+				errorProvider = currentProvider
 
 				var nntpErr *Error
 				if errors.As(execErr, &nntpErr) {
@@ -375,6 +382,9 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 							newConn, newProvider, connErr = c.getAnyAvailableConnection(ctx, providerExclusions{})
 						}
 						if connErr != nil {
+							if newProvider.Host != "" {
+								errorProvider = newProvider
+							}
 							return retry.Unrecoverable(connErr)
 						}
 						currentConn = newConn
@@ -423,15 +433,15 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		if errors.As(err, &nntpErr) {
 			switch nntpErr.Type {
 			case ErrorTypeArticleNotFound:
-				excludeForArticleNotFound(&exclusions, connProvider)
+				excludeForArticleNotFound(&exclusions, errorProvider)
 			case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
-				exclusions.excludeHost(connProvider.Host)
+				exclusions.excludeHost(errorProvider.Host)
 			default:
 				// Non-retriable error, return immediately
 				return err
 			}
 		} else if customerror.IsPanicError(err) {
-			exclusions.excludeHost(connProvider.Host)
+			exclusions.excludeHost(errorProvider.Host)
 		} else {
 			// Unknown error type - return immediately
 			return err
@@ -621,59 +631,55 @@ func (c *Client) raceForConnection(ctx context.Context, eligible []config.Usenet
 		}(provider)
 	}
 
-	// Close resultCh once all goroutines have finished so the receiver loop below
-	// can terminate without needing an explicit count.
+	// Close resultCh once all goroutines have finished. The winning caller may
+	// return before this happens; a background drainer then owns every remaining
+	// result and returns any extra connections to their pools.
 	go func() {
 		wg.Wait()
 		close(resultCh)
-		cancel()
 	}()
 
-	// Drain all results:
-	//  - First success becomes the winner; cancel() is called to stop remaining goroutines.
-	//  - Any subsequent successes (from goroutines that raced to completion before cancel
-	//    reached them) have their connections returned to the pool to prevent slot leaks.
-	//  - Errors are collected so we can return a meaningful error if there is no winner.
-	var winConn *Connection
-	var winProvider config.UsenetProvider
+	// Once this function returns a winner (or the parent context is canceled),
+	// the receiver must still be drained. resultCh is deliberately buffered so
+	// workers never depend on the caller staying in this loop, and every extra
+	// connection remains paired with exactly one returnOrReleaseConn call.
+	drainRemaining := func() {
+		go func() {
+			for r := range resultCh {
+				if r.conn != nil {
+					c.returnOrReleaseConn(r.conn, r.provider)
+				}
+			}
+		}()
+	}
+
 	var lastErr error
+	var lastErrProvider config.UsenetProvider
 
 	for {
 		select {
 		case r, ok := <-resultCh:
 			if !ok {
+				cancel()
 				// Channel closed — all goroutines have finished.
-				if winConn != nil {
-					return winConn, winProvider, nil
-				}
 				if lastErr != nil {
-					return nil, config.UsenetProvider{}, lastErr
+					return nil, lastErrProvider, lastErr
 				}
 				return nil, config.UsenetProvider{}, errors.New("failed to get connection from any provider")
 			}
 			if r.err == nil && r.conn != nil {
-				if winConn == nil {
-					winConn = r.conn
-					winProvider = r.provider
-					cancel() // Tell losing goroutines to stop ASAP.
-				} else {
-					// Extra winner arrived before cancel propagated — release it.
-					c.returnOrReleaseConn(r.conn, r.provider)
-				}
+				cancel() // Tell losing goroutines to stop ASAP.
+				drainRemaining()
+				return r.conn, r.provider, nil
 			} else if r.err != nil {
 				lastErr = r.err
+				lastErrProvider = r.provider
 			}
 		case <-ctx.Done():
-			// Parent context cancelled — cancel inner, drain remaining connections
-			// in background so we don't block the caller.
+			// Parent context cancelled — cancel inner and transfer ownership of all
+			// remaining results to the background drainer.
 			cancel()
-			go func() {
-				for r := range resultCh {
-					if r.conn != nil {
-						c.returnOrReleaseConn(r.conn, r.provider)
-					}
-				}
-			}()
+			drainRemaining()
 			return nil, config.UsenetProvider{}, ctx.Err()
 		}
 	}
@@ -810,6 +816,16 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 		return nil, NewConnectionError(fmt.Errorf("dial %s: %w", address, err))
 	}
 
+	// DialContext only covers establishment (and the TLS handshake for direct
+	// TLS). Greeting and AUTHINFO below use socket deadlines, so explicitly
+	// close the established socket when the acquisition context is canceled.
+	// This lets a losing raceForConnection worker stop immediately instead of
+	// holding its provider slot until HandshakeTimeout.
+	stopContextClose := context.AfterFunc(ctx, func() {
+		_ = netConn.Close()
+	})
+	defer stopContextClose()
+
 	// Optimize TCP socket (buffer sizing already applied pre-connect via
 	// Dialer.Control; this reinforces it and covers the TLS-wrapped conn).
 	if tcpConn, ok := netConn.(*net.TCPConn); ok {
@@ -861,6 +877,18 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 
 	// Clear deadline for normal operation
 	_ = netConn.SetDeadline(time.Time{})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_ = netConn.Close()
+		return nil, NewConnectionError(fmt.Errorf("connection setup canceled: %w", ctxErr))
+	}
+	if !stopContextClose() {
+		_ = netConn.Close()
+		ctxErr := ctx.Err()
+		if ctxErr == nil {
+			ctxErr = context.Canceled
+		}
+		return nil, NewConnectionError(fmt.Errorf("connection setup canceled: %w", ctxErr))
+	}
 
 	return conn, nil
 }
