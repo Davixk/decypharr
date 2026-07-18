@@ -8,6 +8,9 @@ on:
         required: true
         default: improved
         type: string
+  push:
+    tags:
+      - custom-image-*
 
 permissions:
   contents: read
@@ -20,6 +23,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/davixk/decypharr
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'improved' }}
 
 jobs:
   validate:
@@ -78,7 +82,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=${{ inputs.tag }}
+            type=raw,value=${{ env.RELEASE_TAG }}
             type=raw,value=latest
             type=sha,prefix=sha-
           labels: |
@@ -92,7 +96,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            VERSION=${{ inputs.tag }}
+            VERSION=${{ env.RELEASE_TAG }}
             CHANNEL=custom
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
