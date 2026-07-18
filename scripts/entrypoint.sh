@@ -1,4 +1,5 @@
 #!/bin/sh
+# This script must retain LF line endings so Alpine can resolve /bin/sh.
 set -e
 
 # Default values
