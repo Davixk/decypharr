@@ -29,13 +29,63 @@ type Storage struct {
 	dir         string
 	logger      zerolog.Logger
 
+	entryMutationLocks keyedLockPool
+	queueMutationLocks keyedLockPool
+	itemMutationLocks  keyedLockPool
+
 	healthCountsMu      sync.Mutex
 	healthCounts        map[HealthStatus]int
 	healthCountsBuiltAt time.Time
 }
 
+type keyedLockPool struct {
+	mu    sync.Mutex
+	locks map[string]*keyedLock
+}
 
+type keyedLock struct {
+	mu   sync.Mutex
+	refs int
+}
 
+func (p *keyedLockPool) lock(key string) func() {
+	p.mu.Lock()
+	if p.locks == nil {
+		p.locks = make(map[string]*keyedLock)
+	}
+	lock := p.locks[key]
+	if lock == nil {
+		lock = &keyedLock{}
+		p.locks[key] = lock
+	}
+	// Count both holders and waiters before blocking. That makes it safe to
+	// remove the key only after the final participant releases it.
+	lock.refs++
+	p.mu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		p.mu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(p.locks, key)
+		}
+		p.mu.Unlock()
+	}
+}
+
+func (s *Storage) lockEntryMutation(infohash string) func() {
+	return s.entryMutationLocks.lock(infohash)
+}
+
+func (s *Storage) lockQueueMutation(infohash string) func() {
+	return s.queueMutationLocks.lock(infohash)
+}
+
+func (s *Storage) lockItemMutation(name string) func() {
+	return s.itemMutationLocks.lock(name)
+}
 
 func createItemStores(baseDir string, baseConfig hybrid.Config) (map[string]*hybrid.Store, error) {
 	items := make(map[string]*hybrid.Store)
@@ -98,11 +148,25 @@ func NewStorage(dbPath string) (*Storage, error) {
 		dir:         dbPath,
 		logger:      log,
 	}
+	if count, err := s.MigrateStoreVersions(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("failed to migrate entry store versions: %w", err)
+	} else if count > 0 {
+		log.Info().Int("count", count).Msg("Assigned exact versions to legacy entry rows")
+	}
 
 	if count, err := s.MigrateMetadata(); err != nil {
-		log.Warn().Err(err).Msg("Metadata migration failed")
+		_ = s.Close()
+		return nil, fmt.Errorf("failed to migrate entry metadata: %w", err)
 	} else if count > 0 {
 		log.Info().Int("count", count).Msg("Migrated entry metadata to new format")
+	}
+
+	if count, err := s.reconcileEntryItemsAtStartup(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("failed to reconcile derived entry items: %w", err)
+	} else if count > 0 {
+		log.Info().Int("count", count).Msg("Rebuilt derived entry items from authoritative entries")
 	}
 
 	return s, nil
@@ -177,10 +241,19 @@ func (s *Storage) copyFrom(other *Storage) error {
 			continue
 		}
 		if err := p.from.ForEach(func(key string, value []byte) error {
-			return p.to.Put(key, value, nil)
+			var meta *hybrid.EntryMeta
+			if (p.name == "entries" || p.name == "queue") && key != "__migration_status__" {
+				var pb EntryProto
+				if err := proto.Unmarshal(value, &pb); err != nil {
+					return fmt.Errorf("decode %s entry %s metadata: %w", p.name, key, err)
+				}
+				meta = entryMetadata(ProtoToEntry(&pb))
+			}
+			return p.to.Put(key, value, meta)
 		}); err != nil {
 			return fmt.Errorf("failed to copy %s: %w", p.name, err)
 		}
 	}
-	return nil
+	_, err := s.MigrateStoreVersions()
+	return err
 }

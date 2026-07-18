@@ -19,7 +19,11 @@ const (
 
 // NZB represents a torrent-like structure for NZB files
 type NZB struct {
-	ID             string    `json:"id" msgpack:"id"`
+	ID string `json:"id" msgpack:"id"`
+	// Generation is an opaque lifecycle token. It changes whenever metadata for
+	// the same ID is replaced, allowing long-running parsers and streams to
+	// prove that they still own the durable NZB they started with.
+	Generation     string    `json:"generation,omitempty" msgpack:"generation,omitempty"`
 	Name           string    `json:"name" msgpack:"name"`
 	Title          string    `json:"title,omitempty" msgpack:"title,omitempty"`
 	Path           string    `json:"path,omitempty" msgpack:"path,omitempty"`

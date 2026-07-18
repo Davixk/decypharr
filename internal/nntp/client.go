@@ -334,7 +334,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		// actually fails. When it does fail, pendingErr lets the retry closure
 		// process that first error as attempt 1 so retry counts and failover
 		// behavior stay identical to the original path.
-		pendingErr := c.safeExecute(currentConn, fn)
+		pendingErr := c.safeExecute(ctx, currentConn, fn)
 		if pendingErr == nil {
 			c.returnOrReleaseConn(currentConn, currentProvider)
 			return nil
@@ -345,7 +345,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				if execErr != nil {
 					pendingErr = nil
 				} else {
-					execErr = c.safeExecute(currentConn, fn)
+					execErr = c.safeExecute(ctx, currentConn, fn)
 				}
 				if execErr == nil {
 					return nil
@@ -476,15 +476,31 @@ func (c *Client) getConnectionFromProvider(ctx context.Context, provider config.
 	}
 }
 
-// safeExecute wraps fn execution with panic recovery
-func (c *Client) safeExecute(conn *Connection, fn func(conn *Connection) error) (err error) {
+// safeExecute wraps fn execution with panic recovery and makes cancellation
+// interrupt blocking socket operations. Waiting for the cancellation callback
+// before returning prevents a connection from racing back into the pool while
+// Close is still in flight.
+func (c *Client) safeExecute(ctx context.Context, conn *Connection, fn func(conn *Connection) error) (err error) {
+	cancelComplete := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		defer close(cancelComplete)
+		_ = conn.Close()
+	})
+
 	defer func() {
+		if !stopCancel() {
+			<-cancelComplete
+		}
 		if r := recover(); r != nil {
 			c.logger.Error().
 				Interface("panic", r).
 				Str("host", conn.address).
 				Msg("Recovered from panic in NNTP operation")
 			err = customerror.NewPanicError(r)
+			return
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
 		}
 	}()
 	return fn(conn)

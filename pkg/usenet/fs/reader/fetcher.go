@@ -209,11 +209,6 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	// a single call is sufficient.  An outer retry loop would multiply the
 	// total attempts by retries×providers, leading to very long failure times.
 	err := sf.client.ExecuteWithFailover(downloadCtx, func(conn *nntp.Connection) error {
-		stopCancel := context.AfterFunc(downloadCtx, func() {
-			_ = conn.Close()
-		})
-		defer stopCancel()
-
 		// Get the segment writer for the disk cache.
 		writer := sf.cache.StreamWriter(segIdx)
 		if writer == nil {

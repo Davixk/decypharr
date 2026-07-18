@@ -1175,6 +1175,7 @@ func (dl *downloader) streamChunk(start, end int64) (int64, error) {
 		dl.dls.item.filename,
 		missingRange.Pos,
 		missingRange.Pos+missingRange.Size-1, // manager.Stream uses inclusive end
+		true,
 		writer,
 		nil,
 		"DFS",

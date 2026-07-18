@@ -149,6 +149,82 @@ func TestPrepareStreamRejectsNonContiguousSegmentMap(t *testing.T) {
 	}
 }
 
+func TestPrepareStreamsReconcilesMultipleFilesInOneMetadataPass(t *testing.T) {
+	store := newTestNZBStorage(t)
+	nzb := &storage.NZB{
+		ID:        "batch-prepare",
+		TotalSize: 13,
+		Files: []storage.NZBFile{
+			{
+				Name: "oversized.mkv",
+				Size: 10,
+				Segments: []storage.NZBSegment{
+					{Number: 1, MessageID: "one", Bytes: 4},
+					{Number: 2, MessageID: "two", Bytes: 4},
+				},
+			},
+			{
+				Name:     "encrypted.mkv",
+				Size:     3,
+				Segments: []storage.NZBSegment{{Number: 1, MessageID: "three", Bytes: 5}},
+			},
+		},
+	}
+	if err := store.AddNZB(nzb); err != nil {
+		t.Fatalf("AddNZB: %v", err)
+	}
+
+	u := newTestUsenet(store)
+	sizes, fileErrors, err := u.PrepareStreams(nzb.ID, []string{"oversized.mkv", "encrypted.mkv"})
+	if err != nil {
+		t.Fatalf("PrepareStreams: %v", err)
+	}
+	if len(fileErrors) != 0 {
+		t.Fatalf("PrepareStreams file errors: %v", fileErrors)
+	}
+	if sizes["oversized.mkv"] != 8 || sizes["encrypted.mkv"] != 3 {
+		t.Fatalf("prepared sizes = %v, want oversized=8 encrypted=3", sizes)
+	}
+
+	stored, err := store.GetNZB(nzb.ID)
+	if err != nil {
+		t.Fatalf("GetNZB: %v", err)
+	}
+	if stored.TotalSize != 11 || stored.Files[0].Size != 8 || stored.Files[1].Size != 3 {
+		t.Fatalf("durable sizes = total:%d files:%d,%d, want 11,8,3",
+			stored.TotalSize, stored.Files[0].Size, stored.Files[1].Size)
+	}
+}
+
+func TestPrepareStreamsReturnsPerFilePermanentFailures(t *testing.T) {
+	store := newTestNZBStorage(t)
+	nzb := &storage.NZB{
+		ID: "batch-failure",
+		Files: []storage.NZBFile{
+			{Name: "missing.mkv", Size: 1, Segments: []storage.NZBSegment{{Number: 1, MessageID: "missing", Bytes: 1}}},
+			{Name: "healthy.mkv", Size: 1, Segments: []storage.NZBSegment{{Number: 1, MessageID: "healthy", Bytes: 1}}},
+		},
+	}
+	if err := store.AddNZB(nzb); err != nil {
+		t.Fatalf("AddNZB: %v", err)
+	}
+	if err := store.markFilePermanentlyFailed(nzb.ID, "missing.mkv", "articles missing"); err != nil {
+		t.Fatalf("markFilePermanentlyFailed: %v", err)
+	}
+
+	sizes, fileErrors, err := newTestUsenet(store).PrepareStreams(nzb.ID, []string{"missing.mkv", "healthy.mkv"})
+	if err != nil {
+		t.Fatalf("PrepareStreams: %v", err)
+	}
+	if sizes["healthy.mkv"] != 1 {
+		t.Fatalf("healthy size = %d, want 1", sizes["healthy.mkv"])
+	}
+	var permanent *customerror.Error
+	if !errors.As(fileErrors["missing.mkv"], &permanent) || permanent.StatusCode() != http.StatusGone {
+		t.Fatalf("missing file error = %v, want HTTP 410", fileErrors["missing.mkv"])
+	}
+}
+
 func TestPermanentArticleFailuresAreAtomicAndDurable(t *testing.T) {
 	store := newTestNZBStorage(t)
 	nzb := &storage.NZB{
@@ -201,6 +277,51 @@ func TestPermanentArticleFailuresAreAtomicAndDurable(t *testing.T) {
 	}
 	if streamErr.StatusCode() != http.StatusGone || !streamErr.IsPermanent() {
 		t.Fatalf("persistent failure status = %d, permanent=%v; want 410, true", streamErr.StatusCode(), streamErr.IsPermanent())
+	}
+}
+
+func TestPermanentArticleFailureIsCachedOnlyAfterDurableWrite(t *testing.T) {
+	store := newTestNZBStorage(t)
+	u := newTestUsenet(store)
+	const (
+		nzoID    = "durability-order"
+		filename = "movie.mkv"
+	)
+	key := fsKey(nzoID, filename)
+	u.preparedSizes.Store(key, int64(123))
+
+	err := u.recordPermanentArticleFailure(nzoID, filename, errors.New("430 no such article"))
+	var permanent *customerror.Error
+	if errors.As(err, &permanent) {
+		t.Fatalf("failed persistence returned permanent error: %v", err)
+	}
+	if _, ok := u.failedFiles.Load(key); ok {
+		t.Fatal("failure entered hot cache before metadata was durable")
+	}
+	if size, ok := u.preparedSizes.Load(key); !ok || size != 123 {
+		t.Fatalf("prepared size changed after failed persistence: size=%d present=%v", size, ok)
+	}
+
+	nzb := &storage.NZB{
+		ID: nzoID,
+		Files: []storage.NZBFile{{
+			Name: filename,
+			Size: 123,
+		}},
+	}
+	if err := store.AddNZB(nzb); err != nil {
+		t.Fatalf("AddNZB: %v", err)
+	}
+
+	err = u.recordPermanentArticleFailure(nzoID, filename, errors.New("430 no such article"))
+	if !errors.As(err, &permanent) || permanent.StatusCode() != http.StatusGone {
+		t.Fatalf("durable failure error = %v, want permanent HTTP 410", err)
+	}
+	if _, ok := u.failedFiles.Load(key); !ok {
+		t.Fatal("durable failure was not entered into the hot cache")
+	}
+	if _, ok := u.preparedSizes.Load(key); ok {
+		t.Fatal("prepared size remained cached after durable failure")
 	}
 }
 

@@ -41,13 +41,22 @@ var (
 
 // Entry is the unified model across debrids and nzbs
 type Entry struct {
-	Protocol         config.Protocol `msgpack:"protocol" json:"protocol"`                   // torrent or nzb
-	InfoHash         string          `msgpack:"info_hash" json:"info_hash"`                 // Primary key - torrent hash
-	Name             string          `msgpack:"name" json:"name"`                           // Entry name
-	OriginalFilename string          `msgpack:"original_filename" json:"original_filename"` // Original filename from debrid
-	Size             int64           `msgpack:"size" json:"size"`                           // Total size in bytes (for QBit compat)
-	Bytes            int64           `msgpack:"bytes" json:"bytes"`                         // Actual bytes (debrid uses this)
-	Magnet           string          `msgpack:"magnet,omitempty" json:"magnet,omitempty"`   // Magnet link
+	// Store versions are internal optimistic-concurrency tokens. Main and
+	// queue rows have independent lifecycles even when the same Entry pointer
+	// is carried from the active queue into the completed-entry store.
+	mainStoreGeneration  string
+	mainStoreRevision    uint64
+	queueStoreGeneration string
+	queueStoreRevision   uint64
+
+	Protocol         config.Protocol `msgpack:"protocol" json:"protocol"`                                 // torrent or nzb
+	InfoHash         string          `msgpack:"info_hash" json:"info_hash"`                               // Primary key - torrent hash
+	Name             string          `msgpack:"name" json:"name"`                                         // Entry name
+	OriginalFilename string          `msgpack:"original_filename" json:"original_filename"`               // Original filename from debrid
+	Size             int64           `msgpack:"size" json:"size"`                                         // Total size in bytes (for QBit compat)
+	Bytes            int64           `msgpack:"bytes" json:"bytes"`                                       // Actual bytes (debrid uses this)
+	Magnet           string          `msgpack:"magnet,omitempty" json:"magnet,omitempty"`                 // Magnet link
+	NZBGeneration    string          `msgpack:"nzb_generation,omitempty" json:"nzb_generation,omitempty"` // Stable ownership token for same-ID NZB lifecycles
 
 	IsDownloading  bool  `msgpack:"is_downloading,omitempty" json:"is_downloading,omitempty"`   // Whether currently downloading(this is for local download)
 	SizeDownloaded int64 `msgpack:"size_downloaded,omitempty" json:"size_downloaded,omitempty"` // Actual downloaded bytes

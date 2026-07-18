@@ -83,7 +83,7 @@ func (b *Backend) Mount(ctx context.Context) error {
 		DisableXAttrs:        true,
 		IgnoreSecurityLabels: true,
 		MaxWrite:             1024 * 1024,
-		AllowOther: true,
+		AllowOther:           true,
 	}
 
 	var opt []string

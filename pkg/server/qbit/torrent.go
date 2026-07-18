@@ -82,25 +82,43 @@ func (q *QBit) GetTorrentProperties(t *storage.Entry) *TorrentProperties {
 }
 
 func (q *QBit) setTorrentTags(t *storage.Entry, tags []string) {
+	updated, err := q.manager.Queue().Mutate(t.InfoHash, func(current *storage.Entry) bool {
+		changed := false
+		for _, tag := range tags {
+			if tag == "" {
+				continue
+			}
+			if !utils.Contains(current.Tags, tag) {
+				current.Tags = append(current.Tags, tag)
+				changed = true
+			}
+		}
+		return changed
+	})
+	if err == nil && updated != nil {
+		*t = *updated
+	}
 	for _, tag := range tags {
-		if tag == "" {
-			continue
-		}
-		if !utils.Contains(t.Tags, tag) {
-			t.Tags = append(t.Tags, tag)
-		}
-		if !utils.Contains(q.Tags, tag) {
+		if tag != "" && !utils.Contains(q.Tags, tag) {
 			q.Tags = append(q.Tags, tag)
 		}
 	}
-	_ = q.manager.Queue().Update(t)
 }
 
 func (q *QBit) removeTorrentTags(t *storage.Entry, tags []string) bool {
-	newTorrentTags := utils.RemoveItem(t.Tags, tags...)
+	updated, err := q.manager.Queue().Mutate(t.InfoHash, func(current *storage.Entry) bool {
+		newTags := utils.RemoveItem(current.Tags, tags...)
+		if len(newTags) == len(current.Tags) {
+			return false
+		}
+		current.Tags = newTags
+		return true
+	})
 	q.Tags = utils.RemoveItem(q.Tags, tags...)
-	t.Tags = newTorrentTags
-	_ = q.manager.Queue().Update(t)
+	if err != nil || updated == nil {
+		return false
+	}
+	*t = *updated
 	return true
 }
 

@@ -25,8 +25,10 @@ var (
 	emptyDownloadLink = types.DownloadLink{}
 )
 
-// EntryRefresher is a function that refreshes an entry by infohash
-type EntryRefresher func(infohash string) (*storage.Entry, error)
+// EntryRefresher refreshes the exact lifecycle represented by the supplied
+// snapshot. Implementations must reject a delete/re-add replacement rather
+// than applying an old provider response to it.
+type EntryRefresher func(expected *storage.Entry) (*storage.Entry, error)
 type EntryRepairer func(ctx context.Context, entry *storage.Entry) error
 type EntrySaver func(entry *storage.Entry) error
 
@@ -70,7 +72,7 @@ func New(
 // Links are cached at the account level; this service only tracks validation state.
 func (s *Service) GetLink(ctx context.Context, entry *storage.Entry, filename string) (types.DownloadLink, error) {
 	// Use singleflight to deduplicate concurrent requests for the same file
-	key := entry.InfoHash + ":" + filename
+	key := entrySingleflightKey(entry, filename)
 	v, err, _ := s.singleflight.Do(key, func() (any, error) {
 		return s.fetchAndValidate(ctx, entry, filename, 0)
 	})
@@ -80,6 +82,17 @@ func (s *Service) GetLink(ctx context.Context, entry *storage.Entry, filename st
 	}
 
 	return v.(types.DownloadLink), nil
+}
+
+func entrySingleflightKey(entry *storage.Entry, filename string) string {
+	identity := storage.EntryLifecycleIdentity(entry)
+	if identity == "" {
+		// Unpersisted entries have no reusable lifecycle identity. Pointer scope
+		// still deduplicates concurrent calls sharing that exact workflow object
+		// without conflating an unrelated same-hash object.
+		identity = fmt.Sprintf("ptr:%p", entry)
+	}
+	return identity + "\x00" + entry.InfoHash + "\x00" + filename
 }
 
 func (s *Service) getClient(provider string) (debrid.Client, error) {
@@ -305,11 +318,17 @@ func (s *Service) getPlacementFile(entry *storage.Entry, filename string) (*stor
 			)
 		}
 
-		refreshed, err := s.entryRefresher(entry.InfoHash)
+		refreshed, err := s.entryRefresher(entry)
 		if err != nil {
 			return nil, NewRefetchableError(
 				fmt.Errorf("failed to refresh entry: %w", err),
 				"refresh_failed",
+			)
+		}
+		if refreshed == nil {
+			return nil, NewRefetchableError(
+				fmt.Errorf("refresh returned an empty entry"),
+				"refresh_empty",
 			)
 		}
 
@@ -321,10 +340,10 @@ func (s *Service) getPlacementFile(entry *storage.Entry, filename string) (*stor
 			)
 		}
 
-		placement = refreshed.Providers[entry.ActiveProvider]
+		placement = refreshed.Providers[refreshed.ActiveProvider]
 		if placement == nil {
 			return nil, NewPermanentError(
-				fmt.Errorf("placement disappeared after refresh for debrid %s", entry.ActiveProvider),
+				fmt.Errorf("placement disappeared after refresh for debrid %s", refreshed.ActiveProvider),
 				"placement_disappeared",
 			)
 		}
@@ -337,10 +356,73 @@ func (s *Service) getPlacementFile(entry *storage.Entry, filename string) (*stor
 			)
 		}
 
-		*entry = *refreshed
+		mergeRefreshedProviderView(entry, refreshed)
+		placement = entry.Providers[entry.ActiveProvider]
+		placementFile = placement.Files[filename]
 	}
 
 	return placementFile, nil
+}
+
+// mergeRefreshedProviderView deliberately copies only provider-owned state.
+// In particular it does not replace queue workflow fields or either store's
+// private lifecycle tokens on a long-lived downloader snapshot.
+func mergeRefreshedProviderView(dst, src *storage.Entry) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.ActiveProvider = src.ActiveProvider
+	dst.Providers = cloneProviderEntries(src.Providers)
+	dst.Files = cloneEntryFiles(src.Files)
+	dst.Size = src.Size
+	dst.Bytes = src.Bytes
+}
+
+func cloneProviderEntries(source map[string]*storage.ProviderEntry) map[string]*storage.ProviderEntry {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]*storage.ProviderEntry, len(source))
+	for name, placement := range source {
+		if placement == nil {
+			result[name] = nil
+			continue
+		}
+		copyPlacement := *placement
+		if placement.Files != nil {
+			copyPlacement.Files = make(map[string]*storage.ProviderFile, len(placement.Files))
+			for filename, file := range placement.Files {
+				if file == nil {
+					copyPlacement.Files[filename] = nil
+					continue
+				}
+				copyFile := *file
+				copyPlacement.Files[filename] = &copyFile
+			}
+		}
+		result[name] = &copyPlacement
+	}
+	return result
+}
+
+func cloneEntryFiles(source map[string]*storage.File) map[string]*storage.File {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]*storage.File, len(source))
+	for name, file := range source {
+		if file == nil {
+			result[name] = nil
+			continue
+		}
+		copyFile := *file
+		if file.ByteRange != nil {
+			copyRange := *file.ByteRange
+			copyFile.ByteRange = &copyRange
+		}
+		result[name] = &copyFile
+	}
+	return result
 }
 
 // validateLink validates a download link by making a HEAD request

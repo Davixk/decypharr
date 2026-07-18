@@ -2,6 +2,9 @@ package manager
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,15 +38,25 @@ func (m *Manager) syncTorrents(ctx context.Context) {
 
 // Refresh configuration constants
 const (
-	refreshBatchSize       = 500
-	refreshWriteBatchSize  = 50
-	refreshFlushInterval   = 3 * time.Second
-	refreshMaxWorkers      = 50 // Capped to avoid overwhelming debrid APIs
-	refreshMinWorkers      = 5
-	refreshDeleteWorkers   = 10
-	refreshWorkChanBuffer  = 100
-	refreshBatchChanBuffer = 50
+	refreshBatchSize      = 500
+	refreshMaxWorkers     = 50 // Capped to avoid overwhelming debrid APIs
+	refreshMinWorkers     = 5
+	refreshDeleteWorkers  = 10
+	refreshWorkChanBuffer = 100
 )
+
+type providerRemovalCandidate struct {
+	snapshot    *storage.Entry
+	provider    string
+	placementID string
+}
+
+type providerRefreshCandidate struct {
+	remote   *types.Torrent
+	snapshot *storage.Entry
+}
+
+var errProviderBecameLastPlacement = errors.New("provider became the last placement")
 
 // refreshTorrents refreshes torrents from a specific debrid service.
 // Returns an error if the refresh fails.
@@ -72,91 +85,107 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 
 	if len(remote) == 0 {
 		m.logger.Debug().Str("debrid", provider).Msg("No remote found")
-		return nil
 	}
 
 	// Build map of current remote by infohash
 	remoteTorrentsByHash := make(map[string]*types.Torrent, len(remote))
+	remoteTorrentsByID := make(map[string]*types.Torrent, len(remote))
 	for _, t := range remote {
-		old, exists := remoteTorrentsByHash[t.InfoHash]
+		if t == nil || t.InfoHash == "" {
+			continue
+		}
+		if t.Debrid == "" {
+			t.Debrid = provider
+		}
+		if t.Id != "" {
+			remoteTorrentsByID[t.Id] = t
+		}
+		remoteHash := strings.ToLower(t.InfoHash)
+		old, exists := remoteTorrentsByHash[remoteHash]
 		if !exists {
-			remoteTorrentsByHash[t.InfoHash] = t
+			remoteTorrentsByHash[remoteHash] = t
 		}
 		if exists && t.Added.After(old.Added) {
-			remoteTorrentsByHash[t.InfoHash] = t
+			remoteTorrentsByHash[remoteHash] = t
 		}
 	}
 
 	// Detect changes by streaming through cached entries
-	newTorrents, torrentsToUpdate, torrentsToDelete, err := m.detectTorrentChanges(provider, remoteTorrentsByHash)
+	refreshes, removals, err := m.detectTorrentChanges(provider, remoteTorrentsByHash, remoteTorrentsByID)
 	if err != nil {
 		return err
 	}
 
-	// Handle deletions
-	m.handleTorrentDeletions(torrentsToDelete)
+	removalErr := m.handleProviderRemovals(removals)
 
-	// Batch update torrents with changed placements (run concurrently)
-	var updateWg sync.WaitGroup
-	if len(torrentsToUpdate) > 0 {
-		updateWg.Add(1)
-		go func(torrents []*storage.Entry) {
-			defer updateWg.Done()
-			if err := m.storage.BatchAddOrUpdate(torrents); err != nil {
-				m.logger.Error().Err(err).Msg("Failed to batch update remote")
-			}
-		}(torrentsToUpdate)
-	}
-
-	// Process new torrents
-	if len(newTorrents) > 0 {
-		if err := m.processNewTorrents(provider, newTorrents); err != nil {
-			m.logger.Error().Err(err).Str("debrid", provider).Msg("Failed to process new torrents")
+	var refreshErr error
+	if len(refreshes) > 0 {
+		if processErr := m.processNewTorrents(provider, refreshes); processErr != nil {
+			m.logger.Error().Err(processErr).Str("debrid", provider).Msg("Failed to process some torrents")
+			refreshErr = processErr
 		}
 	}
 
-	// Wait for concurrent update to finish
-	updateWg.Wait()
-
-	return nil
+	return errors.Join(removalErr, refreshErr)
 }
 
 // detectTorrentChanges streams through cached entries and detects what changed
-func (m *Manager) detectTorrentChanges(provider string, remoteTorrentsByHash map[string]*types.Torrent) (
-	newTorrents []*types.Torrent,
-	torrentsToUpdate []*storage.Entry,
-	torrentsToDelete []string,
+func (m *Manager) detectTorrentChanges(
+	provider string,
+	remoteTorrentsByHash map[string]*types.Torrent,
+	remoteTorrentsByID map[string]*types.Torrent,
+) (
+	refreshes []providerRefreshCandidate,
+	removals []providerRemovalCandidate,
 	err error,
 ) {
-	newTorrents = make([]*types.Torrent, 0, 100)
-	torrentsToUpdate = make([]*storage.Entry, 0, 100)
-	torrentsToDelete = make([]string, 0, 10)
+	refreshes = make([]providerRefreshCandidate, 0, 100)
+	removals = make([]providerRemovalCandidate, 0, 10)
 	cachedInfoHashes := make(map[string]bool, len(remoteTorrentsByHash))
+	representedRemoteIDs := make(map[string]bool, len(remoteTorrentsByID))
 
 	err = m.storage.ForEachBatch(refreshBatchSize, func(batch []*storage.Entry) error {
 		for _, entry := range batch {
-			cachedInfoHashes[entry.InfoHash] = true
+			entryHash := strings.ToLower(entry.InfoHash)
+			cachedInfoHashes[entryHash] = true
 
-			currentTorrent, onRemote := remoteTorrentsByHash[entry.InfoHash]
 			oldPlacement, placementOnDebrid := entry.Providers[provider]
-
-			if placementOnDebrid {
-				if !onRemote {
-					entry.RemoveProvider(provider, nil)
-					if len(entry.Providers) == 0 {
-						torrentsToDelete = append(torrentsToDelete, entry.InfoHash)
-					} else {
-						torrentsToUpdate = append(torrentsToUpdate, entry)
+			currentTorrent, onRemote := remoteTorrentsByHash[entryHash]
+			if placementOnDebrid && oldPlacement != nil && oldPlacement.ID != "" {
+				if byID, exists := remoteTorrentsByID[oldPlacement.ID]; exists {
+					currentTorrent, onRemote = byID, true
+				}
+			}
+			// Folder aliases have a synthetic storage key but retain the content
+			// magnet. Fall back to that immutable torrent hash if the provider
+			// rotated its placement ID.
+			if placementOnDebrid && !onRemote {
+				if contentHash := utils.ExtractInfoHash(entry.Magnet); contentHash != "" {
+					if byContent, exists := remoteTorrentsByHash[strings.ToLower(contentHash)]; exists {
+						currentTorrent, onRemote = byContent, true
 					}
+				}
+			}
+			if onRemote && currentTorrent != nil && currentTorrent.Id != "" {
+				representedRemoteIDs[currentTorrent.Id] = true
+			}
+
+			if placementOnDebrid && oldPlacement != nil {
+				if !onRemote {
+					removals = append(removals, providerRemovalCandidate{
+						snapshot:    entry,
+						provider:    provider,
+						placementID: oldPlacement.ID,
+					})
 				} else if oldPlacement.NeedsUpdate(currentTorrent) {
 					// currentTorrent has changes for this provider - update placement info
 					// But the issue is that currentTorrent may not have all the metadata we need to update the placement (e.g. downloadedAt, files etc)
 					// So we need to fetch the full torrent info from debrid to ensure we have all the metadata to update the placement correctly
 					// So let's just add it to the newTorrents list and let processNewTorrents handle the update logic - it will be smart enough to only update the placement info without overwriting other metadata
-					newTorrents = append(newTorrents, currentTorrent)
+					refreshes = append(refreshes, providerRefreshCandidate{remote: currentTorrent, snapshot: entry})
 				}
 			} else if onRemote {
-				newTorrents = append(newTorrents, currentTorrent)
+				refreshes = append(refreshes, providerRefreshCandidate{remote: currentTorrent, snapshot: entry})
 			}
 		}
 		return nil
@@ -164,72 +193,125 @@ func (m *Manager) detectTorrentChanges(provider string, remoteTorrentsByHash map
 
 	if err != nil {
 		m.logger.Error().Err(err).Msg("Failed to stream cached remote")
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	// Check for brand new torrents (not in cache at all)
 	for infohash, t := range remoteTorrentsByHash {
-		if !cachedInfoHashes[infohash] {
-			newTorrents = append(newTorrents, t)
+		if !cachedInfoHashes[infohash] && (t.Id == "" || !representedRemoteIDs[t.Id]) {
+			refreshes = append(refreshes, providerRefreshCandidate{remote: t})
 		}
 	}
 
-	return newTorrents, torrentsToUpdate, torrentsToDelete, nil
+	return refreshes, removals, nil
 }
 
-// handleTorrentDeletions processes torrent deletions concurrently
-func (m *Manager) handleTorrentDeletions(torrentsToDelete []string) {
-	if len(torrentsToDelete) == 0 {
-		return
+// handleProviderRemovals independently removes placements that disappeared
+// from one provider. Every candidate is generation-fenced and rechecked; one
+// stale candidate or write error cannot prevent the remaining entries from
+// being reconciled.
+func (m *Manager) handleProviderRemovals(candidates []providerRemovalCandidate) error {
+	if len(candidates) == 0 {
+		return nil
 	}
 
 	var deleteWg sync.WaitGroup
-	deleteChan := make(chan string, len(torrentsToDelete))
+	deleteChan := make(chan providerRemovalCandidate, len(candidates))
+	errChan := make(chan error, len(candidates))
 
-	deleteWorkers := min(refreshDeleteWorkers, len(torrentsToDelete))
+	deleteWorkers := min(refreshDeleteWorkers, len(candidates))
 	for range deleteWorkers {
 		deleteWg.Go(func() {
-			for infohash := range deleteChan {
-				if err := m.storage.Delete(infohash); err != nil {
-					m.logger.Error().Err(err).Str("infohash", infohash).Msg("Failed to delete torrent")
+			for candidate := range deleteChan {
+				if err := m.removeProviderPlacement(candidate); err != nil {
+					errChan <- err
 				}
 			}
 		})
 	}
 
-	for _, infohash := range torrentsToDelete {
-		deleteChan <- infohash
+	for _, candidate := range candidates {
+		deleteChan <- candidate
 	}
 	close(deleteChan)
 	deleteWg.Wait()
+	close(errChan)
+
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func (m *Manager) removeProviderPlacement(candidate providerRemovalCandidate) error {
+	for range 8 {
+		current, err := m.storage.Get(candidate.snapshot.InfoHash)
+		if err != nil {
+			return nil
+		}
+		if !storage.SameMainGeneration(candidate.snapshot, current) {
+			return nil
+		}
+		placement := current.Providers[candidate.provider]
+		if placement == nil || placement.ID != candidate.placementID {
+			return nil
+		}
+
+		if len(current.Providers) == 1 {
+			deleted, deleteErr := m.storage.DeleteIfCurrent(current)
+			if deleteErr != nil {
+				return fmt.Errorf("delete remote-only entry %s: %w", current.InfoHash, deleteErr)
+			}
+			if deleted {
+				return nil
+			}
+			continue
+		}
+
+		_, present, mutateErr := m.storage.MutateEntrySnapshot(candidate.snapshot, func(entry *storage.Entry) (bool, error) {
+			placement := entry.Providers[candidate.provider]
+			if placement == nil || placement.ID != candidate.placementID {
+				return false, nil
+			}
+			if len(entry.Providers) == 1 {
+				return false, errProviderBecameLastPlacement
+			}
+			entry.RemoveProvider(candidate.provider, nil)
+			return true, nil
+		})
+		if errors.Is(mutateErr, errProviderBecameLastPlacement) {
+			continue
+		}
+		if errors.Is(mutateErr, storage.ErrStaleEntryGeneration) || !present {
+			return nil
+		}
+		if mutateErr != nil {
+			return fmt.Errorf("remove %s placement %s from %s: %w", candidate.provider, candidate.placementID, candidate.snapshot.InfoHash, mutateErr)
+		}
+		return nil
+	}
+	return fmt.Errorf("provider removal for %s did not stabilize", candidate.snapshot.InfoHash)
 }
 
 // processNewTorrents processes new torrents with worker pool and batch writing
-func (m *Manager) processNewTorrents(provider string, newTorrents []*types.Torrent) error {
-	workChan := make(chan *types.Torrent, min(refreshWorkChanBuffer, len(newTorrents)))
-	batchChan := make(chan *storage.Entry, refreshBatchChanBuffer)
-	errChan := make(chan error, 1) // Buffer for first error
+func (m *Manager) processNewTorrents(provider string, refreshes []providerRefreshCandidate) error {
+	workChan := make(chan providerRefreshCandidate, min(refreshWorkChanBuffer, len(refreshes)))
+	errChan := make(chan error, len(refreshes))
 
 	var processWg sync.WaitGroup
-	var batchWg sync.WaitGroup
 	var processed atomic.Int64
-	totalTorrents := len(newTorrents)
-
-	// Batch writer goroutine
-	batchWg.Go(func() {
-		m.runBatchWriter(batchChan, errChan)
-	})
+	totalTorrents := len(refreshes)
 
 	// Scale workers based on torrent count, but cap to avoid overwhelming APIs
-	workers := min(refreshMaxWorkers, max(refreshMinWorkers, len(newTorrents)/10))
+	workers := min(refreshMaxWorkers, max(refreshMinWorkers, len(refreshes)/10))
 
 	for range workers {
 		processWg.Go(func() {
-			for t := range workChan {
-				if mt, err := m.processSyncTorrent(t); err != nil {
-					m.logger.Error().Err(err).Str("debrid", provider).Msgf("Failed to process torrent %s", t.Id)
-				} else if mt != nil {
-					batchChan <- mt
+			for candidate := range workChan {
+				if _, err := m.processSyncTorrentSnapshot(candidate.remote, candidate.snapshot); err != nil {
+					m.logger.Error().Err(err).Str("debrid", provider).Msgf("Failed to process torrent %s", candidate.remote.Id)
+					errChan <- fmt.Errorf("process %s torrent %s: %w", provider, candidate.remote.InfoHash, err)
 				}
 				count := processed.Add(1)
 				if count%50 == 0 {
@@ -240,74 +322,37 @@ func (m *Manager) processNewTorrents(provider string, newTorrents []*types.Torre
 	}
 
 	// Send torrents to workers
-	for _, t := range newTorrents {
-		workChan <- t
+	for _, candidate := range refreshes {
+		workChan <- candidate
 	}
 
 	close(workChan)
 	processWg.Wait()
-	close(batchChan)
-	batchWg.Wait()
+	close(errChan)
 
-	// Check if batch writer encountered an error
-	select {
-	case err := <-errChan:
-		return err
-	default:
-		return nil
+	var errs []error
+	for err := range errChan {
+		errs = append(errs, err)
 	}
+	return errors.Join(errs...)
 }
 
-// runBatchWriter collects entries and writes them in batches
-func (m *Manager) runBatchWriter(batchChan <-chan *storage.Entry, errChan chan<- error) {
-	batch := make([]*storage.Entry, 0, refreshWriteBatchSize)
-	ticker := time.NewTicker(refreshFlushInterval)
-	defer ticker.Stop()
-
-	var writeErr error
-	flushBatch := func() {
-		if len(batch) == 0 || writeErr != nil {
-			return
-		}
-		if err := m.storage.BatchAddOrUpdate(batch); err != nil {
-			m.logger.Error().Err(err).Msg("Failed to batch write remote")
-			writeErr = err
-			// Send first error to channel (non-blocking)
-			select {
-			case errChan <- err:
-			default:
-			}
-		}
-		// Clear slice
-		for i := range batch {
-			batch[i] = nil
-		}
-		batch = batch[:0]
+func (m *Manager) processSyncTorrentSnapshot(t *types.Torrent, expected *storage.Entry) (*storage.Entry, error) {
+	if t == nil || t.InfoHash == "" || t.Debrid == "" {
+		return nil, fmt.Errorf("remote torrent is missing identity or provider")
 	}
-
-	for {
-		select {
-		case t, ok := <-batchChan:
-			if !ok {
-				flushBatch()
-				return
-			}
-			batch = append(batch, t)
-			if len(batch) >= refreshWriteBatchSize {
-				flushBatch()
-			}
-		case <-ticker.C:
-			flushBatch()
-		}
-	}
-}
-
-// processSyncTorrent processes a single torrent and returns it for batched writing
-func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 	// GetReader the debrid client
 	client := m.ProviderClient(t.Debrid)
 	if client == nil {
-		return nil, nil
+		return nil, fmt.Errorf("debrid client %s not found", t.Debrid)
+	}
+	if expected != nil && expected.InfoHash != t.InfoHash {
+		placement := expected.Providers[t.Debrid]
+		placementMatches := placement != nil && placement.ID != "" && placement.ID == t.Id
+		contentMatches := strings.EqualFold(utils.ExtractInfoHash(expected.Magnet), t.InfoHash)
+		if !placementMatches && !contentMatches {
+			return nil, fmt.Errorf("remote torrent %s/%s does not belong to alias entry %s", t.Debrid, t.Id, expected.InfoHash)
+		}
 	}
 
 	// Check if files are complete - only make API call if needed
@@ -318,24 +363,23 @@ func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 		if err := client.UpdateTorrent(t); err != nil {
 			return nil, err
 		}
-
-		// Re-check completion after update
-		if !isComplete(t.Files) {
-			return nil, nil
-		}
 	}
+	if t.Id == "" {
+		return nil, fmt.Errorf("remote %s torrent %s is missing a placement id", t.Debrid, t.InfoHash)
+	}
+
+	// Serialize provider-ID adoption with folder alias cleanup. Remote calls
+	// remain outside this mutex; the exact snapshot fence rejects a lifecycle
+	// that changed while the provider was queried.
+	m.copyEntryMu.Lock()
+	defer m.copyEntryMu.Unlock()
 
 	addedOn := t.Added
 	if addedOn.IsZero() {
 		addedOn = time.Now()
 	}
 
-	// Check if we have an existing managed torrent
-	// Note: This is a database read per torrent - could be optimized with batch reads
-	// or an in-memory cache, but storage.GetReader is likely fast (indexed by InfoHash)
-	mt, err := m.storage.Get(t.InfoHash)
-	if err != nil {
-		// Create new managed torrent
+	if expected == nil {
 		var magnet *utils.Magnet
 		if t.Magnet == nil || t.Magnet.Link == "" {
 			magnet = utils.ConstructMagnet(t.InfoHash, t.Name)
@@ -346,7 +390,7 @@ func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 		if size == 0 {
 			size = t.Bytes
 		}
-		mt = &storage.Entry{
+		entry := &storage.Entry{
 			Protocol:         config.ProtocolTorrent,
 			InfoHash:         t.InfoHash,
 			Name:             t.Name,
@@ -367,64 +411,43 @@ func (m *Manager) processSyncTorrent(t *types.Torrent) (*storage.Entry, error) {
 			CreatedAt:        addedOn,
 			UpdatedAt:        time.Now(),
 		}
-	}
-
-	// Populate global Files metadata (only if empty)
-	if len(mt.Files) == 0 {
-		for _, f := range t.GetFiles() {
-			mt.Files[f.Name] = &storage.File{
-				Name:      f.Name,
-				Size:      f.Size,
-				ByteRange: f.ByteRange,
-				Deleted:   f.Deleted,
-				InfoHash:  t.InfoHash,
-				AddedOn:   addedOn,
-			}
+		applyProviderTorrent(entry, t)
+		if err := m.storage.AddOrUpdate(entry); err != nil {
+			return nil, fmt.Errorf("create remote torrent %s: %w", t.InfoHash, err)
 		}
+		return entry, nil
 	}
-
-	// AddOrUpdate or update placement
-	placement := mt.AddTorrentProvider(t)
-	placement.Progress = t.Progress
-	if t.Status == types.TorrentStatusDownloaded {
-		downloadedAt := addedOn
-		placement.DownloadedAt = &downloadedAt
+	updated, present, err := m.storage.MutateEntrySnapshot(expected, func(current *storage.Entry) (bool, error) {
+		applyProviderTorrent(current, t)
+		return true, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("merge %s provider response for %s: %w", t.Debrid, t.InfoHash, err)
 	}
-
-	// If this is the first placement or the only one, make it active
-	if mt.ActiveProvider == "" || len(mt.Providers) == 1 {
-		if t.Status == types.TorrentStatusDownloaded {
-			_ = mt.ActivatePlacement(t.Debrid)
-		}
+	if !present {
+		return nil, fmt.Errorf("%w for deleted main entry %s", storage.ErrStaleEntryGeneration, t.InfoHash)
 	}
-
-	// confirm everything is complete
-	if err := mt.Validate(); err != nil {
-		m.logger.Warn().Err(err).Str("infohash", t.InfoHash).Str("name", mt.Name).Msg("Validation failed for torrent, marking as bad")
-	}
-
-	return mt, nil
+	return updated, nil
 }
 
 // refreshTorrent refreshes a single torrent from its active debrid
-func (m *Manager) refreshTorrent(infohash string) (*storage.Entry, error) {
-	torrent, err := m.storage.Get(infohash)
-	if err != nil {
-		return nil, err
+func (m *Manager) refreshTorrent(expected *storage.Entry) (*storage.Entry, error) {
+	if expected == nil {
+		return nil, fmt.Errorf("entry is nil")
 	}
 
-	if torrent.ActiveProvider == "" {
-		return torrent, nil
+	if expected.ActiveProvider == "" {
+		return expected, nil
 	}
 
-	client := m.ProviderClient(torrent.ActiveProvider)
+	client := m.ProviderClient(expected.ActiveProvider)
 	if client == nil {
-		return torrent, nil
+		return nil, fmt.Errorf("debrid client %s not found", expected.ActiveProvider)
 	}
 
-	placement := torrent.GetActiveProvider()
+	placement := expected.GetActiveProvider()
 	if placement == nil {
-		return torrent, nil
+		return nil, fmt.Errorf("active placement %s not found", expected.ActiveProvider)
 	}
 
 	// GetReader updated torrent info from debrid
@@ -432,18 +455,16 @@ func (m *Manager) refreshTorrent(infohash string) (*storage.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	entry, err := m.processSyncTorrent(debridTorrent)
-	if err != nil {
-		return nil, err
+	if debridTorrent == nil {
+		return nil, fmt.Errorf("provider %s returned an empty torrent", expected.ActiveProvider)
 	}
-	// Store updated entry in storage
-	if entry != nil {
-		if err := m.storage.AddOrUpdate(entry); err != nil {
-			return nil, err
-		}
+	if debridTorrent.InfoHash == "" {
+		debridTorrent.InfoHash = expected.InfoHash
 	}
-	return entry, nil
+	if debridTorrent.Debrid == "" {
+		debridTorrent.Debrid = expected.ActiveProvider
+	}
+	return m.processSyncTorrentSnapshot(debridTorrent, expected)
 }
 
 // refreshDebridDownloadLinks refreshes download links for a specific debrid service

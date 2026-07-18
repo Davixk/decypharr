@@ -281,15 +281,11 @@ func (q *QBit) handleSetCategory(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	category := getCategory(ctx)
 	hashes := getHashes(ctx)
-	var filterFunc func(t *storage.Entry) bool
-
-	hashSet := make(map[string]bool)
-	if len(hashes) > 0 {
-		for _, h := range hashes {
-			hashSet[h] = true
-		}
-
+	if len(hashes) == 0 {
+		http.Error(w, "No hashes provided", http.StatusBadRequest)
+		return
 	}
+	filterFunc := q.manager.Queue().ListFilterFunc("", config.ProtocolTorrent, "", hashes)
 
 	updateFunc := func(t *storage.Entry) bool {
 		if t.Category != category {

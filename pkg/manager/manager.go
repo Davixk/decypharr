@@ -65,17 +65,19 @@ type Manager struct {
 	startTime     time.Time
 	usenetTimeout time.Duration
 
-	rootInfo   *FileInfo
-	entry      *EntryCache
-	downloader *Downloader
-	usenet     *usenet.Usenet
+	rootInfo            *FileInfo
+	entry               *EntryCache
+	downloader          *Downloader
+	usenet              *usenet.Usenet
+	copyEntryMu         sync.Mutex
+	copyEntryTestHook   func(stage string)
+	deleteEntryTestHook func(stage string)
 
 	// Debrid speed test results storage
 	debridSpeedTestResults *xsync.Map[string, debridTypes.SpeedTestResult]
 
 	// Active streams tracking
-	activeStreams   *xsync.Map[string, *ActiveStream]
-	usenetFailureMu sync.Mutex
+	activeStreams *xsync.Map[string, *ActiveStream]
 
 	// In-flight queue-processor dispatches, keyed by InfoHash, to prevent
 	// duplicate goroutines from processing the same entry when the scheduler
@@ -83,8 +85,9 @@ type Manager struct {
 	processingEntries *xsync.Map[string, struct{}]
 
 	// Unified active-download queue for torrent and NZB imports.
-	jobQueue  *JobQueue
-	nzbSyncMu sync.Mutex
+	jobQueue       *JobQueue
+	nzbSyncMu      sync.Mutex
+	nzbAdmissionMu sync.Mutex
 
 	// Notifications service
 	Notifications *notifications.Service
@@ -254,7 +257,7 @@ func (m *Manager) initLinkService() {
 		m.clients,
 		m.refreshTorrent,
 		m.ReinsertEntry,
-		func(entry *storage.Entry) error { return m.AddOrUpdate(entry, nil) },
+		m.persistLinkEntryBad,
 		m.streamClient,
 		m.config.Retries,
 		logger.New("link"),
@@ -262,6 +265,9 @@ func (m *Manager) initLinkService() {
 }
 
 func (m *Manager) initJobQueue() {
+	if err := m.cleanupOrphanedStagedNZBs(); err != nil {
+		m.logger.Warn().Err(err).Msg("Failed to reconcile orphaned staged NZBs")
+	}
 	m.jobQueue = NewJobQueue(m.ctx, m.config.MaxActiveDownloads, m.processJob)
 	// Restore persisted active/queued downloads in the background. With large
 	// queues this re-parses thousands of NZBs over the network, and running it
@@ -279,8 +285,41 @@ func (m *Manager) initJobQueue() {
 	}()
 }
 
+func (m *Manager) cleanupOrphanedStagedNZBs() error {
+	if m.usenet == nil || m.storage == nil {
+		return nil
+	}
+
+	// Keep StageNZBForGeneration -> Queue.Add atomic with respect to the scan.
+	// This matters during Reset as well as initial construction: a newly staged
+	// file must either be absent from the directory snapshot or already have a
+	// durable Magnet reference before cleanup can consider it orphaned.
+	m.nzbAdmissionMu.Lock()
+	defer m.nzbAdmissionMu.Unlock()
+
+	entries, err := m.storage.FilterQueued(func(entry *storage.Entry) bool {
+		return entry != nil && entry.IsNZB() && entry.Magnet != ""
+	})
+	if err != nil {
+		return fmt.Errorf("load live staged NZB paths: %w", err)
+	}
+	livePaths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		livePaths = append(livePaths, entry.Magnet)
+	}
+	removed, err := m.usenet.CleanupOrphanedStagedNZBs(livePaths)
+	if removed > 0 {
+		m.logger.Info().Int("removed", removed).Msg("Removed orphaned staged NZBs")
+	}
+	return err
+}
+
 func (m *Manager) processJob(ctx context.Context, job *Job) {
 	if job == nil {
+		return
+	}
+	if job.ResumeAction {
+		m.resumeClaimedAction(job.Entry)
 		return
 	}
 	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
@@ -321,6 +360,23 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 	m.waitForDownloadCompletion(ctx, job.Entry)
 }
 
+func (m *Manager) resumeClaimedAction(entry *storage.Entry) {
+	if entry == nil {
+		return
+	}
+	current, err := m.queue.RefreshSnapshot(entry)
+	if err != nil || !current {
+		if err != nil {
+			m.logger.Warn().Err(err).Str("infohash", entry.InfoHash).Msg("Failed to refresh claimed action during restore")
+		}
+		return
+	}
+	if entry.State != storage.EntryStateDownloading || !entry.IsDownloading || entry.Status != debridTypes.TorrentStatusDownloaded {
+		return
+	}
+	m.runClaimedAction(entry)
+}
+
 func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.Entry) {
 	if entry == nil {
 		return
@@ -328,8 +384,8 @@ func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		current, err := m.queue.GetTorrent(entry.InfoHash)
-		if err != nil || current.State != storage.EntryStateDownloading {
+		current, err := m.queue.RefreshSnapshot(entry)
+		if err != nil || !current || entry.State != storage.EntryStateDownloading {
 			return
 		}
 		select {
@@ -608,21 +664,64 @@ func (m *Manager) GetTorrentsCount() (int, error) {
 
 // DeleteEntry deletes a torrent by infohash
 func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
-	torr, err := m.GetEntry(infohash)
+	expected, err := m.GetEntry(infohash)
 	if err != nil {
 		return err
 	}
-	// Delete active placements from debrid clients
+	m.runDeleteEntryTestHook("snapshot-loaded")
+	var cleanup func(*storage.Entry) error
 	if removePlacements {
-		go m.RemoveTorrentPlacements(torr)
+		cleanup = m.removeTorrentPlacementsLocked
 	}
-
-	if err := m.storage.Delete(infohash); err != nil {
+	loadCurrent := func() (*storage.Entry, error) {
+		current, loadErr := m.GetEntry(infohash)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if !storage.SameMainGeneration(expected, current) {
+			return nil, fmt.Errorf("entry %s was replaced before deletion", infohash)
+		}
+		return current, nil
+	}
+	validateMain := func() error {
+		_, validateErr := loadCurrent()
+		return validateErr
+	}
+	deleteMain := func(_ *storage.Entry) error {
+		m.runDeleteEntryTestHook("before-copy-lock")
+		m.copyEntryMu.Lock()
+		defer m.copyEntryMu.Unlock()
+		current, loadErr := loadCurrent()
+		if loadErr != nil {
+			return loadErr
+		}
+		deleted, deleteErr := m.storage.DeleteIfCurrentWithCleanup(current, cleanup)
+		if deleteErr != nil {
+			return deleteErr
+		}
+		if !deleted {
+			return fmt.Errorf("entry %s changed before deletion", infohash)
+		}
+		return nil
+	}
+	if m.queue != nil {
+		if err := m.queue.withDeletionBarrier(infohash, validateMain, deleteMain); err != nil {
+			return err
+		}
+	} else if err := deleteMain(nil); err != nil {
 		return err
 	}
 	// Refresh entry cache
-	m.RefreshEntries(true)
+	if m.entry != nil {
+		m.RefreshEntries(true)
+	}
 	return nil
+}
+
+func (m *Manager) runDeleteEntryTestHook(stage string) {
+	if m.deleteEntryTestHook != nil {
+		m.deleteEntryTestHook(stage)
+	}
 }
 
 func (m *Manager) DeleteTorrents(infohashes []string, removeFromDebrid bool) error {

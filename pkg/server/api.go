@@ -431,8 +431,7 @@ func (s *Server) handleDeleteTorrent(w http.ResponseWriter, r *http.Request) {
 				// Remove the entry from manager fully, which will handle removing from debrid and deleting the entry
 				return s.manager.DeleteEntry(t.InfoHash, true)
 			}
-			go s.manager.RemoveTorrentPlacements(t)
-			return nil
+			return s.manager.RemoveTorrentPlacements(t)
 		}
 	}
 
@@ -461,8 +460,7 @@ func (s *Server) handleDeleteTorrents(w http.ResponseWriter, r *http.Request) {
 				// Remove the entry from manager fully, which will handle removing from debrid and deleting the entry
 				return s.manager.DeleteEntry(t.InfoHash, true)
 			}
-			go s.manager.RemoveTorrentPlacements(t)
-			return nil
+			return s.manager.RemoveTorrentPlacements(t)
 		}
 	}
 	if err := s.manager.Queue().DeleteWhere("", config.ProtocolAll, "", hashes, cleanup); err != nil {

@@ -2,9 +2,11 @@ package manager
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
 
 func (m *Manager) fixNZBFileSizes(ctx context.Context) {
@@ -26,41 +28,28 @@ func (m *Manager) fixNZBFileSizes(ctx context.Context) {
 		default:
 		}
 
-		nzb, err := m.usenet.GetNZB(id)
-		if err != nil || nzb == nil {
+		nzb, changed, err := m.usenet.NormalizeNZBFileSizes(id)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("nzb_id", id).Msg("Failed to normalize NZB metadata sizes")
 			continue
 		}
-
-		changed, total := normalizeNZBFileSizes(nzb)
-		if !changed {
+		if !changed || nzb == nil {
 			continue
 		}
+		total := nzb.TotalSize
 
-		if err := m.usenet.NZBStorage().AddNZB(nzb); err != nil {
-			m.logger.Warn().Err(err).Str("nzb_id", nzb.ID).Msg("Failed to update NZB metadata during size correction")
-			continue
-		}
-
-		if entry, err := m.storage.Get(nzb.ID); err == nil && entry != nil && entry.Protocol == config.ProtocolNZB {
-			entryChanged := entry.Size != total || entry.Bytes != total
-			entry.Size = total
-			entry.Bytes = total
-			changedEntry := false
-
-			for _, nzbFile := range nzb.Files {
-				if file, ok := entry.Files[nzbFile.Name]; ok {
-					if file.Size != nzbFile.Size {
-						file.Size = nzbFile.Size
-						changedEntry = true
-					}
-				}
+		entry, entryErr := m.storage.Get(nzb.ID)
+		if entryErr == nil && entry != nil && entry.Protocol == config.ProtocolNZB {
+			sizes, sizeErr := normalizedNZBEntrySizes(entry, nzb)
+			if sizeErr != nil {
+				m.logger.Warn().Err(sizeErr).Str("nzb_id", nzb.ID).Msg("Skipped stale NZB entry size correction")
+				continue
 			}
-
-			if changedEntry || entryChanged {
-				// Add usenet placement to update it
-				_ = entry.AddUsenetProvider(nzb)
-				if err := m.storage.AddOrUpdate(entry); err != nil {
-					m.logger.Warn().Err(err).Str("nzb_id", nzb.ID).Msg("Failed to update entry during NZB size correction")
+			if len(sizes) > 0 {
+				// The helper checks the returned metadata snapshot, and the atomic
+				// persistence helper checks again under the main-entry mutation lock.
+				if _, err := m.persistUsenetFileSizesForGeneration(nzb.ID, nzb.Generation, sizes); err != nil {
+					m.logger.Warn().Err(err).Str("nzb_id", nzb.ID).Int64("normalized_total", total).Msg("Failed to update entry during NZB size correction")
 				}
 			}
 		}
@@ -73,50 +62,22 @@ func (m *Manager) fixNZBFileSizes(ctx context.Context) {
 	}
 }
 
-func normalizeNZBFileSizes(nzb *storage.NZB) (bool, int64) {
-	if nzb == nil {
-		return false, 0
+func normalizedNZBEntrySizes(entry *storage.Entry, metadata *storage.NZB) (map[string]int64, error) {
+	if entry == nil || metadata == nil {
+		return nil, fmt.Errorf("entry and NZB metadata are required")
+	}
+	if entry.InfoHash != metadata.ID {
+		return nil, fmt.Errorf("NZB metadata ID %q does not match entry %q", metadata.ID, entry.InfoHash)
+	}
+	if entry.NZBGeneration == "" || metadata.Generation == "" || entry.NZBGeneration != metadata.Generation {
+		return nil, fmt.Errorf("%w: entry generation %q, metadata generation %q", usenet.ErrStaleNZBGeneration, entry.NZBGeneration, metadata.Generation)
 	}
 
-	changed := false
-	var total int64
-
-	for i := range nzb.Files {
-		file := &nzb.Files[i]
-		streamSize := streamSizeFromSegments(file.Segments)
-		if streamSize > 0 && (file.Size <= 0 || file.Size > streamSize) {
-			file.Size = streamSize
-			changed = true
-		}
-		total += file.Size
-	}
-
-	if nzb.TotalSize != total {
-		nzb.TotalSize = total
-		changed = true
-	}
-
-	return changed, total
-}
-
-func streamSizeFromSegments(segments []storage.NZBSegment) int64 {
-	if len(segments) == 0 {
-		return 0
-	}
-
-	var maxEnd int64
-	var sum int64
-	for _, seg := range segments {
-		if seg.Bytes > 0 {
-			sum += seg.Bytes
-		}
-		if seg.EndOffset+1 > maxEnd {
-			maxEnd = seg.EndOffset + 1
+	sizes := make(map[string]int64, len(metadata.Files))
+	for _, nzbFile := range metadata.Files {
+		if _, ok := entry.Files[nzbFile.Name]; ok && nzbFile.Size > 0 {
+			sizes[nzbFile.Name] = nzbFile.Size
 		}
 	}
-
-	if maxEnd > 0 {
-		return maxEnd
-	}
-	return sum
+	return sizes, nil
 }

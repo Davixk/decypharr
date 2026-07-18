@@ -2,6 +2,8 @@ package usenet
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -56,46 +58,54 @@ func releaseStreamBuffer(buf []byte) {
 type fsEntry struct {
 	fs            *fs.FS
 	volumes       []*types.Volume
+	generation    string                  // Durable NZB lifecycle that supplied the segment map
 	reader        fs.PrefetchableReaderAt // Shared reader with prefetch capability
 	readerSize    int64                   // Size of the volume
 	readerCleanup func()                  // Cleanup function for reader
 	readerOnce    sync.Once               // Ensures reader is created exactly once
+	cleanupOnce   sync.Once               // Ensures a retired entry is closed exactly once
 	readerErr     error                   // Error from reader creation (if any)
 	refCount      atomic.Int32
 	lastAccessed  atomic.Int64 // Unix timestamp
+	retired       atomic.Bool  // Fences out new users after metadata invalidation
+	unmapped      atomic.Bool  // Allows cleanup only after exact map removal
 }
-
-// fsEntryTombstone marks an entry claimed for teardown. Once refCount holds
-// this value no new stream can acquire the entry (see acquire), which is what
-// makes cleanup safe against a concurrent Stream that already Load()ed the
-// entry from the map.
-const fsEntryTombstone = int32(-1 << 30)
 
 func (fe *fsEntry) cleanup() {
-	if fe.readerCleanup != nil {
-		fe.readerCleanup()
-		fe.readerCleanup = nil
-		fe.reader = nil
+	fe.cleanupOnce.Do(func() {
+		if fe.readerCleanup != nil {
+			fe.readerCleanup()
+			fe.readerCleanup = nil
+			fe.reader = nil
+		}
+	})
+}
+
+func (fe *fsEntry) cleanupIfUnused() {
+	if fe.retired.Load() && fe.unmapped.Load() && fe.refCount.Load() == 0 {
+		fe.cleanup()
 	}
 }
 
-// acquire takes a reference unless the entry has been claimed for teardown.
+// acquire takes a reference unless the entry has been retired. The second
+// retired check closes the race where retirement starts after the first check;
+// in that case the speculative reference is immediately returned.
 func (fe *fsEntry) acquire() bool {
-	for {
-		n := fe.refCount.Load()
-		if n < 0 {
-			return false
-		}
-		if fe.refCount.CompareAndSwap(n, n+1) {
-			return true
-		}
+	if fe.retired.Load() {
+		return false
 	}
+	fe.refCount.Add(1)
+	if fe.retired.Load() {
+		fe.release()
+		return false
+	}
+	return true
 }
 
-// claimForCleanup atomically claims an idle (refCount == 0) entry for
-// teardown, fencing out any future acquire.
-func (fe *fsEntry) claimForCleanup() bool {
-	return fe.refCount.CompareAndSwap(0, fsEntryTombstone)
+func (fe *fsEntry) release() {
+	fe.refCount.Add(-1)
+	fe.lastAccessed.Store(utils.NowUnix())
+	fe.cleanupIfUnused()
 }
 
 // getOrCreateReader returns the shared reader, creating it lazily on first use.
@@ -221,6 +231,10 @@ type Usenet struct {
 	failedFiles              *xsync.Map[string, error]
 	preparedSizes            *xsync.Map[string, int64]
 
+	// Test seam for deterministic lifecycle/cache publication races. Tests set
+	// this before starting goroutines and leave it immutable while they run.
+	lifecycleTestHook func(operation, nzoID string)
+
 	fs *xsync.Map[string, *fsEntry]
 }
 
@@ -234,6 +248,76 @@ func fsKey(nzoID, filename string) string {
 	buf[n+1] = ':'
 	copy(buf[n+2:], filename)
 	return string(buf)
+}
+
+func (u *Usenet) lockNZBLifecycle(nzoID string) func() {
+	return u.nzbStorage.lockNZBLifecycle(nzoID)
+}
+
+// clearNZBHotCaches invalidates every file-level result and cached reader for
+// an NZB, including filenames that disappeared in a replacement generation.
+// The caller holds the NZB lifecycle lock through its durable metadata write
+// and this invalidation.
+func (u *Usenet) clearNZBHotCaches(nzoID string) {
+	prefix := nzoID + "::"
+	if u.failedFiles != nil {
+		u.failedFiles.Range(func(key string, _ error) bool {
+			if strings.HasPrefix(key, prefix) {
+				u.failedFiles.Delete(key)
+			}
+			return true
+		})
+	}
+	if u.preparedSizes != nil {
+		u.preparedSizes.Range(func(key string, _ int64) bool {
+			if strings.HasPrefix(key, prefix) {
+				u.preparedSizes.Delete(key)
+			}
+			return true
+		})
+	}
+	u.retireFSForNZB(nzoID)
+}
+
+// retireFSEntry prevents new users from acquiring entry, removes it only when
+// it is still the value mapped at key, and lets active users finish before the
+// reader is closed. The idle janitor also uses this path, so retirement and
+// acquisition synchronize through the entry atomics rather than a lifecycle
+// lock alone.
+func (u *Usenet) retireFSEntry(key string, entry *fsEntry) {
+	if entry == nil {
+		return
+	}
+	entry.retired.Store(true)
+	if u.fs != nil {
+		u.fs.Compute(key, func(current *fsEntry, loaded bool) (*fsEntry, xsync.ComputeOp) {
+			if loaded && current == entry {
+				return nil, xsync.DeleteOp
+			}
+			return current, xsync.CancelOp
+		})
+	}
+	entry.unmapped.Store(true)
+	entry.cleanupIfUnused()
+}
+
+func (u *Usenet) retireFSForNZB(nzoID string) {
+	if u.fs == nil {
+		return
+	}
+	prefix := nzoID + "::"
+	u.fs.Range(func(key string, entry *fsEntry) bool {
+		if strings.HasPrefix(key, prefix) {
+			u.retireFSEntry(key, entry)
+		}
+		return true
+	})
+}
+
+func (u *Usenet) runLifecycleTestHook(operation, nzoID string) {
+	if u.lifecycleTestHook != nil {
+		u.lifecycleTestHook(operation, nzoID)
+	}
 }
 
 // New creates a new usenet instance
@@ -321,7 +405,7 @@ func (u *Usenet) initStreamsDir(streamsDir string) {
 	}
 }
 
-func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
+func (u *Usenet) createEntry(file *storage.NZBFile, generation string) (*fsEntry, error) {
 	volumes := GetFileVolumes(file)
 	if len(volumes) == 0 {
 		return nil, fmt.Errorf("no volumes available for file %s", file.Name)
@@ -335,74 +419,109 @@ func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
 	}
 
 	return &fsEntry{
-		fs:      usenetFS,
-		volumes: volumes,
+		fs:         usenetFS,
+		volumes:    volumes,
+		generation: generation,
 	}, nil
 }
 
-// getOrCreateEntry returns the fsEntry and its cache key to avoid redundant key computation.
-func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (*fsEntry, string, error) {
+// getOrCreateEntry holds the per-NZB lifecycle lock through metadata lookup and
+// cache publication, so Delete or replacement cannot miss an in-flight entry
+// built from the previous metadata generation.
+func (u *Usenet) getOrCreateEntry(ctx context.Context, nzoID, filename string) (*fsEntry, error) {
+	return u.getOrCreateEntryForGeneration(ctx, nzoID, "", filename)
+}
+
+func (u *Usenet) getOrCreateEntryForGeneration(ctx context.Context, nzoID, generation, filename string) (*fsEntry, error) {
+	unlockLifecycle := u.lockNZBLifecycle(nzoID)
+	defer unlockLifecycle()
+	if generation != "" {
+		if _, err := u.nzbStorage.assertGenerationWithLifecycleHeld(nzoID, generation); err != nil {
+			return nil, err
+		}
+	}
+
 	key := fsKey(nzoID, filename)
 
-	// Fast path: entry already exists and isn't being torn down. acquire() (a
-	// CAS, not a blind Add) is what closes the race against cleanupIdleFS:
-	// once the janitor claims an idle entry no new reference can be taken, so
-	// a stream can never end up on an entry whose reader is being closed.
-	if entry, ok := u.fs.Load(key); ok && entry.acquire() {
-		entry.lastAccessed.Store(utils.NowUnix())
-		return entry, key, nil
+	// Fast path: entry already exists and has not been retired by metadata
+	// invalidation or idle cleanup.
+	if entry, ok := u.fs.Load(key); ok {
+		if generation != "" && entry.generation != generation {
+			u.retireFSEntry(key, entry)
+		} else if entry.acquire() {
+			entry.lastAccessed.Store(utils.NowUnix())
+			return entry, nil
+		}
 	}
 
 	// Slow path: need to create entry
-	file, err := u.getFile(nzoID, filename)
+	file, durableGeneration, err := u.getFileForGeneration(nzoID, generation, filename)
 	if err != nil {
-		return nil, key, err
+		return nil, err
 	}
 
 	// Pre-checks
 	if err := u.preStreamChecks(file); err != nil {
-		return nil, key, err
+		return nil, err
 	}
 
-	newEntry, err := u.createEntry(file)
+	newEntry, err := u.createEntry(file, durableGeneration)
 	if err != nil {
-		return nil, key, err
+		return nil, err
 	}
+	// Publish with the creator's reference already installed. Otherwise the
+	// idle janitor can observe refCount == 0 between LoadOrStore and return,
+	// retire the entry, and leave the caller holding a closed reader.
+	newEntry.refCount.Store(1)
+	newEntry.lastAccessed.Store(utils.NowUnix())
+	u.runLifecycleTestHook("fs-before-publish", nzoID)
 
 	// Atomically store only if key doesn't exist (prevents race condition)
 	for {
 		actual, loaded := u.fs.LoadOrStore(key, newEntry)
 		if !loaded {
 			// We won the race - use our new entry
-			newEntry.refCount.Add(1)
-			newEntry.lastAccessed.Store(utils.NowUnix())
-			return newEntry, key, nil
+			u.runLifecycleTestHook("fs-publish", nzoID)
+			return newEntry, nil
 		}
 		// Another goroutine created the entry first - use theirs.
-		// Our newEntry was never used (readers are lazy), GC reclaims it.
-		if actual.acquire() {
-			actual.lastAccessed.Store(utils.NowUnix())
-			return actual, key, nil
+		// Retire our unpublished candidate and return its creator reference.
+		if actual.generation != durableGeneration {
+			u.retireFSEntry(key, actual)
+			if err := ctx.Err(); err != nil {
+				newEntry.retired.Store(true)
+				newEntry.unmapped.Store(true)
+				newEntry.release()
+				return nil, err
+			}
+			runtime.Gosched()
+			continue
 		}
-		// The mapped entry is claimed for teardown; the janitor removes it
-		// from the map immediately after claiming, so retry until our entry
-		// can be stored.
+		if actual.acquire() {
+			newEntry.retired.Store(true)
+			newEntry.unmapped.Store(true)
+			newEntry.release()
+			actual.lastAccessed.Store(utils.NowUnix())
+			return actual, nil
+		}
+		// The mapped entry is retired; retry until exact-pointer removal lets
+		// our candidate be stored.
 		if err := ctx.Err(); err != nil {
-			return nil, key, err
+			newEntry.retired.Store(true)
+			newEntry.unmapped.Store(true)
+			newEntry.release()
+			return nil, err
 		}
 		runtime.Gosched()
 	}
 }
 
-// releaseFS releases an fs entry using a pre-computed key (avoids redundant allocation).
-func (u *Usenet) releaseFS(key string) {
-	entry, ok := u.fs.Load(key)
-	if !ok {
-		return
+// releaseFS releases the exact entry acquired by the caller. Looking it up by
+// key would decrement a replacement generation after the old entry is retired.
+func (u *Usenet) releaseFS(entry *fsEntry) {
+	if entry != nil {
+		entry.release()
 	}
-
-	entry.refCount.Add(-1)
-	entry.lastAccessed.Store(utils.NowUnix())
 }
 
 // cleanupIdleFS removes sessions with refCount=0 that haven't been used recently
@@ -421,15 +540,10 @@ func (u *Usenet) cleanupIdleFS() {
 			if entry.refCount.Load() == 0 {
 				lastUsed := entry.lastAccessed.Load()
 				if now-lastUsed > idleThreshold {
-					// Claim before touching anything: the CAS fences out a
-					// concurrent Stream that already Load()ed this entry from
-					// the map (it will fail acquire() and create a fresh
-					// entry). Delete from the map before the (potentially
-					// slow) cleanup so waiting creators aren't stalled.
-					if entry.claimForCleanup() {
-						u.fs.Delete(key)
-						entry.cleanup()
-					}
+					// Retirement fences out a concurrent Stream that already
+					// loaded this entry. If it acquired first, it may finish;
+					// otherwise its speculative reference is rolled back.
+					u.retireFSEntry(key, entry)
 				}
 			}
 			return true
@@ -445,8 +559,37 @@ func (u *Usenet) Parse(ctx context.Context, name string, content []byte, categor
 // ParseWithID parses an NZB using a caller-provided ID. Supplying the ID lets
 // the manager expose a queued entry before the active-download worker starts.
 func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byte, category string) (*storage.NZB, map[string]*parser.FileGroup, error) {
+	return u.parseWithGeneration(ctx, id, "", name, content, category, true)
+}
+
+// ParseWithGeneration resumes a queued NZB only if the metadata under id still
+// belongs to generation. Unlike ParseWithID it never replaces a different
+// lifecycle, so a restored worker cannot overwrite a same-ID delete/re-add.
+func (u *Usenet) ParseWithGeneration(ctx context.Context, id, generation, name string, content []byte, category string) (*storage.NZB, map[string]*parser.FileGroup, error) {
+	if id == "" {
+		return nil, nil, fmt.Errorf("NZB ID is required")
+	}
+	if generation == "" {
+		return nil, nil, fmt.Errorf("NZB generation is required")
+	}
+	return u.parseWithGeneration(ctx, id, generation, name, content, category, false)
+}
+
+func (u *Usenet) parseWithGeneration(ctx context.Context, id, generation, name string, content []byte, category string, replace bool) (*storage.NZB, map[string]*parser.FileGroup, error) {
 	if len(content) == 0 {
 		return nil, nil, fmt.Errorf("NZB content is empty")
+	}
+	var unlockLifecycle func()
+	if !replace && id != "" {
+		// Keep this per-ID lock through validation, network parsing, source write,
+		// and commit. Otherwise Delete can win after this check and the final add
+		// can resurrect the deleted generation from an absent metadata file.
+		unlockLifecycle = u.lockNZBLifecycle(id)
+		defer unlockLifecycle()
+		if err := u.nzbStorage.assertGenerationIfPresentWithLifecycleHeld(id, generation); err != nil {
+			return nil, nil, err
+		}
+		u.runLifecycleTestHook("parse-generation-checked", id)
 	}
 
 	// Validate NZB content
@@ -465,11 +608,24 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 	if id != "" {
 		nzb.ID = id
 	}
+	if replace {
+		nzb.Generation = newNZBGeneration()
+	} else {
+		nzb.Generation = generation
+	}
+	if unlockLifecycle == nil {
+		unlockLifecycle = u.lockNZBLifecycle(nzb.ID)
+		defer unlockLifecycle()
+	}
+	previousSourcePath := ""
+	if current, currentErr := u.nzbStorage.GetNZBHeader(nzb.ID); currentErr == nil && current != nil {
+		previousSourcePath = current.Path
+	}
 
 	nzb.Category = category
 	nzb.Status = NZBStatusParsing
 	// Save NZB file to disk
-	nzbPath, err := u.saveNZBFile(nzb.ID, content)
+	nzbPath, err := u.saveNZBFile(nzb.ID, nzb.Generation, content)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -477,17 +633,28 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 
 	// Mark as processing
 	if err := u.markAsProcessing(nzb); err != nil {
-		// Don't leave the source file orphaned; an un-marked .nzb would be
-		// re-claimed by the refresh watcher on every scan.
+		// Don't leave a managed source orphaned after marker creation fails.
 		_ = os.Remove(nzbPath)
 		return nil, nil, fmt.Errorf("failed to mark NZB as processing: %w", err)
 	}
 
-	if err := u.nzbStorage.AddNZB(nzb); err != nil {
+	var persistErr error
+	if replace {
+		// Keep the generation chosen above because it is already embedded in the
+		// source path and returned to the queue as the ownership token.
+		persistErr = u.nzbStorage.replaceNZBWithLifecycleHeld(nzb)
+	} else {
+		persistErr = u.nzbStorage.addNZBWithLifecycleHeld(nzb)
+	}
+	if persistErr != nil {
 		_ = os.Remove(nzbPath + ".processing")
 		_ = os.Remove(nzbPath)
-		return nil, nil, fmt.Errorf("failed to save NZB to storage: %w", err)
+		return nil, nil, fmt.Errorf("failed to save NZB to storage: %w", persistErr)
 	}
+	if previousSourcePath != "" && previousSourcePath != nzbPath {
+		removeNZBSourceArtifacts(previousSourcePath)
+	}
+	u.clearNZBHotCaches(nzb.ID)
 
 	u.logger.Info().
 		Str("nzb_id", nzb.ID).
@@ -499,6 +666,12 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 
 // Process processes archive files in an NZB (full parse)
 func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[string]*parser.FileGroup) (*storage.NZB, error) {
+	if nzb == nil {
+		return nil, fmt.Errorf("NZB metadata is required")
+	}
+	if err := u.nzbStorage.AssertGeneration(nzb.ID, nzb.Generation); err != nil {
+		return nzb, fmt.Errorf("refusing to process stale NZB metadata: %w", err)
+	}
 	u.logger.Info().
 		Str("nzb_id", nzb.ID).
 		Str("name", nzb.Name).
@@ -509,9 +682,11 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 	// Process the groups (archives)
 	updatedNZB, err := prs.Process(ctx, nzb, groups)
 	if err != nil {
-		// Mark as failed
-		_ = u.markAsFailed(nzb, err)
-		return nzb, fmt.Errorf("failed to process NZB archives: %w", err)
+		processErr := fmt.Errorf("failed to process NZB archives: %w", err)
+		if markErr := u.markAsFailed(nzb, err); markErr != nil {
+			return nzb, errors.Join(processErr, fmt.Errorf("record NZB processing failure: %w", markErr))
+		}
+		return nzb, processErr
 	}
 
 	// Post-parse availability gate: probe a sample of each content file's
@@ -522,8 +697,16 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 	// so a provider hiccup won't wrongly fail an import — only a definitively
 	// missing segment (gone on every provider) fails the NZB.
 	if err := u.checkNZBAvailability(ctx, updatedNZB); err != nil {
-		_ = u.markAsFailed(updatedNZB, err)
-		return updatedNZB, fmt.Errorf("availability check failed: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Cancellation is a workflow interruption, not evidence that the NZB
+			// is bad. Leave durable metadata resumable.
+			return updatedNZB, ctxErr
+		}
+		availabilityErr := fmt.Errorf("availability check failed: %w", err)
+		if markErr := u.markAsFailed(updatedNZB, err); markErr != nil {
+			return updatedNZB, errors.Join(availabilityErr, fmt.Errorf("record NZB availability failure: %w", markErr))
+		}
+		return updatedNZB, availabilityErr
 	}
 
 	// Mark as completed
@@ -548,6 +731,9 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 // CheckFileAvailability, so they do not fail the NZB. It returns on the first
 // definitively-missing file (fail fast).
 func (u *Usenet) checkNZBAvailability(ctx context.Context, nzb *storage.NZB) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	samplePercent := config.Get().Usenet.ImportAvailabilitySamplePercent
 	for i := range nzb.Files {
 		file := &nzb.Files[i]
@@ -559,8 +745,7 @@ func (u *Usenet) checkNZBAvailability(ctx context.Context, nzb *storage.NZB) err
 			continue
 		}
 		if ctx.Err() != nil {
-			// Cancelled/timed out: not a content failure — don't fail the NZB.
-			return nil
+			return ctx.Err()
 		}
 		if err := u.CheckFileAvailability(ctx, file, samplePercent); err != nil {
 			u.logger.Warn().
@@ -606,6 +791,9 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 
 	result, err := u.nntp.BatchStat(ctx, messageIDs)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		// Connection/system error - log and continue (don't fail availability check)
 		u.logger.Warn().
 			Err(err).
@@ -685,9 +873,19 @@ func (u *Usenet) Close() error {
 }
 
 func (u *Usenet) getFile(nzoID, filename string) (*storage.NZBFile, error) {
+	file, _, err := u.getFileForGeneration(nzoID, "", filename)
+	return file, err
+}
+
+func (u *Usenet) getFileForGeneration(nzoID, generation, filename string) (*storage.NZBFile, string, error) {
 	nzb, err := u.nzbStorage.GetNZB(nzoID)
 	if err != nil {
-		return nil, fmt.Errorf("metadata load failed: %w", err)
+		return nil, "", fmt.Errorf("metadata load failed: %w", err)
+	}
+	if generation != "" {
+		if err := requireNZBGeneration(nzoID, generation, nzb.Generation); err != nil {
+			return nil, "", err
+		}
 	}
 	for i := range nzb.Files {
 		source := nzb.Files[i]
@@ -695,20 +893,41 @@ func (u *Usenet) getFile(nzoID, filename string) (*storage.NZBFile, error) {
 			continue
 		}
 		if source.IsDeleted {
-			return nil, customerror.NewArticleNotFoundError(fmt.Errorf("articles missing on provider for %q", filename))
+			return nil, "", customerror.NewArticleNotFoundError(fmt.Errorf("articles missing on provider for %q", filename))
 		}
 		file := source
 		if file.NzbID == "" {
 			file.NzbID = nzoID
 		}
-		return &file, nil
+		return &file, nzb.Generation, nil
 	}
-	return nil, fmt.Errorf("file %s not found in NZB %s", filename, nzoID)
+	return nil, "", fmt.Errorf("file %s not found in NZB %s", filename, nzoID)
 }
 
 // IsFilePermanentlyFailed checks both the hot failure cache and durable NZB
 // metadata. Callers use it before committing HTTP headers.
 func (u *Usenet) IsFilePermanentlyFailed(nzoID, filename string) error {
+	return u.isFilePermanentlyFailedForGeneration(nzoID, "", filename)
+}
+
+// IsFilePermanentlyFailedForGeneration performs the same durable check while
+// rejecting a caller that belongs to an older lifecycle.
+func (u *Usenet) IsFilePermanentlyFailedForGeneration(nzoID, generation, filename string) error {
+	if generation == "" {
+		return fmt.Errorf("NZB generation is required")
+	}
+	return u.isFilePermanentlyFailedForGeneration(nzoID, generation, filename)
+}
+
+func (u *Usenet) isFilePermanentlyFailedForGeneration(nzoID, generation, filename string) error {
+	unlockLifecycle := u.lockNZBLifecycle(nzoID)
+	defer unlockLifecycle()
+	if generation != "" {
+		if _, err := u.nzbStorage.assertGenerationWithLifecycleHeld(nzoID, generation); err != nil {
+			return err
+		}
+	}
+
 	key := fsKey(nzoID, filename)
 	if cause, ok := u.failedFiles.Load(key); ok {
 		return customerror.NewArticleNotFoundError(cause)
@@ -774,38 +993,116 @@ func segmentDerivedFileSize(file *storage.NZBFile) (int64, error) {
 // smaller advertised size is legitimate for encrypted stored files, whose
 // segment map can include cipher padding, so it must never be expanded here.
 func (u *Usenet) PrepareStream(nzoID, filename string) (int64, error) {
-	if err := u.IsFilePermanentlyFailed(nzoID, filename); err != nil {
-		return 0, err
+	return u.prepareStreamForGeneration(nzoID, "", filename)
+}
+
+func (u *Usenet) PrepareStreamForGeneration(nzoID, generation, filename string) (int64, error) {
+	if generation == "" {
+		return 0, fmt.Errorf("NZB generation is required")
 	}
-	key := fsKey(nzoID, filename)
-	if u.preparedSizes != nil {
-		if size, ok := u.preparedSizes.Load(key); ok {
-			return size, nil
-		}
-	}
-	file, err := u.getFile(nzoID, filename)
+	return u.prepareStreamForGeneration(nzoID, generation, filename)
+}
+
+func (u *Usenet) prepareStreamForGeneration(nzoID, generation, filename string) (int64, error) {
+	sizes, fileErrors, err := u.prepareStreamsForGeneration(nzoID, generation, []string{filename})
 	if err != nil {
 		return 0, err
 	}
-	streamableSize, err := segmentDerivedFileSize(file)
-	if err != nil {
-		wrapped := customerror.NewPermanentError(fmt.Errorf("invalid usenet file metadata for %q: %w", filename, err))
-		wrapped.Code = "usenet_metadata_invalid"
-		return 0, wrapped
+	if fileErr := fileErrors[filename]; fileErr != nil {
+		return 0, fileErr
 	}
-	size := file.Size
-	if size <= 0 || size > streamableSize {
-		size = streamableSize
-		if err := u.nzbStorage.reconcileFileSize(nzoID, filename, size); err != nil {
-			return 0, fmt.Errorf("persist corrected size for %q: %w", filename, err)
-		}
-		u.logger.Warn().Str("nzo_id", nzoID).Str("file", filename).Int64("advertised_size", file.Size).Int64("segment_size", streamableSize).Msg("Clamped Usenet file size before streaming")
-	}
-	if u.preparedSizes != nil {
-		actual, _ := u.preparedSizes.LoadOrStore(key, size)
-		return actual, nil
+	size, ok := sizes[filename]
+	if !ok {
+		return 0, fmt.Errorf("file %s was not prepared in NZB %s", filename, nzoID)
 	}
 	return size, nil
+}
+
+// PrepareStreams is the batch form of PrepareStream. Cached results avoid disk
+// work on later listings; unresolved files share one metadata decode and write.
+func (u *Usenet) PrepareStreams(nzoID string, filenames []string) (map[string]int64, map[string]error, error) {
+	return u.prepareStreamsForGeneration(nzoID, "", filenames)
+}
+
+func (u *Usenet) PrepareStreamsForGeneration(nzoID, generation string, filenames []string) (map[string]int64, map[string]error, error) {
+	if generation == "" {
+		return nil, nil, fmt.Errorf("NZB generation is required")
+	}
+	return u.prepareStreamsForGeneration(nzoID, generation, filenames)
+}
+
+func (u *Usenet) prepareStreamsForGeneration(nzoID, generation string, filenames []string) (map[string]int64, map[string]error, error) {
+	unlockLifecycle := u.lockNZBLifecycle(nzoID)
+	defer unlockLifecycle()
+	if generation != "" {
+		if _, err := u.nzbStorage.assertGenerationWithLifecycleHeld(nzoID, generation); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	sizes := make(map[string]int64, len(filenames))
+	fileErrors := make(map[string]error)
+	unresolved := make([]string, 0, len(filenames))
+
+	for _, filename := range filenames {
+		key := fsKey(nzoID, filename)
+		if cause, ok := u.failedFiles.Load(key); ok {
+			fileErrors[filename] = customerror.NewArticleNotFoundError(cause)
+			continue
+		}
+		if u.preparedSizes != nil {
+			if size, ok := u.preparedSizes.Load(key); ok {
+				sizes[filename] = size
+				continue
+			}
+		}
+		unresolved = append(unresolved, filename)
+	}
+	if len(unresolved) == 0 {
+		return sizes, fileErrors, nil
+	}
+
+	prepared, err := u.nzbStorage.prepareStreamFilesWithLifecycleHeld(nzoID, generation, unresolved)
+	if err != nil {
+		return nil, nil, fmt.Errorf("prepare Usenet metadata for %s: %w", nzoID, err)
+	}
+	u.runLifecycleTestHook("prepare-publish", nzoID)
+	for _, filename := range unresolved {
+		result := prepared[filename]
+		key := fsKey(nzoID, filename)
+		if result.err != nil {
+			fileErrors[filename] = result.err
+			var permanent *customerror.Error
+			if errors.As(result.err, &permanent) && permanent.Code == "usenet_article_missing" {
+				u.failedFiles.Store(key, result.err)
+				if u.preparedSizes != nil {
+					u.preparedSizes.Delete(key)
+				}
+			}
+			continue
+		}
+
+		size := result.size
+		if u.preparedSizes != nil {
+			actual, _ := u.preparedSizes.LoadOrStore(key, size)
+			size = actual
+		}
+		sizes[filename] = size
+		if result.corrected {
+			if u.fs != nil {
+				if entry, ok := u.fs.Load(key); ok {
+					u.retireFSEntry(key, entry)
+				}
+			}
+			u.logger.Warn().
+				Str("nzo_id", nzoID).
+				Str("file", filename).
+				Int64("advertised_size", result.advertisedSize).
+				Int64("segment_size", result.streamableSize).
+				Msg("Clamped Usenet file size before streaming")
+		}
+	}
+	return sizes, fileErrors, nil
 }
 
 func (u *Usenet) getFiles(nzoID string, filenames []string) (map[string]*storage.NZBFile, error) {
@@ -853,10 +1150,45 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 
 // Stream streams a file using the new streaming system with caching and worker limiting
 func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
+	return u.streamForGeneration(ctx, nzoID, "", filename, start, end, writer, nil)
+}
+
+// StreamReadyInfo describes the exact acquired reader and effective range. A
+// caller may safely commit response headers from this value: streaming proceeds
+// through the same retained reader handle after the callback returns.
+type StreamReadyInfo struct {
+	Size  int64
+	Start int64
+	End   int64
+}
+
+type StreamReadyFunc func(StreamReadyInfo) error
+
+// StreamForGeneration guarantees that both the segment map used for the read
+// and any durable failure it records belong to generation.
+func (u *Usenet) StreamForGeneration(ctx context.Context, nzoID, generation, filename string, start, end int64, writer io.Writer) error {
+	if generation == "" {
+		return fmt.Errorf("NZB generation is required")
+	}
+	return u.streamForGeneration(ctx, nzoID, generation, filename, start, end, writer, nil)
+}
+
+// StreamForGenerationReady acquires the exact generation-bound reader first,
+// reports its authoritative size/range to onReady, then copies bytes through
+// that same retained handle. onReady is never called on preparation failure or
+// after the requested generation has been replaced.
+func (u *Usenet) StreamForGenerationReady(ctx context.Context, nzoID, generation, filename string, start, end int64, writer io.Writer, onReady StreamReadyFunc) error {
+	if generation == "" {
+		return fmt.Errorf("NZB generation is required")
+	}
+	return u.streamForGeneration(ctx, nzoID, generation, filename, start, end, writer, onReady)
+}
+
+func (u *Usenet) streamForGeneration(ctx context.Context, nzoID, generation, filename string, start, end int64, writer io.Writer, onReady StreamReadyFunc) error {
 	deadline := newProgressDeadline(ctx, u.readTimeout)
 	defer deadline.Close()
 	ctx = deadline.Context
-	if err := u.IsFilePermanentlyFailed(nzoID, filename); err != nil {
+	if err := u.isFilePermanentlyFailedForGeneration(nzoID, generation, filename); err != nil {
 		return err
 	}
 
@@ -867,13 +1199,11 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 		return fmt.Errorf("invalid byte range %d-%d", start, end)
 	}
 
-	// Use getOrCreateEntry to get both entry and key in one call,
-	// avoiding redundant key computation in releaseFS.
-	ufsEntry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	ufsEntry, err := u.getOrCreateEntryForGeneration(ctx, nzoID, generation, filename)
 	if err != nil {
 		return fmt.Errorf("failed to get or create file system: %w", err)
 	}
-	defer u.releaseFS(key)
+	defer u.releaseFS(ufsEntry)
 
 	// Use start/end directly - file segments are already positioned correctly
 	rangeStart := start
@@ -889,6 +1219,30 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	}
 	if rangeEnd < rangeStart {
 		return fmt.Errorf("invalid reader byte range %d-%d for size %d", rangeStart, rangeEnd, readerSize)
+	}
+	u.runLifecycleTestHook("stream-reader-acquired", nzoID)
+	readyInfo := StreamReadyInfo{Size: readerSize, Start: rangeStart, End: rangeEnd}
+	if generation != "" {
+		// Serialize the final current-generation check with replacement through
+		// the readiness callback. Replacement may proceed once headers are
+		// committed; the retained fsEntry remains safe for this response, and a
+		// later 430 is still conditionally fenced by its generation.
+		unlockLifecycle := u.lockNZBLifecycle(nzoID)
+		if _, generationErr := u.nzbStorage.assertGenerationWithLifecycleHeld(nzoID, generation); generationErr != nil {
+			unlockLifecycle()
+			return generationErr
+		}
+		if onReady != nil {
+			if readyErr := onReady(readyInfo); readyErr != nil {
+				unlockLifecycle()
+				return readyErr
+			}
+		}
+		unlockLifecycle()
+	} else if onReady != nil {
+		if err := onReady(readyInfo); err != nil {
+			return err
+		}
 	}
 
 	length := rangeEnd - rangeStart + 1
@@ -926,18 +1280,40 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 
 	// Mark file as failed if article not found (permanent error)
 	if err != nil && nntp.IsArticleNotFoundError(err) {
-		cause := fmt.Errorf("articles missing on provider for %q: %w", filename, err)
-		u.failedFiles.Store(key, cause)
-		if u.preparedSizes != nil {
-			u.preparedSizes.Delete(key)
-		}
-		if persistErr := u.nzbStorage.markFilePermanentlyFailed(nzoID, filename, cause.Error()); persistErr != nil {
-			u.logger.Error().Err(persistErr).Str("nzo_id", nzoID).Str("file", filename).Msg("Failed to persist permanent Usenet file failure")
-		}
-		return customerror.NewArticleNotFoundError(cause)
+		return u.recordPermanentArticleFailureForGeneration(nzoID, ufsEntry.generation, filename, err)
 	}
 
 	return err
+}
+
+func (u *Usenet) recordPermanentArticleFailure(nzoID, filename string, articleErr error) error {
+	return u.recordPermanentArticleFailureForGeneration(nzoID, "", filename, articleErr)
+}
+
+func (u *Usenet) recordPermanentArticleFailureForGeneration(nzoID, generation, filename string, articleErr error) error {
+	unlockLifecycle := u.lockNZBLifecycle(nzoID)
+	defer unlockLifecycle()
+
+	cause := fmt.Errorf("articles missing on provider for %q: %w", filename, articleErr)
+	if persistErr := u.nzbStorage.markFilePermanentlyFailedWithLifecycleHeld(nzoID, generation, filename, cause.Error()); persistErr != nil {
+		// Do not acknowledge/cache a permanent 410 until it is durable. A
+		// transient metadata write failure must be retried after this request
+		// instead of disappearing on process restart.
+		return fmt.Errorf("persist permanent usenet failure for %q: %w (article error: %v)", filename, persistErr, cause)
+	}
+
+	u.runLifecycleTestHook("failure-publish", nzoID)
+	key := fsKey(nzoID, filename)
+	if u.fs != nil {
+		if entry, ok := u.fs.Load(key); ok {
+			u.retireFSEntry(key, entry)
+		}
+	}
+	u.failedFiles.Store(key, cause)
+	if u.preparedSizes != nil {
+		u.preparedSizes.Delete(key)
+	}
+	return customerror.NewArticleNotFoundError(cause)
 }
 
 // safeCopyBuffer copies from src to dst using buf, with context checking and
@@ -1032,11 +1408,11 @@ func (u *Usenet) Touch(ctx context.Context, nzoID, filename string) error {
 // Uses the shared entry/reader so the cache is available for Stream calls.
 func (u *Usenet) PreCache(ctx context.Context, nzoID, filename string) error {
 	// Use shared entry (same as Stream)
-	entry, key, err := u.getOrCreateEntry(ctx, nzoID, filename)
+	entry, err := u.getOrCreateEntry(ctx, nzoID, filename)
 	if err != nil {
 		return fmt.Errorf("failed to get or create entry: %w", err)
 	}
-	defer u.releaseFS(key)
+	defer u.releaseFS(entry)
 
 	if len(entry.volumes) == 0 {
 		return fmt.Errorf("no volumes available for file %s", filename)
@@ -1081,6 +1457,73 @@ func (u *Usenet) Stats() map[string]any {
 // GetNZB returns NZB metadata by ID
 func (u *Usenet) GetNZB(id string) (*storage.NZB, error) {
 	return u.nzbStorage.GetNZB(id)
+}
+
+// AssertGeneration atomically adopts expected into legacy metadata or verifies
+// strict equality for already-versioned metadata.
+func (u *Usenet) AssertGeneration(id, expected string) error {
+	if expected == "" {
+		return fmt.Errorf("NZB generation is required")
+	}
+	return u.nzbStorage.AssertGeneration(id, expected)
+}
+
+// NormalizeNZBFileSizes corrects impossible advertised file sizes from the
+// segment map while holding the NZB lifecycle lock across the full
+// read-modify-write operation. The returned NZB is the version that was read
+// (and, when changed, persisted). Callers must use this method instead of a
+// GetNZB/modify/NZBStorage.AddNZB sequence, which can overwrite a concurrent
+// failure or replacement with stale metadata.
+func (u *Usenet) NormalizeNZBFileSizes(id string) (*storage.NZB, bool, error) {
+	unlockLifecycle := u.lockNZBLifecycle(id)
+	defer unlockLifecycle()
+
+	nzb, err := u.nzbStorage.GetNZB(id)
+	if err != nil {
+		return nil, false, err
+	}
+	changed, _, err := normalizeNZBFileSizes(nzb)
+	if err != nil {
+		return nil, false, err
+	}
+	if !changed {
+		return nzb, false, nil
+	}
+
+	u.runLifecycleTestHook("normalize-write", id)
+	if err := u.nzbStorage.addNZBWithLifecycleHeld(nzb); err != nil {
+		return nil, false, fmt.Errorf("persist normalized NZB metadata: %w", err)
+	}
+	u.clearNZBHotCaches(id)
+	return nzb, true, nil
+}
+
+func normalizeNZBFileSizes(nzb *storage.NZB) (bool, int64, error) {
+	if nzb == nil {
+		return false, 0, nil
+	}
+
+	changed := false
+	var total int64
+	for i := range nzb.Files {
+		file := &nzb.Files[i]
+		if len(file.Segments) > 0 {
+			streamSize, err := segmentDerivedFileSize(file)
+			if err != nil {
+				return false, 0, fmt.Errorf("normalize file size for %q: %w", file.Name, err)
+			}
+			if file.Size <= 0 || file.Size > streamSize {
+				file.Size = streamSize
+				changed = true
+			}
+		}
+		total += file.Size
+	}
+	if nzb.TotalSize != total {
+		nzb.TotalSize = total
+		changed = true
+	}
+	return changed, total, nil
 }
 
 // GetNZBHeader returns NZB metadata without its segment map. Use this when only
@@ -1134,14 +1577,44 @@ func (u *Usenet) GetSpeedTestResults() map[string]nntp.SpeedTestResult {
 	return u.nntp.GetSpeedTestResults()
 }
 
-func (u *Usenet) saveNZBFile(id string, content []byte) (string, error) {
+func generationPathToken(generation string) string {
+	sum := sha256.Sum256([]byte(generation))
+	return fmt.Sprintf("%x", sum[:12])
+}
+
+func (u *Usenet) generationArtifactPath(id, generation, suffix string) string {
+	return filepath.Join(u.metadataDir, id+"."+generationPathToken(generation)+suffix)
+}
+
+func (u *Usenet) removeGenerationSourceArtifacts(id, generation string) {
+	if id == "" || generation == "" {
+		return
+	}
+	removeNZBSourceArtifacts(u.generationArtifactPath(id, generation, ".queued"))
+	removeNZBSourceArtifacts(u.generationArtifactPath(id, generation, ".source"))
+}
+
+func removeNZBSourceArtifacts(path string) {
+	if path == "" {
+		return
+	}
+	_ = os.Remove(path)
+	_ = os.Remove(path + ".processing")
+	_ = os.Remove(path + ".processed")
+	_ = os.Remove(path + ".failed")
+}
+
+func (u *Usenet) saveNZBFile(id, generation string, content []byte) (string, error) {
 	// Store the raw source keyed by the bounded NZB ID rather than the
 	// (untrusted, arbitrarily long) display name. ext4 caps a path component at
 	// 255 bytes; a long release name plus a ".processing"/".importing"/".queued"
 	// marker suffix blew past that limit, which failed the rename, wedged the
 	// refresh watcher, and left truncated fragment files behind. The UUID keeps
 	// every derived name comfortably under the cap.
-	path := filepath.Join(u.metadataDir, id+".nzb")
+	// Keep managed in-flight sources outside the watched .nzb extension. A
+	// watcher scan between file creation and marker creation could otherwise
+	// claim/rename this source and enqueue a duplicate.
+	path := u.generationArtifactPath(id, generation, ".source")
 	if err := os.WriteFile(path, content, 0644); err != nil {
 		return "", fmt.Errorf("failed to save NZB file to disk: %w", err)
 	}
@@ -1150,16 +1623,98 @@ func (u *Usenet) saveNZBFile(id string, content []byte) (string, error) {
 
 // StageNZB persists a queued NZB before an active-download worker starts.
 func (u *Usenet) StageNZB(id string, content []byte) (string, error) {
+	return u.StageNZBForGeneration(id, newNZBGeneration(), content)
+}
+
+// StageNZBForGeneration keeps queued sources from different same-ID
+// lifecycles in distinct files, so cleanup by an old worker cannot remove the
+// replacement's staged bytes.
+func (u *Usenet) StageNZBForGeneration(id, generation string, content []byte) (string, error) {
 	if id == "" {
 		return "", fmt.Errorf("NZB ID is required")
 	}
+	if generation == "" {
+		return "", fmt.Errorf("NZB generation is required")
+	}
 	// Keep the staged file off the .nzb extension so the metadata-directory
 	// watcher does not treat a pending active-download job as an unmanaged import.
-	path := filepath.Join(u.metadataDir, id+".queued")
+	path := u.generationArtifactPath(id, generation, ".queued")
 	if err := os.WriteFile(path, content, 0644); err != nil {
 		return "", fmt.Errorf("failed to stage NZB file: %w", err)
 	}
 	return path, nil
+}
+
+func normalizedNZBArtifactPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		path = abs
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
+func isManagedQueuedNZBName(name string) bool {
+	if !strings.HasSuffix(name, ".queued") {
+		return false
+	}
+	stem := strings.TrimSuffix(name, ".queued")
+	dot := strings.LastIndexByte(stem, '.')
+	if dot <= 0 {
+		return false
+	}
+	token := stem[dot+1:]
+	if len(token) != 24 {
+		return false
+	}
+	for i := range len(token) {
+		if (token[i] < '0' || token[i] > '9') && (token[i] < 'a' || token[i] > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// CleanupOrphanedStagedNZBs removes only managed generation-qualified queue
+// artifacts that are not referenced by a durable queue row. It is intended to
+// run synchronously before persisted jobs are restored, closing the crash gap
+// between StageNZBForGeneration and Queue.Add without touching user files or a
+// live replacement generation.
+func (u *Usenet) CleanupOrphanedStagedNZBs(livePaths []string) (int, error) {
+	live := make(map[string]struct{}, len(livePaths))
+	for _, path := range livePaths {
+		if path != "" {
+			live[normalizedNZBArtifactPath(path)] = struct{}{}
+		}
+	}
+
+	entries, err := os.ReadDir(u.metadataDir)
+	if err != nil {
+		return 0, fmt.Errorf("read NZB metadata dir for staged cleanup: %w", err)
+	}
+
+	removed := 0
+	var cleanupErrors []error
+	for _, entry := range entries {
+		if entry.IsDir() || !isManagedQueuedNZBName(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(u.metadataDir, entry.Name())
+		if _, ok := live[normalizedNZBArtifactPath(path)]; ok {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			if !os.IsNotExist(err) {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("remove orphan staged NZB %s: %w", path, err))
+			}
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(cleanupErrors...)
 }
 
 // RemoveStagedNZB removes a queued source file after it has been parsed.
@@ -1179,6 +1734,48 @@ func (u *Usenet) markAsProcessing(nzb *storage.NZB) error {
 }
 
 func (u *Usenet) markAsCompleted(nzb *storage.NZB) error {
+	unlockLifecycle := u.lockNZBLifecycle(nzb.ID)
+	defer unlockLifecycle()
+
+	current, err := u.nzbStorage.GetNZB(nzb.ID)
+	if err != nil {
+		// In particular, never recreate metadata after a concurrent Delete.
+		return fmt.Errorf("load current NZB before completion: %w", err)
+	}
+	if _, err := adoptOrRequireNZBGeneration(current, nzb.Generation); err != nil {
+		return err
+	}
+	if current.IsBad || current.Status == NZBStatusFailed {
+		return fmt.Errorf("refusing to complete NZB %s after durable failure: %s", nzb.ID, current.FailMessage)
+	}
+	for i := range current.Files {
+		if current.Files[i].IsDeleted {
+			return fmt.Errorf("refusing to complete NZB %s after file %q permanently failed", nzb.ID, current.Files[i].Name)
+		}
+	}
+	// Preserve a size correction committed after this parser snapshot was
+	// created, but only when the immutable segment layout still identifies the
+	// same logical file.
+	currentFiles := make(map[string]*storage.NZBFile, len(current.Files))
+	for i := range current.Files {
+		currentFiles[current.Files[i].Name] = &current.Files[i]
+	}
+	sizesMerged := false
+	for i := range nzb.Files {
+		durable := currentFiles[nzb.Files[i].Name]
+		if durable != nil && durable.Size > 0 && sameNZBSegments(durable.Segments, nzb.Files[i].Segments) && durable.Size != nzb.Files[i].Size {
+			nzb.Files[i].Size = durable.Size
+			sizesMerged = true
+		}
+	}
+	if sizesMerged {
+		var total int64
+		for i := range nzb.Files {
+			total += nzb.Files[i].Size
+		}
+		nzb.TotalSize = total
+	}
+
 	nzb.Status = NZBStatusCompleted
 
 	// The parsed segment map (.meta) is the only artifact needed for streaming
@@ -1195,38 +1792,108 @@ func (u *Usenet) markAsCompleted(nzb *storage.NZB) error {
 		nzb.Path = ""
 	}
 
-	if err := u.nzbStorage.AddNZB(nzb); err != nil {
+	if err := u.nzbStorage.addNZBWithLifecycleHeld(nzb); err != nil {
 		return fmt.Errorf("failed to save NZB to storage: %w", err)
 	}
+	u.clearNZBHotCaches(nzb.ID)
 	return nil
 }
 
-func (u *Usenet) markAsFailed(nzb *storage.NZB, err error) error {
-	// Mark as failed in storage
-	nzb.Status = NZBStatusFailed
-	nzb.FailMessage = err.Error()
-	if err := u.nzbStorage.AddNZB(nzb); err != nil {
-		return fmt.Errorf("failed to mark NZB as failed in storage: %w", err)
+func sameNZBSegments(a, b []storage.NZBSegment) bool {
+	if len(a) != len(b) {
+		return false
 	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (u *Usenet) markAsFailed(nzb *storage.NZB, err error) error {
+	unlockLifecycle := u.lockNZBLifecycle(nzb.ID)
+	defer unlockLifecycle()
+
+	// Apply the status change to a fresh durable snapshot. The parser-owned NZB
+	// may predate a size correction or permanent file failure, and writing that
+	// long-lived value would silently undo the newer metadata.
+	current, loadErr := u.nzbStorage.GetNZB(nzb.ID)
+	if loadErr != nil {
+		// In particular, never recreate metadata after a concurrent Delete.
+		return fmt.Errorf("load current NZB before failure update: %w", loadErr)
+	}
+	if _, generationErr := adoptOrRequireNZBGeneration(current, nzb.Generation); generationErr != nil {
+		return generationErr
+	}
+	failMessage := err.Error()
+	if current.IsBad && current.FailMessage != "" {
+		failMessage = current.FailMessage
+	}
+	current.Status = NZBStatusFailed
+	current.FailMessage = failMessage
+	if writeErr := u.nzbStorage.addNZBWithLifecycleHeld(current); writeErr != nil {
+		return fmt.Errorf("failed to mark NZB as failed in storage: %w", writeErr)
+	}
+	u.clearNZBHotCaches(current.ID)
+	nzb.Status = current.Status
+	nzb.FailMessage = current.FailMessage
 
 	// Remove processing marker if exists
-	processingMarker := nzb.Path + ".processing"
+	processingMarker := current.Path + ".processing"
 	_ = os.Remove(processingMarker)
 
 	// Remove the nzb file itself, as it's considered failed
-	if nzb.Path != "" {
-		if err := os.Remove(nzb.Path); err != nil && !os.IsNotExist(err) {
-			u.logger.Warn().Err(err).Str("path", nzb.Path).Msg("Failed to delete NZB file from disk after failure")
+	if current.Path != "" {
+		if removeErr := os.Remove(current.Path); removeErr != nil && !os.IsNotExist(removeErr) {
+			u.logger.Warn().Err(removeErr).Str("path", current.Path).Msg("Failed to delete NZB file from disk after failure")
 		}
+		_ = os.Remove(current.Path + ".processing")
 	}
 	return nil
 }
 
 func (u *Usenet) Delete(nzoID string) error {
+	return u.delete(nzoID, "")
+}
+
+// DeleteForGeneration removes metadata and source artifacts only while the
+// caller still owns the current lifecycle.
+func (u *Usenet) DeleteForGeneration(nzoID, generation string) error {
+	if generation == "" {
+		return fmt.Errorf("NZB generation is required")
+	}
+	return u.delete(nzoID, generation)
+}
+
+func (u *Usenet) delete(nzoID, generation string) error {
+	unlockLifecycle := u.lockNZBLifecycle(nzoID)
+	defer unlockLifecycle()
+
 	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
 	if err != nil {
+		if generation != "" && errors.Is(err, ErrNZBNotFound) {
+			// Generation-qualified cleanup is intentionally idempotent. A retry
+			// after a crash may observe that its exact resource was already
+			// removed; a live replacement would still be present and fail the
+			// generation assertion below instead of being touched.
+			u.removeGenerationSourceArtifacts(nzoID, generation)
+			u.clearNZBHotCaches(nzoID)
+			return nil
+		}
 		return fmt.Errorf("failed to get NZB: %w", err)
 	}
+	if generation != "" {
+		nzb, err = u.nzbStorage.assertGenerationWithLifecycleHeld(nzoID, generation)
+		if err != nil {
+			return err
+		}
+	}
+	artifactGeneration := generation
+	if artifactGeneration == "" {
+		artifactGeneration = nzb.Generation
+	}
+	u.removeGenerationSourceArtifacts(nzoID, artifactGeneration)
 
 	// Delete NZB XML file from disk
 	if nzb.Path != "" {
@@ -1239,19 +1906,14 @@ func (u *Usenet) Delete(nzoID string) error {
 		_ = os.Remove(processedMarker)
 		failedMarker := nzb.Path + ".failed"
 		_ = os.Remove(failedMarker)
+		_ = os.Remove(nzb.Path + ".processing")
 	}
 
 	// Delete from file-based storage
-	if err := u.nzbStorage.DeleteNZB(nzoID); err != nil {
+	if err := u.nzbStorage.deleteNZBWithLifecycleHeld(nzoID, generation); err != nil {
 		return fmt.Errorf("failed to delete NZB from storage: %w", err)
 	}
-	for i := range nzb.Files {
-		key := fsKey(nzoID, nzb.Files[i].Name)
-		u.failedFiles.Delete(key)
-		if u.preparedSizes != nil {
-			u.preparedSizes.Delete(key)
-		}
-	}
+	u.clearNZBHotCaches(nzoID)
 	return nil
 }
 

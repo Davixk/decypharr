@@ -297,6 +297,7 @@ type NZBProto struct {
 	Storage          string                 `protobuf:"bytes,21,opt,name=storage,proto3" json:"storage,omitempty"`
 	FailMessage      string                 `protobuf:"bytes,22,opt,name=fail_message,json=failMessage,proto3" json:"fail_message,omitempty"`
 	Password         string                 `protobuf:"bytes,23,opt,name=password,proto3" json:"password,omitempty"`
+	Generation       string                 `protobuf:"bytes,24,opt,name=generation,proto3" json:"generation,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -492,6 +493,13 @@ func (x *NZBProto) GetPassword() string {
 	return ""
 }
 
+func (x *NZBProto) GetGeneration() string {
+	if x != nil {
+		return x.Generation
+	}
+	return ""
+}
+
 var File_nzb_proto protoreflect.FileDescriptor
 
 const file_nzb_proto_rawDesc = "" +
@@ -524,7 +532,7 @@ const file_nzb_proto_rawDesc = "" +
 	"\fsegment_size\x18\f \x01(\x03R\vsegmentSize\x12%\n" +
 	"\x0eencryption_key\x18\r \x01(\fR\rencryptionKey\x12#\n" +
 	"\rencryption_iv\x18\x0e \x01(\fR\fencryptionIv\x12!\n" +
-	"\fis_encrypted\x18\x0f \x01(\bR\visEncrypted\"\xb4\x05\n" +
+	"\fis_encrypted\x18\x0f \x01(\bR\visEncrypted\"\xd4\x05\n" +
 	"\bNZBProto\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -554,7 +562,9 @@ const file_nzb_proto_rawDesc = "" +
 	"\x06is_bad\x18\x14 \x01(\bR\x05isBad\x12\x18\n" +
 	"\astorage\x18\x15 \x01(\tR\astorage\x12!\n" +
 	"\ffail_message\x18\x16 \x01(\tR\vfailMessage\x12\x1a\n" +
-	"\bpassword\x18\x17 \x01(\tR\bpasswordB,Z*github.com/sirrobot01/decypharr/pkg/usenetb\x06proto3"
+	"\bpassword\x18\x17 \x01(\tR\bpassword\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x18 \x01(\tR\ngenerationB,Z*github.com/sirrobot01/decypharr/pkg/usenetb\x06proto3"
 
 var (
 	file_nzb_proto_rawDescOnce sync.Once

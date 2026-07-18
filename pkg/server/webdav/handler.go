@@ -26,15 +26,27 @@ const (
 )
 
 type Handler struct {
-	logger  *logger.RateLimitedLogger
-	manager *manager.Manager
+	logger   *logger.RateLimitedLogger
+	manager  *manager.Manager
+	metadata entryMetadataResolver
+}
+
+type entryMetadataResolver interface {
+	RootInfo() *manager.FileInfo
+	GetEntries() []manager.FileInfo
+	GetEntryNode(string) *manager.FileInfo
+	GetEntryChildren(string) (*manager.FileInfo, []manager.FileInfo)
+	GetEntryInfo(string) (*manager.FileInfo, error)
+	GetTorrentChildren(string) (*manager.FileInfo, []manager.FileInfo)
+	GetTorrentFile(string, string) (*manager.FileInfo, error)
 }
 
 func NewHandler(mgr *manager.Manager) *Handler {
 	log := logger.NewRateLimitedLogger(logger.WithLogger(logger.New("webdav")))
 	h := &Handler{
-		logger:  log,
-		manager: mgr,
+		logger:   log,
+		manager:  mgr,
+		metadata: mgr,
 	}
 	return h
 }
@@ -103,14 +115,17 @@ func (h *Handler) handler(current *manager.FileInfo, children []manager.FileInfo
 }
 
 func (h *Handler) handleRoot(w http.ResponseWriter, r *http.Request) {
-	current := h.manager.RootInfo()
-	children := h.manager.GetEntries()
+	current := h.metadata.RootInfo()
+	var children []manager.FileInfo
+	if requestNeedsChildren(r) {
+		children = h.metadata.GetEntries()
+	}
 	h.handler(current, children, w, r)
 }
 
 func (h *Handler) handleGroup(w http.ResponseWriter, r *http.Request) {
 	group := utils.PathUnescape(chi.URLParam(r, "group"))
-	currentInfo, rawEntries := h.manager.GetEntryChildren(group)
+	currentInfo, rawEntries := h.resolveGroupMetadata(group, requestNeedsChildren(r))
 	h.handler(currentInfo, rawEntries, w, r)
 
 }
@@ -118,14 +133,14 @@ func (h *Handler) handleGroup(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleTorrentFolder(w http.ResponseWriter, r *http.Request) {
 	torrent := utils.PathUnescape(chi.URLParam(r, "torrent"))
 
-	currentInfo, children := h.manager.GetTorrentChildren(torrent)
+	currentInfo, children := h.resolveTorrentMetadata(torrent, requestNeedsChildren(r))
 	h.handler(currentInfo, children, w, r)
 }
 
 func (h *Handler) handleTorrentFile(w http.ResponseWriter, r *http.Request) {
 	torrent := utils.PathUnescape(chi.URLParam(r, "torrent"))
 	file := utils.PathUnescape(chi.URLParam(r, "file"))
-	currentInfo, err := h.manager.GetTorrentFile(torrent, file)
+	currentInfo, err := h.metadata.GetTorrentFile(torrent, file)
 	if err != nil || currentInfo == nil {
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
@@ -133,10 +148,32 @@ func (h *Handler) handleTorrentFile(w http.ResponseWriter, r *http.Request) {
 	h.handler(currentInfo, nil, w, r)
 }
 
+func requestNeedsChildren(r *http.Request) bool {
+	return r.Method == PROPFIND && propfindIncludesChildren(r)
+}
+
+func (h *Handler) resolveGroupMetadata(group string, includeChildren bool) (*manager.FileInfo, []manager.FileInfo) {
+	if includeChildren {
+		return h.metadata.GetEntryChildren(group)
+	}
+	return h.metadata.GetEntryNode(group), nil
+}
+
+func (h *Handler) resolveTorrentMetadata(torrent string, includeChildren bool) (*manager.FileInfo, []manager.FileInfo) {
+	if includeChildren {
+		return h.metadata.GetTorrentChildren(torrent)
+	}
+	current, err := h.metadata.GetEntryInfo(torrent)
+	if err != nil {
+		return nil, nil
+	}
+	return current, nil
+}
+
 func (h *Handler) commonMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("DAV", "1, 2")
-		w.Header().Set("Allow", "OPTIONS, PROPFIND GET, HEAD, POST, PUT, DELETE, MKCOL, PROPPATCH, COPY, MOVE, LOCK, UNLOCK")
+		w.Header().Set("Allow", "OPTIONS, PROPFIND, GET, HEAD, POST, PUT, DELETE, MKCOL, PROPPATCH, COPY, MOVE, LOCK, UNLOCK")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "OPTIONS, GET, PROPFIND, HEAD, POST, PUT, DELETE, MKCOL, PROPPATCH, COPY, MOVE, LOCK, UNLOCK")
 		w.Header().Set("Access-Control-Allow-Headers", "Depth, Content-Type, Authorization")

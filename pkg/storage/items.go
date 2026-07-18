@@ -1,9 +1,233 @@
 package storage
 
 import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 	"google.golang.org/protobuf/proto"
 )
+
+type entryItemProjection struct {
+	item     *EntryItem
+	protocol config.Protocol
+}
+
+// preferEntryItemFile makes duplicate folder/file projections independent of
+// insertion and scan order. The newest file wins; an exact timestamp tie is
+// broken by the durable infohash identity.
+func preferEntryItemFile(candidate, existing *File) bool {
+	if candidate == nil {
+		return false
+	}
+	if existing == nil || candidate.InfoHash == existing.InfoHash {
+		return true
+	}
+	if !candidate.AddedOn.Equal(existing.AddedOn) {
+		return candidate.AddedOn.After(existing.AddedOn)
+	}
+	if candidate.InfoHash != existing.InfoHash {
+		return candidate.InfoHash > existing.InfoHash
+	}
+	if candidate.Size != existing.Size {
+		return candidate.Size > existing.Size
+	}
+	return candidate.Name > existing.Name
+}
+
+func mergeEntryIntoItem(item *EntryItem, entry *Entry) {
+	if item == nil || entry == nil {
+		return
+	}
+	if item.Files == nil {
+		item.Files = make(map[string]*File)
+	}
+	for fileName, file := range entry.Files {
+		if preferEntryItemFile(file, item.Files[fileName]) {
+			item.Files[fileName] = file
+		}
+	}
+	item.Size = item.GetSize()
+}
+
+func addEntryToProjection(projections map[string]*entryItemProjection, entry *Entry) {
+	if entry == nil {
+		return
+	}
+	name := entry.GetFolder()
+	if name == "" {
+		return
+	}
+	projection := projections[name]
+	if projection == nil {
+		projection = &entryItemProjection{item: &EntryItem{Name: name, Files: make(map[string]*File)}}
+		projections[name] = projection
+	}
+	if entry.Protocol != "" && (projection.protocol == "" || entry.Protocol < projection.protocol) {
+		projection.protocol = entry.Protocol
+	}
+	mergeEntryIntoItem(projection.item, entry)
+}
+
+func (s *Storage) projectEntryItem(name string) (*entryItemProjection, error) {
+	projections := make(map[string]*entryItemProjection, 1)
+	if err := s.entries.ForEach(func(key string, value []byte) error {
+		if strings.HasPrefix(key, "__") {
+			return nil
+		}
+		var pb EntryProto
+		if err := proto.Unmarshal(value, &pb); err != nil {
+			return fmt.Errorf("decode main entry %s while rebuilding folder %s: %w", key, name, err)
+		}
+		entry := ProtoToEntry(&pb)
+		if entry.GetFolder() == name {
+			addEntryToProjection(projections, entry)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return projections[name], nil
+}
+
+func (s *Storage) writeEntryItemProjectionLocked(name string, projection *entryItemProjection, oldPresent, oldReadable bool, oldItem *EntryItem) (bool, error) {
+	if projection == nil || projection.item == nil || len(projection.item.Files) == 0 {
+		if oldPresent {
+			if err := s.entryItems.Delete(name); err != nil {
+				return false, fmt.Errorf("delete stale entry item %s: %w", name, err)
+			}
+		}
+		if err := s.DeleteEntryHealth(name); err != nil {
+			return oldPresent, fmt.Errorf("delete stale entry health %s: %w", name, err)
+		}
+		return oldPresent, nil
+	}
+
+	projection.item.Name = name
+	projection.item.Size = projection.item.GetSize()
+	data, err := proto.Marshal(EntryItemToProto(projection.item))
+	if err != nil {
+		return false, fmt.Errorf("marshal rebuilt entry item %s: %w", name, err)
+	}
+	if err := s.entryItems.Put(name, data, nil); err != nil {
+		return false, fmt.Errorf("write rebuilt entry item %s: %w", name, err)
+	}
+
+	changed := !oldPresent || !oldReadable || oldItem == nil ||
+		oldItem.Name != name || oldItem.Size != projection.item.Size ||
+		EntryItemRepairFingerprint(oldItem) != EntryItemRepairFingerprint(projection.item)
+	if changed {
+		s.MarkEntryDirty(name, projection.protocol, "entry_item_rebuilt")
+	}
+	return changed, nil
+}
+
+// rebuildEntryItemLocked replaces one derivative folder row from authoritative
+// main-store entries. The caller must hold the folder's item mutation lock.
+func (s *Storage) rebuildEntryItemLocked(name string, fallbackProtocol config.Protocol) (bool, error) {
+	if name == "" {
+		return false, nil
+	}
+	oldPresent := s.entryItems.Exists(name)
+	oldReadable := false
+	var oldItem *EntryItem
+	if oldPresent {
+		if data, err := s.entryItems.Get(name); err == nil {
+			var pb EntryItemProto
+			if err := proto.Unmarshal(data, &pb); err == nil {
+				oldItem = ProtoToEntryItem(&pb)
+				oldReadable = true
+			}
+		}
+	}
+
+	projection, err := s.projectEntryItem(name)
+	if err != nil {
+		return false, err
+	}
+	if projection != nil && projection.protocol == "" {
+		projection.protocol = fallbackProtocol
+	}
+	return s.writeEntryItemProjectionLocked(name, projection, oldPresent, oldReadable, oldItem)
+}
+
+func (s *Storage) rebuildEntryItem(name string, fallbackProtocol config.Protocol) (bool, error) {
+	if name == "" {
+		return false, nil
+	}
+	unlock := s.lockItemMutation(name)
+	defer unlock()
+	return s.rebuildEntryItemLocked(name, fallbackProtocol)
+}
+
+// reconcileEntryItemsAtStartup reconstructs the complete WebDAV folder index
+// from authoritative main rows. It runs before Storage is published to callers,
+// so its one-pass snapshot cannot overwrite a concurrent mutation.
+func (s *Storage) reconcileEntryItemsAtStartup() (int, error) {
+	projections := make(map[string]*entryItemProjection)
+	if err := s.entries.ForEach(func(key string, value []byte) error {
+		if strings.HasPrefix(key, "__") {
+			return nil
+		}
+		var pb EntryProto
+		if err := proto.Unmarshal(value, &pb); err != nil {
+			return fmt.Errorf("decode main entry %s while reconciling entry items: %w", key, err)
+		}
+		addEntryToProjection(projections, ProtoToEntry(&pb))
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	type existingItem struct {
+		present  bool
+		readable bool
+		item     *EntryItem
+	}
+	existing := make(map[string]existingItem)
+	if err := s.entryItems.ForEach(func(key string, value []byte) error {
+		state := existingItem{present: true}
+		var pb EntryItemProto
+		if err := proto.Unmarshal(value, &pb); err == nil {
+			state.readable = true
+			state.item = ProtoToEntryItem(&pb)
+		}
+		existing[key] = state
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("scan existing entry items: %w", err)
+	}
+
+	names := make(map[string]struct{}, len(projections)+len(existing))
+	for name := range projections {
+		names[name] = struct{}{}
+	}
+	for name := range existing {
+		names[name] = struct{}{}
+	}
+	ordered := make([]string, 0, len(names))
+	for name := range names {
+		ordered = append(ordered, name)
+	}
+	sort.Strings(ordered)
+
+	changed := 0
+	for _, name := range ordered {
+		state := existing[name]
+		unlock := s.lockItemMutation(name)
+		itemChanged, err := s.writeEntryItemProjectionLocked(name, projections[name], state.present, state.readable, state.item)
+		unlock()
+		if err != nil {
+			return changed, err
+		}
+		if itemChanged {
+			changed++
+		}
+	}
+	return changed, nil
+}
 
 // GetEntryItems returns all entry item names
 func (s *Storage) GetEntryItems() map[string]struct{} {
@@ -17,11 +241,17 @@ func (s *Storage) GetEntryItems() map[string]struct{} {
 
 // UpdateEntryItem updates an entry item from an entry
 func (s *Storage) UpdateEntryItem(entry *Entry) error {
-	s.updateEntryItem(entry)
-	return nil
+	if entry == nil {
+		return fmt.Errorf("entry is nil")
+	}
+	_, err := s.rebuildEntryItem(entry.GetFolder(), entry.Protocol)
+	return err
 }
 
 func (s *Storage) UpdateItem(item *EntryItem) error {
+	unlock := s.lockItemMutation(item.Name)
+	defer unlock()
+
 	var oldFingerprint string
 	if existing, err := s.GetEntryItem(item.Name); err == nil {
 		oldFingerprint = EntryItemRepairFingerprint(existing)
@@ -59,8 +289,8 @@ func (s *Storage) GetEntryItem(name string) (*EntryItem, error) {
 func (s *Storage) ForEachEntryItem(fn func(*EntryItem) error) error {
 	return s.entryItems.ForEach(func(key string, value []byte) error {
 		var pb EntryItemProto
-		if proto.Unmarshal(value, &pb) != nil {
-			return nil
+		if err := proto.Unmarshal(value, &pb); err != nil {
+			return fmt.Errorf("decode entry item %s: %w", key, err)
 		}
 		return fn(ProtoToEntryItem(&pb))
 	})

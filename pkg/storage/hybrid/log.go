@@ -294,8 +294,8 @@ func (l *appendLog) Iterate(fn func(*LogRecord) error) error {
 
 	pos := int64(logHeaderSize)
 	fileSize := l.writePos
-	var fixed [8]byte    // scratch for fixed-width fields
-	var sbuf []byte      // reused scratch for length-prefixed strings
+	var fixed [8]byte // scratch for fixed-width fields
+	var sbuf []byte   // reused scratch for length-prefixed strings
 
 	for pos < fileSize {
 		record, nextPos, err := readRecordFrom(r, pos, l.version, fixed[:], &sbuf)

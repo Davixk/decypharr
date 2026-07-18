@@ -33,6 +33,7 @@ type Job struct {
 	NZBGroups      map[string]*parser.FileGroup // NZB file groups parsed before the active-download gate
 	Entry          *storage.Entry               // Entry created during processing
 	ResumeExisting bool                         // Continue an already persisted provider placement
+	ResumeAction   bool                         // Resume a durably claimed post-download action after restart
 	CreatedAt      time.Time
 }
 

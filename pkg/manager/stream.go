@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/retry"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
 
 const (
@@ -134,10 +136,15 @@ func isConnectionError(err error) bool {
 }
 
 // Stream streams a file from an entry to the provided writer within the specified byte range.
+// rangeRequested records whether the caller supplied a Range request; it is
+// intentionally distinct from any backing File.ByteRange used to fetch data.
 // client identifies the caller (e.g., User-Agent for WebDAV, "DFS" for DFS mount).
-func (m *Manager) Stream(ctx context.Context, entry *storage.Entry, filename string, start, end int64, writer io.Writer, onReady StreamReadyFunc, client string) error {
+func (m *Manager) Stream(ctx context.Context, entry *storage.Entry, filename string, start, end int64, rangeRequested bool, writer io.Writer, onReady StreamReadyFunc, client string) error {
 	if writer == nil {
 		return fmt.Errorf("writer is nil")
+	}
+	if entry == nil {
+		return retry.Unrecoverable(fmt.Errorf("entry is nil"))
 	}
 
 	// get file info for size
@@ -146,37 +153,14 @@ func (m *Manager) Stream(ctx context.Context, entry *storage.Entry, filename str
 		return retry.Unrecoverable(fmt.Errorf("file %s not found", filename))
 	}
 	if entry.Protocol == config.ProtocolNZB {
-		if m.usenet == nil {
-			return retry.Unrecoverable(fmt.Errorf("usenet client not configured"))
-		}
-		actualSize, prepErr := m.usenet.PrepareStream(entry.InfoHash, filename)
+		preparedEntry, prepErr := m.prepareUsenetStreamEntry(entry.InfoHash, filename, entry.NZBGeneration)
 		if prepErr != nil {
-			var permanent *customerror.Error
-			if errors.As(prepErr, &permanent) && permanent.IsPermanent() {
-				m.markUsenetStreamFailure(entry, filename, prepErr, permanent.Code == "usenet_article_missing")
-			}
 			return retry.Unrecoverable(prepErr)
 		}
-		if actualSize != file.Size {
-			updated := false
-			m.usenetFailureMu.Lock()
-			if actualSize != file.Size {
-				file.Size = actualSize
-				var total int64
-				for _, entryFile := range entry.Files {
-					total += entryFile.Size
-				}
-				entry.Size = total
-				entry.Bytes = total
-				if updateErr := m.queue.Update(entry); updateErr != nil {
-					m.logger.Error().Err(updateErr).Str("entry", entry.Name).Str("file", filename).Msg("Failed to persist reconciled Usenet file size")
-				}
-				updated = true
-			}
-			m.usenetFailureMu.Unlock()
-			if updated {
-				m.entry.Refresh()
-			}
+		entry = preparedEntry
+		file, ok = entry.Files[filename]
+		if !ok {
+			return retry.Unrecoverable(fmt.Errorf("file %s not found after preparing Usenet stream", filename))
 		}
 	}
 	start, end, err := normalizeStreamRange(file.Size, start, end)
@@ -187,11 +171,290 @@ func (m *Manager) Stream(ctx context.Context, entry *storage.Entry, filename str
 
 	// Route based on protocol
 	if entry.Protocol == config.ProtocolNZB {
-		return m.streamUsenet(ctx, entry, filename, start, end, writer, onReady)
+		return m.streamUsenet(ctx, entry, filename, start, end, rangeRequested, writer, onReady)
 	}
 
 	// Default to HTTP streaming for torrents
-	return m.streamHTTP(ctx, entry, filename, start, end, writer, onReady)
+	return m.streamHTTP(ctx, entry, filename, start, end, rangeRequested, writer, onReady)
+}
+
+// PrepareFileInfo validates a remote Usenet file before an HTTP/WebDAV caller
+// derives response metadata from it. It returns a copy of FileInfo so cached
+// directory entries are never mutated concurrently by request handlers.
+func (m *Manager) PrepareFileInfo(entry *storage.Entry, info *FileInfo) (*storage.Entry, *FileInfo, error) {
+	if entry == nil {
+		return nil, nil, fmt.Errorf("entry is nil")
+	}
+	if info == nil {
+		return nil, nil, fmt.Errorf("file info is nil")
+	}
+	if entry.Protocol != config.ProtocolNZB {
+		return entry, info, nil
+	}
+
+	preparedEntry, err := m.prepareUsenetStreamEntry(entry.InfoHash, info.name, entry.NZBGeneration)
+	if err != nil {
+		return nil, nil, err
+	}
+	file, ok := preparedEntry.Files[info.name]
+	if !ok {
+		return nil, nil, fmt.Errorf("file %s not found after preparing Usenet metadata", info.name)
+	}
+
+	preparedInfo := *info
+	preparedInfo.size = file.Size
+	return preparedEntry, &preparedInfo, nil
+}
+
+// PrepareFileInfos batches collection metadata preparation by entry. The
+// returned slices align with infos; callers can omit a permanently failed
+// child while still returning healthy siblings.
+func (m *Manager) PrepareFileInfos(infos []FileInfo) ([]FileInfo, []error) {
+	prepared := append([]FileInfo(nil), infos...)
+	fileErrors := make([]error, len(infos))
+	groups := make(map[string][]int)
+
+	for i := range prepared {
+		info := &prepared[i]
+		if info.isDir || len(info.content) != 0 {
+			continue
+		}
+		if info.infohash == "" {
+			fileErrors[i] = fmt.Errorf("remote file %s/%s has no entry infohash", info.parent, info.name)
+			continue
+		}
+		groups[info.infohash] = append(groups[info.infohash], i)
+	}
+
+	for infohash, indexes := range groups {
+		entry, err := m.storage.Get(infohash)
+		if err != nil {
+			for _, index := range indexes {
+				fileErrors[index] = err
+			}
+			continue
+		}
+		if entry.Protocol != config.ProtocolNZB {
+			continue
+		}
+		if m.usenet == nil {
+			for _, index := range indexes {
+				fileErrors[index] = fmt.Errorf("usenet client not configured")
+			}
+			continue
+		}
+		generation, generationErr := m.ensureNZBGeneration(entry)
+		if generationErr != nil {
+			for _, index := range indexes {
+				fileErrors[index] = generationErr
+			}
+			continue
+		}
+
+		names := make([]string, 0, len(indexes))
+		seen := make(map[string]struct{}, len(indexes))
+		for _, index := range indexes {
+			name := prepared[index].name
+			if _, ok := seen[name]; !ok {
+				seen[name] = struct{}{}
+				names = append(names, name)
+			}
+		}
+		sizes, preparationErrors, batchErr := m.usenet.PrepareStreamsForGeneration(infohash, generation, names)
+		if batchErr != nil {
+			for _, index := range indexes {
+				fileErrors[index] = batchErr
+			}
+			continue
+		}
+
+		corrections := make(map[string]int64, len(sizes))
+		permanentFailures := make(map[string]usenetFileFailure)
+		for _, index := range indexes {
+			name := prepared[index].name
+			if prepErr := preparationErrors[name]; prepErr != nil {
+				var permanent *customerror.Error
+				if errors.As(prepErr, &permanent) && permanent.IsPermanent() {
+					permanentFailures[name] = usenetFileFailure{
+						cause:           prepErr,
+						articlesMissing: permanent.Code == "usenet_article_missing",
+					}
+				}
+				fileErrors[index] = prepErr
+				continue
+			}
+			size, ok := sizes[name]
+			if !ok {
+				fileErrors[index] = fmt.Errorf("file %s was not prepared in entry %s", name, infohash)
+				continue
+			}
+			corrections[name] = size
+		}
+
+		if len(permanentFailures) > 0 {
+			if persistErr := m.markUsenetStreamFailuresForGeneration(infohash, generation, permanentFailures); persistErr != nil {
+				for _, index := range indexes {
+					name := prepared[index].name
+					if _, failed := permanentFailures[name]; failed {
+						fileErrors[index] = fmt.Errorf("persist manager Usenet failure for %q: %w (original error: %v)", name, persistErr, fileErrors[index])
+					}
+				}
+			}
+		}
+
+		if len(corrections) == 0 {
+			continue
+		}
+		updated, persistErr := m.persistUsenetFileSizesForGeneration(infohash, generation, corrections)
+		if persistErr != nil {
+			for _, index := range indexes {
+				if fileErrors[index] == nil {
+					fileErrors[index] = persistErr
+				}
+			}
+			continue
+		}
+		for _, index := range indexes {
+			if fileErrors[index] != nil {
+				continue
+			}
+			if file, ok := updated.Files[prepared[index].name]; ok {
+				prepared[index].size = file.Size
+			}
+		}
+	}
+	return prepared, fileErrors
+}
+
+func (m *Manager) prepareUsenetStreamEntry(infohash, filename, expectedGeneration string) (*storage.Entry, error) {
+	if m.usenet == nil {
+		return nil, fmt.Errorf("usenet client not configured")
+	}
+	if m.storage == nil {
+		return nil, fmt.Errorf("manager storage is not configured")
+	}
+
+	entry, err := m.storage.Get(infohash)
+	if err != nil {
+		return nil, fmt.Errorf("load authoritative entry %s: %w", infohash, err)
+	}
+	if expectedGeneration != "" && entry.NZBGeneration != expectedGeneration {
+		return nil, fmt.Errorf("%w for manager entry %s (expected %q, current %q)", usenet.ErrStaleNZBGeneration, infohash, expectedGeneration, entry.NZBGeneration)
+	}
+	_, ok := entry.Files[filename]
+	if !ok {
+		return nil, fmt.Errorf("file %s not found in entry %s", filename, infohash)
+	}
+	generation, err := m.ensureNZBGeneration(entry)
+	if err != nil {
+		return nil, err
+	}
+	if expectedGeneration != "" && generation != expectedGeneration {
+		return nil, fmt.Errorf("%w for manager entry %s (expected %q, current %q)", usenet.ErrStaleNZBGeneration, infohash, expectedGeneration, generation)
+	}
+
+	actualSize, prepErr := m.usenet.PrepareStreamForGeneration(infohash, generation, filename)
+	if prepErr != nil {
+		var permanent *customerror.Error
+		if errors.As(prepErr, &permanent) && permanent.IsPermanent() {
+			if persistErr := m.markUsenetStreamFailureForGeneration(infohash, generation, filename, prepErr, permanent.Code == "usenet_article_missing"); persistErr != nil {
+				// Do not expose the permanent status until the manager's
+				// authoritative entry has durably recorded it.
+				return nil, fmt.Errorf("persist manager Usenet failure for %q: %w (original error: %v)", filename, persistErr, prepErr)
+			}
+		}
+		return nil, prepErr
+	}
+	// Always pass through the atomic persistence helper. Even when the main
+	// entry is already correct, this retries a previously failed queue mirror.
+	return m.persistUsenetFileSizeForGeneration(infohash, generation, filename, actualSize)
+}
+
+func (m *Manager) persistUsenetFileSize(infohash, filename string, size int64) (*storage.Entry, error) {
+	return m.persistUsenetFileSizes(infohash, map[string]int64{filename: size})
+}
+
+func (m *Manager) persistUsenetFileSizeForGeneration(infohash, generation, filename string, size int64) (*storage.Entry, error) {
+	return m.persistUsenetFileSizesForGeneration(infohash, generation, map[string]int64{filename: size})
+}
+
+func (m *Manager) persistUsenetFileSizes(infohash string, sizes map[string]int64) (*storage.Entry, error) {
+	return m.persistUsenetFileSizesForGeneration(infohash, "", sizes)
+}
+
+func (m *Manager) persistUsenetFileSizesForGeneration(infohash, generation string, sizes map[string]int64) (*storage.Entry, error) {
+	for filename, size := range sizes {
+		if size <= 0 {
+			return nil, fmt.Errorf("invalid reconciled Usenet size %d for %q", size, filename)
+		}
+	}
+
+	mainChanged := false
+	entry, present, err := m.storage.MutateEntryIfPresent(infohash, func(entry *storage.Entry) (bool, error) {
+		if generation != "" && entry.NZBGeneration != generation {
+			return false, fmt.Errorf("stale NZB generation %q for main entry %s (current %q)", generation, infohash, entry.NZBGeneration)
+		}
+		var mutateErr error
+		mainChanged, mutateErr = applyUsenetFileSizes(entry, sizes)
+		return mainChanged, mutateErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("persist reconciled Usenet sizes in main entry: %w", err)
+	}
+	if !present {
+		return nil, fmt.Errorf("entry %s was deleted before Usenet size reconciliation", infohash)
+	}
+
+	_, _, queueErr := m.storage.MutateQueuedIfPresent(infohash, func(queued *storage.Entry) (bool, error) {
+		if generation != "" && queued.NZBGeneration != generation {
+			return false, fmt.Errorf("stale NZB generation %q for queue entry %s (current %q)", generation, infohash, queued.NZBGeneration)
+		}
+		return applyUsenetFileSizes(queued, sizes)
+	})
+	if queueErr != nil {
+		m.logger.Error().Err(queueErr).Str("entry", entry.Name).Msg("Failed to synchronize reconciled Usenet sizes to queue")
+	}
+
+	if mainChanged {
+		m.refreshEntryCache()
+	}
+	return entry, nil
+}
+
+func applyUsenetFileSizes(entry *storage.Entry, sizes map[string]int64) (bool, error) {
+	if entry == nil {
+		return false, fmt.Errorf("entry is nil")
+	}
+	changed := false
+	for filename, size := range sizes {
+		file, ok := entry.Files[filename]
+		if !ok {
+			return false, fmt.Errorf("file %s not found in entry %s", filename, entry.InfoHash)
+		}
+		if file.Size != size {
+			file.Size = size
+			changed = true
+		}
+	}
+	var total int64
+	for _, entryFile := range entry.Files {
+		total += entryFile.Size
+	}
+	if entry.Size != total {
+		entry.Size = total
+		changed = true
+	}
+	if entry.Bytes != total {
+		entry.Bytes = total
+		changed = true
+	}
+	return changed, nil
+}
+
+func (m *Manager) refreshEntryCache() {
+	if m.entry != nil && m.config != nil {
+		m.entry.Refresh()
+	}
 }
 
 // TrackStream registers an active stream for observability and returns the stream ID.
@@ -221,169 +484,363 @@ func (m *Manager) UntrackStream(streamID string) {
 	m.unregisterStream(streamID)
 }
 
-// streamHTTP handles streaming for torrent files via HTTP
-func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filename string, start, end int64, writer io.Writer, onReady StreamReadyFunc) error {
+type httpStreamPlan struct {
+	logicalStart      int64
+	logicalEnd        int64
+	upstreamStart     int64
+	upstreamEnd       int64
+	clientRequested   bool
+	upstreamRequested bool
+}
+
+func newHTTPStreamPlan(file *storage.File, start, end int64, rangeRequested bool) (httpStreamPlan, error) {
+	var plan httpStreamPlan
+	if file == nil {
+		return plan, fmt.Errorf("stream file is nil")
+	}
+	if file.Size <= 0 {
+		return plan, fmt.Errorf("invalid file size %d", file.Size)
+	}
+	if start < 0 || end < start || end >= file.Size {
+		return plan, fmt.Errorf("invalid logical byte range %d-%d for file size %d", start, end, file.Size)
+	}
+	if !rangeRequested && (start != 0 || end != file.Size-1) {
+		return plan, fmt.Errorf("partial logical byte range %d-%d is missing client range intent", start, end)
+	}
+
+	plan = httpStreamPlan{
+		logicalStart:      start,
+		logicalEnd:        end,
+		upstreamStart:     start,
+		upstreamEnd:       end,
+		clientRequested:   rangeRequested,
+		upstreamRequested: rangeRequested,
+	}
+	if file.ByteRange == nil {
+		return plan, nil
+	}
+
+	backingStart, backingEnd := file.ByteRange[0], file.ByteRange[1]
+	if backingStart < 0 || backingEnd < backingStart {
+		return httpStreamPlan{}, fmt.Errorf("invalid backing byte range %d-%d", backingStart, backingEnd)
+	}
+	maxLogicalOffset := backingEnd - backingStart
+	if file.Size-1 > maxLogicalOffset {
+		return httpStreamPlan{}, fmt.Errorf("backing byte range %d-%d is shorter than logical file size %d", backingStart, backingEnd, file.Size)
+	}
+	if end > maxLogicalOffset {
+		return httpStreamPlan{}, fmt.Errorf("logical byte range %d-%d exceeds backing byte range %d-%d", start, end, backingStart, backingEnd)
+	}
+
+	plan.upstreamStart = backingStart + start
+	plan.upstreamEnd = backingStart + end
+	plan.upstreamRequested = true
+	return plan, nil
+}
+
+// streamHTTP handles streaming for torrent files via HTTP.
+func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filename string, start, end int64, rangeRequested bool, writer io.Writer, onReady StreamReadyFunc) error {
 	file, ok := torrent.Files[filename]
 	if !ok {
 		return fmt.Errorf("file not found in entry: %s", filename)
 	}
 
-	expectedLen := end - start + 1
-
-	// Get the validated download link using the link service
+	// Get the validated download link using the link service.
 	downloadLink, err := m.linkService.GetLink(ctx, torrent, filename)
 	if err != nil {
 		return fmt.Errorf("failed to get download link: %w", err)
 	}
+	return m.streamHTTPURL(ctx, downloadLink.DownloadLink, file, filename, start, end, rangeRequested, writer, onReady)
+}
 
-	// Get buffer from pool - reduces GC pressure significantly
+// streamHTTPURL keeps link resolution separate from the byte-accurate HTTP
+// transfer. Tests exercise this layer with a real HTTP server.
+func (m *Manager) streamHTTPURL(ctx context.Context, url string, file *storage.File, filename string, start, end int64, rangeRequested bool, writer io.Writer, onReady StreamReadyFunc) error {
+	plan, err := newHTTPStreamPlan(file, start, end, rangeRequested)
+	if err != nil {
+		return retry.Unrecoverable(StreamError{Err: err, Retryable: false})
+	}
+	expectedLen := plan.logicalEnd - plan.logicalStart + 1
+
+	resp, reqErr := m.doRequest(ctx, url, plan.upstreamStart, plan.upstreamEnd, plan.upstreamRequested)
+	if reqErr != nil {
+		return reqErr
+	}
+	defer resp.Body.Close()
+
+	if responseErr := validateHTTPStreamResponse(resp, plan, expectedLen); responseErr != nil {
+		return retry.Unrecoverable(StreamError{Err: responseErr, Retryable: false})
+	}
+
+	if onReady != nil {
+		header := resp.Header.Clone()
+		header.Del("Content-Range")
+		header.Set("Content-Length", strconv.FormatInt(expectedLen, 10))
+		header.Set("Accept-Ranges", "bytes")
+		// A stored byte range may come from an archive URL whose upstream media
+		// type describes the container, not the logical file being served.
+		header.Set("Content-Type", utils.GetContentType(filename))
+		statusCode := http.StatusOK
+		if plan.clientRequested {
+			statusCode = http.StatusPartialContent
+			header.Set("Content-Range", buildContentRange(plan.logicalStart, plan.logicalEnd, file.Size))
+		}
+		if readyErr := onReady(&StreamMetadata{
+			Header:        header,
+			StatusCode:    statusCode,
+			ContentLength: expectedLen,
+		}); readyErr != nil {
+			return retry.Unrecoverable(readyErr)
+		}
+	}
+
 	bufPtr := streamBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer streamBufPool.Put(bufPtr)
 
-	resp, reqErr := m.doRequest(ctx, downloadLink.DownloadLink, start, end)
-	if reqErr != nil {
-		// Network/connection error - retriable
-		return reqErr
+	n, copyErr := io.CopyBuffer(writer, io.LimitReader(resp.Body, expectedLen), buf)
+	if n < expectedLen && copyErr == nil {
+		copyErr = io.ErrUnexpectedEOF
 	}
-
-	// Got response - check status
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
-		var header http.Header
-		if onReady != nil {
-			header = resp.Header.Clone()
-		}
-		meta := &StreamMetadata{
-			Header:        header,
-			StatusCode:    resp.StatusCode,
-			ContentLength: resp.ContentLength,
-		}
-
-		isPartial := expectedLen > 0 && (start > 0 || end < file.Size-1)
-		if expectedLen > 0 {
-			meta.ContentLength = expectedLen
-			if header != nil {
-				header["Content-Length"] = []string{strconv.FormatInt(expectedLen, 10)}
-			}
-		}
-		if isPartial && resp.StatusCode == http.StatusOK {
-			meta.StatusCode = http.StatusPartialContent
-			if header != nil {
-				header["Content-Range"] = []string{buildContentRange(start, end, file.Size)}
-			}
-		}
-
-		if onReady != nil {
-			if readyErr := onReady(meta); readyErr != nil {
-				resp.Body.Close()
-				return retry.Unrecoverable(readyErr)
-			}
-		}
-
-		// Stream response body into provided writer
-		reader := io.Reader(resp.Body)
-		if expectedLen > 0 {
-			reader = io.LimitReader(resp.Body, expectedLen)
-		}
-		n, copyErr := io.CopyBuffer(writer, reader, buf)
-		resp.Body.Close()
-
-		if expectedLen > 0 && n < expectedLen && copyErr == nil {
-			copyErr = io.ErrUnexpectedEOF
-		}
-
-		if copyErr != nil && copyErr != io.EOF {
-			// Check if this is a retriable error (timeout, network issue)
-			// vs a permanent error (context cancelled by user)
-			if ctx.Err() != nil {
-				// User/system cancelled - don't retry
-				return retry.Unrecoverable(ctx.Err())
-			}
-			if isConnectionError(copyErr) || strings.Contains(copyErr.Error(), "timeout") {
-				// Network/timeout error - retriable
-				return copyErr
-			}
-			// Unknown error - don't retry to avoid infinite loops
-			return retry.Unrecoverable(copyErr)
-		}
+	if copyErr == nil || copyErr == io.EOF {
 		return nil
 	}
+	if ctx.Err() != nil {
+		return retry.Unrecoverable(ctx.Err())
+	}
+	if isConnectionError(copyErr) || strings.Contains(copyErr.Error(), "timeout") {
+		return copyErr
+	}
+	return retry.Unrecoverable(copyErr)
+}
 
-	resp.Body.Close()
-	return retry.Unrecoverable(StreamError{
-		Err:       fmt.Errorf("unexpected HTTP status: %d", resp.StatusCode),
-		Retryable: false,
-		LinkError: false,
-	})
+func validateHTTPStreamResponse(resp *http.Response, plan httpStreamPlan, expectedLen int64) error {
+	if resp == nil {
+		return fmt.Errorf("upstream HTTP response is nil")
+	}
+	if plan.upstreamRequested {
+		if resp.StatusCode == http.StatusOK {
+			return fmt.Errorf("upstream ignored requested byte range %d-%d", plan.upstreamStart, plan.upstreamEnd)
+		}
+		if resp.StatusCode != http.StatusPartialContent {
+			return fmt.Errorf("unexpected HTTP status %d for ranged request", resp.StatusCode)
+		}
+		start, end, err := parseContentRange(resp.Header.Get("Content-Range"))
+		if err != nil {
+			return fmt.Errorf("invalid upstream Content-Range: %w", err)
+		}
+		if start != plan.upstreamStart || end != plan.upstreamEnd {
+			return fmt.Errorf("upstream returned byte range %d-%d, requested %d-%d", start, end, plan.upstreamStart, plan.upstreamEnd)
+		}
+	} else if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected HTTP status %d for full request", resp.StatusCode)
+	}
+	if resp.ContentLength >= 0 && resp.ContentLength != expectedLen {
+		return fmt.Errorf("upstream content length %d does not match requested length %d", resp.ContentLength, expectedLen)
+	}
+	return nil
+}
+
+func parseContentRange(value string) (int64, int64, error) {
+	fields := strings.Fields(value)
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "bytes") {
+		return 0, 0, fmt.Errorf("expected bytes content range, got %q", value)
+	}
+	interval, total, ok := strings.Cut(fields[1], "/")
+	if !ok || interval == "" || total == "" {
+		return 0, 0, fmt.Errorf("malformed content range %q", value)
+	}
+	startText, endText, ok := strings.Cut(interval, "-")
+	if !ok || startText == "" || endText == "" {
+		return 0, 0, fmt.Errorf("malformed content range interval %q", interval)
+	}
+	start, err := strconv.ParseInt(startText, 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, fmt.Errorf("invalid content range start %q", startText)
+	}
+	end, err := strconv.ParseInt(endText, 10, 64)
+	if err != nil || end < start {
+		return 0, 0, fmt.Errorf("invalid content range end %q", endText)
+	}
+	if total != "*" {
+		totalSize, totalErr := strconv.ParseInt(total, 10, 64)
+		if totalErr != nil || totalSize <= end {
+			return 0, 0, fmt.Errorf("invalid content range size %q", total)
+		}
+	}
+	return start, end, nil
 }
 
 // streamUsenet handles streaming for NZB files via usenet
-func (m *Manager) streamUsenet(ctx context.Context, entry *storage.Entry, filename string, start, end int64, writer io.Writer, onReady StreamReadyFunc) error {
+func (m *Manager) streamUsenet(ctx context.Context, entry *storage.Entry, filename string, start, end int64, rangeRequested bool, writer io.Writer, onReady StreamReadyFunc) error {
 	if m.usenet == nil {
 		return retry.Unrecoverable(fmt.Errorf("usenet client not configured"))
 	}
 
-	file, ok := entry.Files[filename]
+	_, ok := entry.Files[filename]
 	if !ok {
 		return retry.Unrecoverable(fmt.Errorf("file not found in entry: %s", filename))
 	}
-	if err := m.usenet.IsFilePermanentlyFailed(entry.InfoHash, filename); err != nil {
-		m.markUsenetStreamFailure(entry, filename, err, true)
-		return retry.Unrecoverable(err)
+	if entry.NZBGeneration == "" {
+		return retry.Unrecoverable(fmt.Errorf("NZB generation is missing for %s", entry.InfoHash))
 	}
-
-	contentLength := end - start + 1
-
-	// Only build headers if onReady callback is provided (avoids allocations for DFS streaming)
+	var ready func(usenet.StreamReadyInfo) error
 	if onReady != nil {
-		statusCode := http.StatusOK
-		header := make(http.Header, 4) // Pre-size to avoid rehashing
-		header["Accept-Ranges"] = []string{"bytes"}
-		header["Content-Length"] = []string{strconv.FormatInt(contentLength, 10)}
-		if start > 0 || end < file.Size-1 {
-			statusCode = http.StatusPartialContent
-			header["Content-Range"] = []string{buildContentRange(start, end, file.Size)}
-		}
-		header["Content-Type"] = []string{utils.GetContentType(filename)}
-
-		if err := onReady(&StreamMetadata{
-			Header:        header,
-			StatusCode:    statusCode,
-			ContentLength: contentLength,
-		}); err != nil {
-			return err
+		ready = func(info usenet.StreamReadyInfo) error {
+			return onReady(newUsenetStreamMetadata(info, filename, rangeRequested))
 		}
 	}
 
-	// Stream NZB content directly into writer
-	err := m.usenet.Stream(ctx, entry.InfoHash, filename, start, end, writer)
+	// The ready callback fires only after the exact generation-bound reader is
+	// acquired. Headers and bytes therefore come from the same retained handle.
+	err := m.usenet.StreamForGenerationReady(ctx, entry.InfoHash, entry.NZBGeneration, filename, start, end, writer, ready)
 	if err != nil && nntp.IsArticleNotFoundError(err) {
-		m.markUsenetStreamFailure(entry, filename, err, true)
+		if persistErr := m.markUsenetStreamFailureForGeneration(entry.InfoHash, entry.NZBGeneration, filename, err, true); persistErr != nil {
+			return errors.Join(err, fmt.Errorf("persist manager Usenet failure: %w", persistErr))
+		}
 	}
 	return err
 }
 
-func (m *Manager) markUsenetStreamFailure(entry *storage.Entry, filename string, cause error, articlesMissing bool) {
-	if entry == nil || cause == nil {
-		return
+func newUsenetStreamMetadata(info usenet.StreamReadyInfo, filename string, rangeRequested bool) *StreamMetadata {
+	contentLength := info.End - info.Start + 1
+	statusCode := http.StatusOK
+	header := make(http.Header, 4)
+	header.Set("Accept-Ranges", "bytes")
+	header.Set("Content-Length", strconv.FormatInt(contentLength, 10))
+	if rangeRequested {
+		statusCode = http.StatusPartialContent
+		header.Set("Content-Range", buildContentRange(info.Start, info.End, info.Size))
 	}
-	message := fmt.Errorf("usenet file %q failed: %w", filename, cause)
-	if articlesMissing {
-		message = fmt.Errorf("articles missing on provider for %q", filename)
+	header.Set("Content-Type", utils.GetContentType(filename))
+	return &StreamMetadata{Header: header, StatusCode: statusCode, ContentLength: contentLength}
+}
+
+func (m *Manager) markUsenetStreamFailure(infohash, filename string, cause error, articlesMissing bool) error {
+	return m.markUsenetStreamFailures(infohash, map[string]usenetFileFailure{
+		filename: {cause: cause, articlesMissing: articlesMissing},
+	})
+}
+
+func (m *Manager) markUsenetStreamFailureForGeneration(infohash, generation, filename string, cause error, articlesMissing bool) error {
+	return m.markUsenetStreamFailuresForGeneration(infohash, generation, map[string]usenetFileFailure{
+		filename: {cause: cause, articlesMissing: articlesMissing},
+	})
+}
+
+type usenetFileFailure struct {
+	cause           error
+	articlesMissing bool
+}
+
+func (m *Manager) markUsenetStreamFailures(infohash string, failures map[string]usenetFileFailure) error {
+	return m.markUsenetStreamFailuresForGeneration(infohash, "", failures)
+}
+
+func (m *Manager) markUsenetStreamFailuresForGeneration(infohash, generation string, failures map[string]usenetFileFailure) error {
+	if infohash == "" {
+		return fmt.Errorf("entry infohash is empty")
 	}
-	m.usenetFailureMu.Lock()
-	if entry.State == storage.EntryStateError && entry.Bad && entry.LastError == message.Error() {
-		m.usenetFailureMu.Unlock()
-		return
+	if m.storage == nil {
+		return fmt.Errorf("manager storage is not configured")
+	}
+	if len(failures) == 0 {
+		return fmt.Errorf("Usenet failures are empty")
+	}
+
+	names := make([]string, 0, len(failures))
+	for filename, failure := range failures {
+		if filename == "" {
+			return fmt.Errorf("Usenet failure filename is empty")
+		}
+		if failure.cause == nil {
+			return fmt.Errorf("Usenet failure cause for %q is nil", filename)
+		}
+		names = append(names, filename)
+	}
+	sort.Strings(names)
+
+	parts := make([]string, 0, len(names))
+	for _, filename := range names {
+		failure := failures[filename]
+		if failure.articlesMissing {
+			parts = append(parts, fmt.Sprintf("articles missing on provider for %q", filename))
+		} else {
+			parts = append(parts, fmt.Sprintf("usenet file %q failed: %v", filename, failure.cause))
+		}
+	}
+	messageText := parts[0]
+	if len(parts) > 1 {
+		messageText = "multiple usenet files failed: " + strings.Join(parts, "; ")
+	}
+	message := errors.New(messageText)
+
+	mainChanged := false
+	persist := func() error {
+		_, present, mutateErr := m.storage.MutateEntryIfPresent(infohash, func(entry *storage.Entry) (bool, error) {
+			if generation != "" && entry.NZBGeneration != generation {
+				return false, fmt.Errorf("stale NZB generation %q for main entry %s (current %q)", generation, infohash, entry.NZBGeneration)
+			}
+			mainChanged = applyUsenetStreamFailure(entry, message)
+			return mainChanged, nil
+		})
+		if mutateErr != nil {
+			return fmt.Errorf("persist Usenet failure in main entry: %w", mutateErr)
+		}
+		if !present {
+			return fmt.Errorf("entry %s was deleted before Usenet failure persistence", infohash)
+		}
+		var queueErr error
+		if m.queue != nil {
+			_, _, queueErr = m.queue.mutateTerminalLocked(infohash, func(queued *storage.Entry) bool {
+				if generation != "" && queued.NZBGeneration != generation {
+					return false
+				}
+				return applyUsenetStreamFailure(queued, message)
+			})
+		} else {
+			// Lightweight managers used by focused tests have no Queue wrapper.
+			// Storage still provides an atomic optional-mirror mutation, so retain
+			// the same persistence guarantee without dereferencing a nil queue.
+			_, _, queueErr = m.storage.MutateQueuedIfPresent(infohash, func(queued *storage.Entry) (bool, error) {
+				if generation != "" && queued.NZBGeneration != generation {
+					return false, nil
+				}
+				return applyUsenetStreamFailure(queued, message), nil
+			})
+		}
+		if queueErr != nil {
+			return fmt.Errorf("synchronize Usenet stream failure to queue: %w", queueErr)
+		}
+		return nil
+	}
+	var err error
+	if m.queue != nil {
+		err = m.queue.withLifecycle(infohash, persist)
+	} else {
+		err = persist()
+	}
+	if err != nil {
+		return err
+	}
+
+	if mainChanged {
+		m.refreshEntryCache()
+	}
+	return nil
+}
+
+func applyUsenetStreamFailure(entry *storage.Entry, message error) bool {
+	// A durable Usenet content failure is terminal for the whole entry. Do not
+	// make its identity depend on whether this request observed one failed file
+	// or a collection of them: alternating HEAD/listing requests must not churn
+	// LastError or inflate ErrorCount.
+	if entry.State == storage.EntryStateError && entry.Bad {
+		return false
 	}
 	entry.MarkAsError(message)
 	entry.Bad = true
-	updateErr := m.queue.Update(entry)
-	m.usenetFailureMu.Unlock()
-	if updateErr != nil {
-		m.logger.Error().Err(updateErr).Str("entry", entry.Name).Str("file", filename).Msg("Failed to persist Usenet stream failure")
-	}
-	m.entry.Refresh()
+	return true
 }
 
 func normalizeStreamRange(size, start, end int64) (int64, int64, error) {
@@ -406,7 +863,7 @@ func normalizeStreamRange(size, start, end int64) (int64, int64, error) {
 	return start, end, nil
 }
 
-func (m *Manager) doRequest(ctx context.Context, url string, start, end int64) (*http.Response, error) {
+func (m *Manager) doRequest(ctx context.Context, url string, start, end int64, rangeRequested bool) (*http.Response, error) {
 	var resp *http.Response
 
 	err := retry.Do(
@@ -416,8 +873,9 @@ func (m *Manager) doRequest(ctx context.Context, url string, start, end int64) (
 				return retry.Unrecoverable(StreamError{Err: reqErr, Retryable: false})
 			}
 
-			// Set range header
-			if start > 0 || end > 0 {
+			// Backing ranges are explicit. A logical full-file request without a
+			// stored subrange must not be converted into an upstream Range request.
+			if rangeRequested {
 				req.Header.Set("Range", buildHTTPRange(start, end))
 			}
 

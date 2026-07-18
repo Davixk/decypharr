@@ -248,6 +248,10 @@ func encodeHeader(nzb *storage.NZB) []byte {
 		w.boolean(f.IsEncrypted)
 		w.uvarint(uint64(len(f.Segments)))
 	}
+	// Appending new scalar fields after the file table keeps existing v2 blobs
+	// readable: older blobs end here, while older binaries simply ignore the
+	// trailing bytes written by newer versions.
+	w.str(nzb.Generation)
 	return w.buf
 }
 
@@ -542,6 +546,13 @@ func decodeHeader(buf []byte) (*storage.NZB, []int, error) {
 			return nil, nil, err
 		}
 		counts[i] = int(c)
+	}
+	// Generation was added as an optional trailer. Metadata written before the
+	// lifecycle fence has no trailer and is adopted on its next guarded write.
+	if r.pos < len(r.buf) {
+		if !get(&nzb.Generation, false) {
+			return nil, nil, err
+		}
 	}
 	return nzb, counts, nil
 }

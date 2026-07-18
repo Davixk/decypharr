@@ -230,18 +230,27 @@ func extractFromSID(sid string) (string, string, error) {
 
 func hashesContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_hashes := chi.URLParam(r, "hashes")
-		var hashes []string
-		if _hashes != "" {
-			hashes = strings.Split(_hashes, "|")
+		var rawHashes []string
+		if pathHashes := chi.URLParam(r, "hashes"); pathHashes != "" {
+			rawHashes = []string{pathHashes}
 		}
-		if hashes == nil {
+		if rawHashes == nil {
 			// GetReader hashes from form
 			_ = r.ParseForm()
-			hashes = r.Form["hashes"]
+			rawHashes = r.Form["hashes"]
 		}
-		for i, hash := range hashes {
-			hashes[i] = strings.TrimSpace(hash)
+
+		// qBittorrent encodes multiple hashes as one pipe-delimited form value.
+		// Normalize every value because repeated form fields and path parameters
+		// can each contain their own pipe-delimited list.
+		hashes := make([]string, 0, len(rawHashes))
+		for _, raw := range rawHashes {
+			for hash := range strings.SplitSeq(raw, "|") {
+				hash = strings.TrimSpace(hash)
+				if hash != "" {
+					hashes = append(hashes, hash)
+				}
+			}
 		}
 		ctx := context.WithValue(r.Context(), hashesKey, hashes)
 		next.ServeHTTP(w, r.WithContext(ctx))

@@ -1,6 +1,7 @@
 package usenet
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,8 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sourcegraph/conc/pool"
@@ -25,6 +28,20 @@ const (
 	// files have been upgraded to the v2 codec, so migration runs at most once.
 	metaMigrationMarker = ".codec-v2.done"
 )
+
+// ErrStaleNZBGeneration means a long-running operation no longer owns the
+// metadata currently stored under an NZB ID. Callers should stop that workflow;
+// retrying it against the replacement would corrupt the new lifecycle.
+var (
+	ErrStaleNZBGeneration = errors.New("stale NZB generation")
+	ErrNZBNotFound        = errors.New("NZB not found")
+)
+
+func newNZBGeneration() string { return uuid.NewString() }
+
+// NewNZBGeneration returns an opaque ownership token that a queue can persist
+// before ParseWithGeneration creates or updates any durable NZB metadata.
+func NewNZBGeneration() string { return newNZBGeneration() }
 
 const (
 	NZBStatusPending     = "pending"
@@ -40,9 +57,69 @@ type NZBStorage struct {
 	logger  zerolog.Logger
 	mu      sync.RWMutex // Protects file operations and cached stats
 
+	// lifecycle serializes read-modify-write operations for one NZB without
+	// forcing unrelated IDs through the global metadata write lock. Lock order
+	// is lifecycle entry first, then mu.
+	lifecycle nzbLifecycleLockSet
+
+	// Test seam used by deterministic concurrency tests. It is set before the
+	// tested goroutines start and remains immutable while they run.
+	prepareAfterReadHook      func(string)
+	migrationBeforeCommitHook func(string)
+
 	// Cached stats for fast Stats() reads without filesystem scans.
 	metaCount      int
 	metaTotalBytes int64
+}
+
+type nzbLifecycleLockSet struct {
+	mu      sync.Mutex
+	entries map[string]*nzbLifecycleLockEntry
+}
+
+type nzbLifecycleLockEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lock returns an unlock function. Waiting callers count as references, so an
+// entry cannot be removed and recreated while another goroutine still holds or
+// waits on its mutex (the keyed-lock equivalent of preventing an ABA).
+func (l *nzbLifecycleLockSet) lock(id string) func() {
+	l.mu.Lock()
+	if l.entries == nil {
+		l.entries = make(map[string]*nzbLifecycleLockEntry)
+	}
+	entry := l.entries[id]
+	if entry == nil {
+		entry = &nzbLifecycleLockEntry{}
+		l.entries[id] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		l.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 && l.entries[id] == entry {
+			delete(l.entries, id)
+		}
+		l.mu.Unlock()
+	}
+}
+
+func (s *NZBStorage) lockNZBLifecycle(id string) func() {
+	return s.lifecycle.lock(id)
+}
+
+type streamFilePreparation struct {
+	size           int64
+	advertisedSize int64
+	streamableSize int64
+	corrected      bool
+	err            error
 }
 
 // NewNZBStorage creates a new file-based NZB storage
@@ -100,14 +177,54 @@ func (s *NZBStorage) recalculateStatsLocked() error {
 
 // AddNZB saves an NZB to file storage
 func (s *NZBStorage) AddNZB(nzb *storage.NZB) error {
+	unlock := s.lockNZBLifecycle(nzb.ID)
+	defer unlock()
+	return s.addNZBWithLifecycleHeld(nzb)
+}
+
+func (s *NZBStorage) addNZBWithLifecycleHeld(nzb *storage.NZB) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if nzb == nil || nzb.ID == "" {
+		return fmt.Errorf("NZB and ID are required")
+	}
+
+	// A populated generation denotes a mutation of one specific lifecycle.
+	// Empty-generation callers retain AddNZB's historical replacement semantics
+	// and rotate to a fresh token below.
+	if nzb.Generation != "" {
+		current, exists, err := s.readNZBIfPresentLocked(nzb.ID)
+		if err != nil {
+			return err
+		}
+		if exists && current.Generation != "" && current.Generation != nzb.Generation {
+			return staleNZBGenerationError(nzb.ID, nzb.Generation, current.Generation)
+		}
+	}
+	return s.writeNZBLocked(nzb)
+}
+
+// replaceNZBWithLifecycleHeld deliberately starts a new lifecycle even when an
+// NZB with the same ID already exists. ParseWithID uses this for a genuinely new
+// submission; resumed workers must use the conditional generation API instead.
+func (s *NZBStorage) replaceNZBWithLifecycleHeld(nzb *storage.NZB) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if nzb == nil || nzb.ID == "" {
+		return fmt.Errorf("NZB and ID are required")
+	}
+	if nzb.Generation == "" {
+		nzb.Generation = newNZBGeneration()
+	}
 	return s.writeNZBLocked(nzb)
 }
 
 // writeNZBLocked atomically writes metadata and updates cached storage stats.
 // Caller must hold s.mu.
 func (s *NZBStorage) writeNZBLocked(nzb *storage.NZB) error {
+	if nzb.Generation == "" {
+		nzb.Generation = newNZBGeneration()
+	}
 	data, err := encodeNZBV2(nzb)
 	if err != nil {
 		return fmt.Errorf("failed to encode NZB: %w", err)
@@ -145,10 +262,107 @@ func (s *NZBStorage) writeNZBLocked(nzb *storage.NZB) error {
 	return nil
 }
 
+func (s *NZBStorage) readNZBIfPresentLocked(id string) (*storage.NZB, bool, error) {
+	data, err := os.ReadFile(s.metaFilePath(id))
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to read NZB metadata: %w", err)
+	}
+	nzb, err := decodeNZB(data)
+	if err != nil {
+		return nil, false, err
+	}
+	return nzb, true, nil
+}
+
+func staleNZBGenerationError(id, expected, actual string) error {
+	return fmt.Errorf("%w for NZB %s (expected %q, current %q)", ErrStaleNZBGeneration, id, expected, actual)
+}
+
+func requireNZBGeneration(id, expected, actual string) error {
+	if expected == actual {
+		return nil
+	}
+	return staleNZBGenerationError(id, expected, actual)
+}
+
+// adoptOrRequireNZBGeneration performs the one allowed legacy transition.
+// The caller must persist nzb before releasing the lifecycle lock when adopted
+// is true; after that transition all comparisons are strict equality.
+func adoptOrRequireNZBGeneration(nzb *storage.NZB, expected string) (adopted bool, err error) {
+	if nzb.Generation == "" && expected != "" {
+		nzb.Generation = expected
+		return true, nil
+	}
+	return false, requireNZBGeneration(nzb.ID, expected, nzb.Generation)
+}
+
+func (s *NZBStorage) assertGenerationWithLifecycleHeld(id, expected string) (*storage.NZB, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nzb, exists, err := s.readNZBIfPresentLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
+	}
+	adopted, err := adoptOrRequireNZBGeneration(nzb, expected)
+	if err != nil {
+		return nil, err
+	}
+	if adopted {
+		if err := s.writeNZBLocked(nzb); err != nil {
+			return nil, fmt.Errorf("persist adopted NZB generation: %w", err)
+		}
+	}
+	return nzb, nil
+}
+
+func (s *NZBStorage) assertGenerationIfPresentWithLifecycleHeld(id, expected string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nzb, exists, err := s.readNZBIfPresentLocked(id)
+	if err != nil || !exists {
+		return err
+	}
+	adopted, err := adoptOrRequireNZBGeneration(nzb, expected)
+	if err != nil {
+		return err
+	}
+	if adopted {
+		return s.writeNZBLocked(nzb)
+	}
+	return nil
+}
+
+// AssertGeneration verifies that id still refers to expected. It is useful at
+// the start of expensive work; final mutations perform the same check again.
+func (s *NZBStorage) AssertGeneration(id, expected string) error {
+	unlock := s.lockNZBLifecycle(id)
+	defer unlock()
+	_, err := s.assertGenerationWithLifecycleHeld(id, expected)
+	return err
+}
+
 // markFilePermanentlyFailed records a definitive provider-side content
 // failure while holding one lock across read-modify-write. This prevents two
 // simultaneous 430s for different files from overwriting each other.
 func (s *NZBStorage) markFilePermanentlyFailed(id, filename, reason string) error {
+	unlock := s.lockNZBLifecycle(id)
+	defer unlock()
+	return s.markFilePermanentlyFailedWithLifecycleHeld(id, "", filename, reason)
+}
+
+func (s *NZBStorage) markFilePermanentlyFailedForGeneration(id, generation, filename, reason string) error {
+	unlock := s.lockNZBLifecycle(id)
+	defer unlock()
+	return s.markFilePermanentlyFailedWithLifecycleHeld(id, generation, filename, reason)
+}
+
+func (s *NZBStorage) markFilePermanentlyFailedWithLifecycleHeld(id, generation, filename, reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -159,6 +373,11 @@ func (s *NZBStorage) markFilePermanentlyFailed(id, filename, reason string) erro
 	nzb, err := decodeNZB(data)
 	if err != nil {
 		return err
+	}
+	if generation != "" {
+		if _, err := adoptOrRequireNZBGeneration(nzb, generation); err != nil {
+			return err
+		}
 	}
 
 	found := false
@@ -180,6 +399,12 @@ func (s *NZBStorage) markFilePermanentlyFailed(id, filename, reason string) erro
 
 // reconcileFileSize atomically persists the segment-derived stream size.
 func (s *NZBStorage) reconcileFileSize(id, filename string, size int64) error {
+	unlock := s.lockNZBLifecycle(id)
+	defer unlock()
+	return s.reconcileFileSizeWithLifecycleHeld(id, filename, size)
+}
+
+func (s *NZBStorage) reconcileFileSizeWithLifecycleHeld(id, filename string, size int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -206,6 +431,135 @@ func (s *NZBStorage) reconcileFileSize(id, filename string, size int64) error {
 	return fmt.Errorf("file %s not found in NZB %s", filename, id)
 }
 
+// prepareStreamFiles validates and reconciles a set of files under one per-NZB
+// lifecycle lock and, when needed, one atomic write. Unrelated NZBs can decode
+// and validate concurrently.
+func (s *NZBStorage) prepareStreamFiles(id string, filenames []string) (map[string]streamFilePreparation, error) {
+	unlock := s.lockNZBLifecycle(id)
+	defer unlock()
+	return s.prepareStreamFilesWithLifecycleHeld(id, "", filenames)
+}
+
+func (s *NZBStorage) prepareStreamFilesForGeneration(id, generation string, filenames []string) (map[string]streamFilePreparation, error) {
+	unlock := s.lockNZBLifecycle(id)
+	defer unlock()
+	return s.prepareStreamFilesWithLifecycleHeld(id, generation, filenames)
+}
+
+func (s *NZBStorage) prepareStreamFilesWithLifecycleHeld(id, generation string, filenames []string) (map[string]streamFilePreparation, error) {
+	if generation != "" {
+		if _, err := s.assertGenerationWithLifecycleHeld(id, generation); err != nil {
+			return nil, err
+		}
+	}
+	s.mu.RLock()
+	data, err := os.ReadFile(s.metaFilePath(id))
+	s.mu.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read NZB metadata: %w", err)
+	}
+	if s.prepareAfterReadHook != nil {
+		s.prepareAfterReadHook(id)
+	}
+	nzb, err := decodeNZB(data)
+	if err != nil {
+		return nil, err
+	}
+	if generation != "" {
+		if err := requireNZBGeneration(id, generation, nzb.Generation); err != nil {
+			return nil, err
+		}
+	}
+
+	requested := make(map[string]struct{}, len(filenames))
+	for _, filename := range filenames {
+		requested[filename] = struct{}{}
+	}
+	results, changed := prepareStreamFileResults(id, nzb, requested)
+	if !changed {
+		return results, nil
+	}
+
+	// The lifecycle lock prevents same-ID Add/Delete while validation runs. We
+	// still re-read under the exclusive lock before correcting so migration or
+	// any future non-lifecycle writer cannot be overwritten with stale bytes.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err = os.ReadFile(s.metaFilePath(id))
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-read NZB metadata for correction: %w", err)
+	}
+	nzb, err = decodeNZB(data)
+	if err != nil {
+		return nil, err
+	}
+	if generation != "" {
+		if err := requireNZBGeneration(id, generation, nzb.Generation); err != nil {
+			return nil, err
+		}
+	}
+	results, changed = prepareStreamFileResults(id, nzb, requested)
+	if !changed {
+		return results, nil
+	}
+
+	var total int64
+	for i := range nzb.Files {
+		total += nzb.Files[i].Size
+	}
+	nzb.TotalSize = total
+	if err := s.writeNZBLocked(nzb); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func prepareStreamFileResults(id string, nzb *storage.NZB, requested map[string]struct{}) (map[string]streamFilePreparation, bool) {
+	results := make(map[string]streamFilePreparation, len(requested))
+	changed := false
+	for i := range nzb.Files {
+		file := &nzb.Files[i]
+		if _, ok := requested[file.Name]; !ok {
+			continue
+		}
+
+		result := streamFilePreparation{advertisedSize: file.Size}
+		if file.IsDeleted {
+			result.err = customerror.NewArticleNotFoundError(fmt.Errorf("articles missing on provider for %q", file.Name))
+			results[file.Name] = result
+			continue
+		}
+
+		streamableSize, sizeErr := segmentDerivedFileSize(file)
+		if sizeErr != nil {
+			wrapped := customerror.NewPermanentError(fmt.Errorf("invalid usenet file metadata for %q: %w", file.Name, sizeErr))
+			wrapped.Code = "usenet_metadata_invalid"
+			result.err = wrapped
+			results[file.Name] = result
+			continue
+		}
+
+		result.streamableSize = streamableSize
+		result.size = file.Size
+		if result.size <= 0 || result.size > streamableSize {
+			result.size = streamableSize
+			result.corrected = true
+			file.Size = result.size
+			changed = true
+		}
+		results[file.Name] = result
+	}
+
+	for filename := range requested {
+		if _, ok := results[filename]; !ok {
+			results[filename] = streamFilePreparation{
+				err: fmt.Errorf("file %s not found in NZB %s", filename, id),
+			}
+		}
+	}
+	return results, changed
+}
+
 // GetNZB retrieves an NZB from file storage
 func (s *NZBStorage) GetNZB(id string) (*storage.NZB, error) {
 	s.mu.RLock()
@@ -215,7 +569,7 @@ func (s *NZBStorage) GetNZB(id string) (*storage.NZB, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}
@@ -234,7 +588,7 @@ func (s *NZBStorage) GetNZBHeader(id string) (*storage.NZB, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}
@@ -259,7 +613,7 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}
@@ -302,6 +656,18 @@ func decodeNZB(data []byte) (*storage.NZB, error) {
 
 // DeleteNZB removes an NZB from file storage
 func (s *NZBStorage) DeleteNZB(id string) error {
+	unlock := s.lockNZBLifecycle(id)
+	defer unlock()
+	return s.deleteNZBWithLifecycleHeld(id, "")
+}
+
+func (s *NZBStorage) DeleteNZBForGeneration(id, generation string) error {
+	unlock := s.lockNZBLifecycle(id)
+	defer unlock()
+	return s.deleteNZBWithLifecycleHeld(id, generation)
+}
+
+func (s *NZBStorage) deleteNZBWithLifecycleHeld(id, generation string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -313,6 +679,22 @@ func (s *NZBStorage) DeleteNZB(id string) error {
 		oldSize = info.Size()
 	} else if !os.IsNotExist(statErr) {
 		return fmt.Errorf("failed to stat NZB meta file before delete: %w", statErr)
+	}
+	if !alreadyExists {
+		return fmt.Errorf("%w: %s", ErrNZBNotFound, id)
+	}
+	if generation != "" && alreadyExists {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return fmt.Errorf("failed to read NZB metadata before delete: %w", readErr)
+		}
+		current, decodeErr := decodeNZB(data)
+		if decodeErr != nil {
+			return decodeErr
+		}
+		if _, err := adoptOrRequireNZBGeneration(current, generation); err != nil {
+			return err
+		}
 	}
 
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
@@ -524,12 +906,25 @@ func (s *NZBStorage) migrateFile(path string) (bool, error) {
 	if err := os.WriteFile(tmpPath, out, 0644); err != nil {
 		return false, fmt.Errorf("write temp: %w", err)
 	}
+	if s.migrationBeforeCommitHook != nil {
+		s.migrationBeforeCommitHook(path)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// If AddNZB rewrote this file as v2 while we were encoding, its content is
 	// newer — don't overwrite it with our re-encoded older copy.
-	if cur, cerr := fileIsCodecV2(path); cerr == nil && cur {
+	cur, checkErr := fileIsCodecV2(path)
+	if checkErr != nil {
+		_ = os.Remove(tmpPath)
+		if os.IsNotExist(checkErr) {
+			// Delete won while the legacy bytes were being encoded. Renaming the
+			// temporary conversion here would resurrect the deleted NZB.
+			return false, nil
+		}
+		return false, fmt.Errorf("recheck before migration commit: %w", checkErr)
+	}
+	if cur {
 		_ = os.Remove(tmpPath)
 		return false, nil
 	}
@@ -600,6 +995,7 @@ func nzbToProto(nzb *storage.NZB) *NZBProto {
 		Storage:          nzb.Storage,
 		FailMessage:      nzb.FailMessage,
 		Password:         nzb.Password,
+		Generation:       nzb.Generation,
 	}
 
 	pb.Files = make([]*NZBFileProto, len(nzb.Files))
@@ -668,6 +1064,7 @@ func protoToNZB(pb *NZBProto) *storage.NZB {
 		Storage:        pb.Storage,
 		FailMessage:    pb.FailMessage,
 		Password:       pb.Password,
+		Generation:     pb.Generation,
 	}
 
 	nzb.Files = make([]storage.NZBFile, len(pb.Files))

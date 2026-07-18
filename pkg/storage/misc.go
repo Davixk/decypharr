@@ -8,6 +8,12 @@ import "github.com/sirrobot01/decypharr/internal/config"
 // shares the same infohash. This preserves placements, files, and tags from
 // the existing entry that the incoming entry may not know about.
 func HandleExistingEntryMerge(existing, incoming *Entry) *Entry {
+	// AddOrUpdate uses the persisted main-store version to reject stale
+	// snapshots. A queue entry has an independent queue version, so explicitly
+	// carry only the existing main-row version into the merged result.
+	incoming.mainStoreGeneration = existing.mainStoreGeneration
+	incoming.mainStoreRevision = existing.mainStoreRevision
+
 	// If NZB entry, ignore merging - just return incoming
 	if incoming.Protocol == config.ProtocolNZB {
 		return incoming

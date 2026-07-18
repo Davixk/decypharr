@@ -41,7 +41,6 @@ type Index struct {
 	sortedDirty bool
 }
 
-
 // newIndex creates a new empty index
 func newIndex() *Index {
 	return &Index{

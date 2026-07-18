@@ -10,12 +10,25 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
-func getDownloadByteRange(info *manager.FileInfo) *[2]int64 {
-	return info.ByteRange()
+func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w http.ResponseWriter, r *http.Request) error {
+	var err error
+	entry, info, err = h.manager.PrepareFileInfo(entry, info)
+	if err != nil {
+		var customErr *customerror.Error
+		if errors.As(err, &customErr) {
+			customErr.HeadersWritten = false
+			return customErr
+		}
+		return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, false)
+	}
+	return h.streamPreparedResponse(entry, info, w, r)
 }
 
-func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w http.ResponseWriter, r *http.Request) error {
-	start, end := h.getRange(info, r)
+func (h *Handler) streamPreparedResponse(entry *storage.Entry, info *manager.FileInfo, w http.ResponseWriter, r *http.Request) error {
+	start, end, rangeErr := prepareRangeResponse(w, info.Size(), r)
+	if rangeErr != nil {
+		return rangeErr
+	}
 
 	// Extract client identifier from User-Agent header
 	client := r.UserAgent()
@@ -29,7 +42,12 @@ func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w
 	}
 
 	headersWritten := false
-	err := h.manager.Stream(r.Context(), entry, info.Name(), start, end, w, func(meta *manager.StreamMetadata) error {
+	err := h.manager.Stream(r.Context(), entry, info.Name(), start, end, r.Header.Get("Range") != "", w, func(meta *manager.StreamMetadata) error {
+		// Manager.Stream revalidates Usenet metadata immediately before it
+		// invokes onReady. Delay every success/entity header until that final
+		// preparation succeeds so a concurrent delete/failure cannot leave a
+		// 410 response carrying stale media headers.
+		setEntityHeaders(w, info)
 		if err := h.handleSuccessfulResponse(w, meta, start, end); err != nil {
 			return err
 		}
@@ -46,6 +64,15 @@ func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w
 		return customerror.NewError(err, http.StatusInternalServerError, "server.internal_error", false, headersWritten)
 	}
 	return nil
+}
+
+func prepareRangeResponse(w http.ResponseWriter, size int64, r *http.Request) (int64, int64, error) {
+	start, end, err := getRange(size, r)
+	if err == nil {
+		return start, end, nil
+	}
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+	return 0, 0, customerror.NewError(err, http.StatusRequestedRangeNotSatisfiable, "server.range_not_satisfiable", false, false)
 }
 
 func (h *Handler) handleSuccessfulResponse(w http.ResponseWriter, meta *manager.StreamMetadata, start, end int64) error {
@@ -80,27 +107,20 @@ func (h *Handler) handleSuccessfulResponse(w http.ResponseWriter, meta *manager.
 	return nil
 }
 
-func (h *Handler) getRange(info *manager.FileInfo, r *http.Request) (int64, int64) {
+func getRange(size int64, r *http.Request) (int64, int64, error) {
 	rangeHeader := r.Header.Get("Range")
 	if rangeHeader == "" {
-		if byteRange := getDownloadByteRange(info); byteRange != nil {
-			return byteRange[0], byteRange[1]
-		}
 		// Signal downstream streaming code to serve the entire file
-		return 0, -1
+		return 0, -1, nil
 	}
 
-	ranges, err := parseRange(rangeHeader, info.Size())
+	ranges, err := parseRange(rangeHeader, size)
 	if err != nil || len(ranges) != 1 {
-		return 0, 0
+		if err == nil {
+			err = fmt.Errorf("exactly one satisfiable byte range is required")
+		}
+		return 0, 0, fmt.Errorf("invalid Range header %q: %w", rangeHeader, err)
 	}
 
-	byteRange := getDownloadByteRange(info)
-	start, end := ranges[0].start, ranges[0].end
-
-	if byteRange != nil {
-		start += byteRange[0]
-		end += byteRange[0]
-	}
-	return start, end
+	return ranges[0].start, ranges[0].end, nil
 }

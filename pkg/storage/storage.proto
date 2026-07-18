@@ -91,6 +91,16 @@ message EntryProto {
   int32 error_count = 37;
   int64 last_error_time_unix = 38;
   bool has_last_error_time = 39;
+
+  // Internal optimistic-concurrency tokens. Main and queue rows have
+  // independent lifecycles even when represented by the same Entry value.
+  string main_store_generation = 40;
+  uint64 main_store_revision = 41;
+  string queue_store_generation = 42;
+  uint64 queue_store_revision = 43;
+
+	// Stable ownership token for generation-qualified Usenet metadata.
+	string nzb_generation = 44;
 }
 
 // ============================================================================

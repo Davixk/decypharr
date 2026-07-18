@@ -59,4 +59,5 @@ message NZBProto {
   string storage = 21;
   string fail_message = 22;
   string password = 23;
+  string generation = 24;
 }
