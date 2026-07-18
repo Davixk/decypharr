@@ -1074,13 +1074,22 @@ class ConfigManager {
                             </label>
                         </div>
 
-                        <div class="rounded-box bg-base-200/50 px-3 py-2"
-                             title="Try the remaining providers in priority order only when the preferred provider rejects or fails the add.">
-                            <label class="label cursor-pointer justify-start gap-2 p-0">
-                                <input type="checkbox" class="checkbox checkbox-sm checkbox-primary"
-                                       name="arr[${index}].fallback_on_failure" id="arr[${index}].fallback_on_failure">
-                                <span class="text-sm leading-tight">Fallback on Provider Failure</span>
-                            </label>
+						<div class="rounded-box bg-base-200/50 px-3 py-2"
+							 title="Try the remaining providers in priority order only when the preferred provider rejects or fails the add.">
+							<label class="label cursor-pointer justify-start gap-2 p-0">
+								<input type="checkbox" class="checkbox checkbox-sm checkbox-primary"
+									   name="arr[${index}].fallback_on_failure" id="arr[${index}].fallback_on_failure">
+								<span class="text-sm leading-tight">Fallback on Provider Failure</span>
+							</label>
+						</div>
+
+						<div class="rounded-box bg-base-200/50 px-3 py-2">
+							<label class="label cursor-pointer justify-start gap-2 p-0"
+								   title="Opt in to automated queue actions after the configured confirmation period. Disabled by default.">
+								<input type="checkbox" class="checkbox checkbox-sm checkbox-warning"
+									   name="arr[${index}].cleanup" id="arr[${index}].cleanup">
+								<span class="text-sm leading-tight">Enable Queue Cleanup</span>
+							</label>
                         </div>
                     </div>
                 </div>
@@ -1390,20 +1399,22 @@ class ConfigManager {
             const nameInput = getField('name');
             const hostInput = getField('host');
             const tokenInput = getField('token');
+            const cleanupInput = getField('cleanup');
             const skipRepairInput = getField('skip_repair');
             const downloadUncachedInput = getField('download_uncached');
             const selectedDebridInput = getField('selected_debrid');
             const fallbackOnFailureInput = getField('fallback_on_failure');
             const sourceInput = getField('source');
 
-            if (!nameInput || !hostInput || !tokenInput || !skipRepairInput || !downloadUncachedInput || !selectedDebridInput || !fallbackOnFailureInput || !sourceInput) {
-                return;
+			if (!nameInput || !hostInput || !tokenInput || !cleanupInput || !skipRepairInput || !downloadUncachedInput || !selectedDebridInput || !fallbackOnFailureInput || !sourceInput) {
+				return;
             }
 
             const arr = {
                 name: nameInput.value,
                 host: hostInput.value,
                 token: tokenInput.value,
+                cleanup: cleanupInput.checked,
                 skip_repair: skipRepairInput.checked,
                 download_uncached: downloadUncachedInput.checked,
                 selected_debrid: selectedDebridInput.value,
@@ -1423,6 +1434,11 @@ class ConfigManager {
         const catalogEl = document.getElementById('queueCleanupCatalog');
         const customEl = document.getElementById('queueCleanupCustom');
         if (!catalogEl || !customEl) return;
+
+        const sweepsEl = document.getElementById('queueCleanupConfirmationSweeps');
+        const delayEl = document.getElementById('queueCleanupConfirmationDelay');
+        if (sweepsEl) sweepsEl.value = queueCleanup?.confirmation_sweeps || 3;
+        if (delayEl) delayEl.value = queueCleanup?.confirmation_delay || '5m';
 
         const rules = (queueCleanup && Array.isArray(queueCleanup.rules)) ? queueCleanup.rules : [];
 
@@ -1489,7 +1505,14 @@ class ConfigManager {
             rules.push({match, action});
         });
 
-        return {rules};
+        const sweeps = parseInt(document.getElementById('queueCleanupConfirmationSweeps')?.value, 10);
+        const delay = document.getElementById('queueCleanupConfirmationDelay')?.value?.trim();
+
+        return {
+            rules,
+            confirmation_sweeps: Number.isInteger(sweeps) && sweeps > 0 ? sweeps : 3,
+            confirmation_delay: delay || '5m'
+        };
     }
 
     collectMountConfig() {

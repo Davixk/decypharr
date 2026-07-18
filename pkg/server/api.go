@@ -530,13 +530,14 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
 	for _, a := range newConfig.Arrs {
 		if a.Name != "" && a.Host != "" && a.Token != "" {
+			if err := utils.ValidateURL(a.Host); err != nil {
+				http.Error(w, fmt.Sprintf("Invalid Arr host for %q: %v", a.Name, err), http.StatusBadRequest)
+				return
+			}
 			validArrs = append(validArrs, a)
 		}
 	}
 	newConfig.Arrs = validArrs
-
-	// Sync arr storage with the new configuration
-	s.manager.Arr().SyncFromConfig(newConfig.Arrs)
 
 	// Save the updated config. This also applies defaults to newConfig, so the
 	// restart comparison below sees a fully-normalized config on both sides.
@@ -554,6 +555,9 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		go s.Restart()
 	} else {
 		config.Get().ApplyRuntime(&newConfig)
+		// Only expose Arr policy changes after the complete configuration is
+		// durably saved and applied. A failed write must never enable cleanup.
+		s.manager.Arr().SyncFromConfig(newConfig.Arrs)
 		// Reschedule/reapply the repair sweep if its settings changed.
 		if svc := s.manager.Repair(); svc != nil {
 			if err := svc.ApplyConfig(); err != nil {

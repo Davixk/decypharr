@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	json "github.com/bytedance/sonic"
 )
@@ -55,6 +56,7 @@ var (
 	instance   *Config
 	once       sync.Once
 	configPath string
+	runtimeMu  sync.RWMutex
 )
 
 // QBitTorrent is deprecated. Use Manager instead.
@@ -75,6 +77,7 @@ type Arr struct {
 	Name              string `json:"name,omitempty"`
 	Host              string `json:"host,omitempty"`
 	Token             string `json:"token,omitempty"`
+	Cleanup           bool   `json:"cleanup,omitempty"`
 	SkipRepair        bool   `json:"skip_repair,omitempty"`
 	DownloadUncached  *bool  `json:"download_uncached,omitempty"`
 	SelectedDebrid    string `json:"selected_debrid,omitempty"`
@@ -83,13 +86,15 @@ type Arr struct {
 }
 
 func (a Arr) IsZero() bool {
-	return a.Name == "" && a.Host == "" && a.Token == "" && !a.SkipRepair && a.DownloadUncached == nil && a.SelectedDebrid == "" && !a.FallbackOnFailure && a.Source == ""
+	return a.Name == "" && a.Host == "" && a.Token == "" && !a.Cleanup && !a.SkipRepair && a.DownloadUncached == nil && a.SelectedDebrid == "" && !a.FallbackOnFailure && a.Source == ""
 }
 
 // QueueCleanup is the global policy that drives CleanupQueue. It maps
 // Sonarr/Radarr queue warnings/errors to an action.
 type QueueCleanup struct {
-	Rules []QueueCleanupRule `json:"rules,omitempty"`
+	Rules              []QueueCleanupRule `json:"rules,omitempty"`
+	ConfirmationSweeps int                `json:"confirmation_sweeps,omitempty"` // Consecutive matching monitor sweeps required before acting.
+	ConfirmationDelay  string             `json:"confirmation_delay,omitempty"`  // Minimum age of an unchanged condition, e.g. "5m".
 }
 
 // QueueCleanupRule maps a queue issue to a cleanup action.
@@ -553,6 +558,12 @@ func (c *Config) setDefaults() {
 	}
 
 	c.QueueCleanup.Rules = mergeQueueCleanupRules(c.QueueCleanup.Rules)
+	if c.QueueCleanup.ConfirmationSweeps <= 0 {
+		c.QueueCleanup.ConfirmationSweeps = 3
+	}
+	if delay, err := time.ParseDuration(c.QueueCleanup.ConfirmationDelay); err != nil || delay <= 0 {
+		c.QueueCleanup.ConfirmationDelay = "5m"
+	}
 
 	// Basic defaults
 	if c.URLBase == "" {
@@ -777,9 +788,21 @@ func (c *Config) RequiresRestart(n *Config) bool {
 // Only call this when RequiresRestart(n) is false: the cold fields are then
 // identical between c and n, so this effectively updates just the hot fields.
 func (c *Config) ApplyRuntime(n *Config) {
+	runtimeMu.Lock()
+	defer runtimeMu.Unlock()
 	auth := c.Auth
 	*c = *n
 	c.Auth = auth
+}
+
+// SnapshotQueueCleanup returns an immutable copy suitable for a complete
+// cleanup sweep while ApplyRuntime may replace the live configuration.
+func (c *Config) SnapshotQueueCleanup() QueueCleanup {
+	runtimeMu.RLock()
+	defer runtimeMu.RUnlock()
+	policy := c.QueueCleanup
+	policy.Rules = append([]QueueCleanupRule(nil), c.QueueCleanup.Rules...)
+	return policy
 }
 
 func (c *Config) createConfig() error {

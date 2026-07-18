@@ -59,28 +59,53 @@ type Arr struct {
 	Token string `json:"token"`
 
 	Type              Type   `json:"type"`
+	Cleanup           bool   `json:"cleanup"`
 	SkipRepair        bool   `json:"skip_repair"`
 	DownloadUncached  *bool  `json:"download_uncached"`
 	SelectedDebrid    string `json:"selected_debrid,omitempty"` // The debrid service selected for this arr
 	FallbackOnFailure bool   `json:"fallback_on_failure,omitempty"`
 	Source            Source `json:"source,omitempty"` // The source of the arr, e.g. "auto", "manual". Auto means it was automatically detected from the arr
+
+	cleanupMu           sync.Mutex
+	cleanupObservations map[int]cleanupObservation
 }
 
+// Options contains behavior flags for an Arr. Keeping policy flags out of the
+// positional constructor prevents cleanup and provider fallback from being
+// accidentally interchanged as more Arr-scoped policies are added.
+type Options struct {
+	Cleanup           bool
+	SkipRepair        bool
+	DownloadUncached  *bool
+	SelectedDebrid    string
+	FallbackOnFailure bool
+	Source            Source
+}
+
+// New preserves the original constructor contract for callers that do not
+// need the newer Arr-scoped policies.
 func New(name, host, token string, skipRepair bool, downloadUncached *bool, selectedDebrid, source string) *Arr {
-	return NewWithFallback(name, host, token, skipRepair, downloadUncached, selectedDebrid, false, source)
+	return NewWithOptions(name, host, token, Options{
+		SkipRepair:       skipRepair,
+		DownloadUncached: downloadUncached,
+		SelectedDebrid:   selectedDebrid,
+		Source:           Source(source),
+	})
 }
 
-func NewWithFallback(name, host, token string, skipRepair bool, downloadUncached *bool, selectedDebrid string, fallbackOnFailure bool, source string) *Arr {
+func NewWithOptions(name, host, token string, options Options) *Arr {
 	return &Arr{
-		Name:              name,
-		Host:              host,
-		Token:             strings.TrimSpace(token),
-		Type:              inferType(host, name),
-		SkipRepair:        skipRepair,
-		DownloadUncached:  downloadUncached,
-		SelectedDebrid:    selectedDebrid,
-		FallbackOnFailure: fallbackOnFailure,
-		Source:            Source(source),
+		Name:                name,
+		Host:                host,
+		Token:               strings.TrimSpace(token),
+		Type:                inferType(host, name),
+		Cleanup:             options.Cleanup,
+		SkipRepair:          options.SkipRepair,
+		DownloadUncached:    options.DownloadUncached,
+		SelectedDebrid:      options.SelectedDebrid,
+		FallbackOnFailure:   options.FallbackOnFailure,
+		Source:              options.Source,
+		cleanupObservations: make(map[int]cleanupObservation),
 	}
 }
 
@@ -183,7 +208,14 @@ func NewStorage() *Storage {
 			continue // Skip if host or token is not set
 		}
 		name := a.Name
-		as := NewWithFallback(name, a.Host, a.Token, a.SkipRepair, a.DownloadUncached, a.SelectedDebrid, a.FallbackOnFailure, a.Source)
+		as := NewWithOptions(name, a.Host, a.Token, Options{
+			Cleanup:           a.Cleanup,
+			SkipRepair:        a.SkipRepair,
+			DownloadUncached:  a.DownloadUncached,
+			SelectedDebrid:    a.SelectedDebrid,
+			FallbackOnFailure: a.FallbackOnFailure,
+			Source:            Source(a.Source),
+		})
 		if utils.ValidateURL(as.Host) != nil {
 			continue
 		}
@@ -251,6 +283,7 @@ func (s *Storage) SyncToConfig() []config.Arr {
 				exists.Host = arr.Host
 			}
 			exists.Token = cmp.Or(exists.Token, arr.Token)
+			exists.Cleanup = arr.Cleanup
 			exists.SkipRepair = arr.SkipRepair
 			exists.DownloadUncached = arr.DownloadUncached
 			exists.SelectedDebrid = arr.SelectedDebrid
@@ -262,6 +295,7 @@ func (s *Storage) SyncToConfig() []config.Arr {
 				Name:              arr.Name,
 				Host:              arr.Host,
 				Token:             arr.Token,
+				Cleanup:           arr.Cleanup,
 				SkipRepair:        arr.SkipRepair,
 				DownloadUncached:  arr.DownloadUncached,
 				SelectedDebrid:    arr.SelectedDebrid,
@@ -280,42 +314,66 @@ func (s *Storage) SyncToConfig() []config.Arr {
 }
 
 func (s *Storage) SyncFromConfig(arrs []config.Arr) {
-	newMaps := xsync.NewMap[string, *Arr]()
+	desired := xsync.NewMap[string, *Arr]()
 	for _, a := range arrs {
-		newMaps.Store(a.Name, NewWithFallback(a.Name, a.Host, a.Token, a.SkipRepair, a.DownloadUncached, a.SelectedDebrid, a.FallbackOnFailure, a.Source))
+		desired.Store(a.Name, NewWithOptions(a.Name, a.Host, a.Token, Options{
+			Cleanup:           a.Cleanup,
+			SkipRepair:        a.SkipRepair,
+			DownloadUncached:  a.DownloadUncached,
+			SelectedDebrid:    a.SelectedDebrid,
+			FallbackOnFailure: a.FallbackOnFailure,
+			Source:            Source(a.Source),
+		}))
 	}
 
-	// AddOrUpdate or update arrs from config
+	// Preserve auto-detected Arrs that are not represented in config. A
+	// removed manual/configured Arr must disappear immediately, especially
+	// when it had destructive queue cleanup enabled.
 	s.arrs.Range(func(name string, arr *Arr) bool {
-		if ac, ok := newMaps.Load(name); ok {
+		if ac, ok := desired.Load(name); ok {
 			// Update existing arr with new config values.
 			// Only preserve the resolved host from memory if the new host is invalid.
-			if utils.ValidateURL(ac.Host) == nil {
+			if utils.ValidateURL(ac.Host) != nil {
 				ac.Host = arr.Host
 			}
 			ac.Token = cmp.Or(ac.Token, arr.Token)
-			newMaps.Store(name, ac)
-		} else {
-			newMaps.Store(name, arr)
+			desired.Store(name, ac)
+		} else if arr.Source == SourceAuto {
+			desired.Store(name, arr)
 		}
 		return true
 	})
-	s.arrs = newMaps
+
+	// Mutate the concurrent map in place instead of replacing its pointer
+	// while Monitor/Get may be using it.
+	s.arrs.Range(func(name string, _ *Arr) bool {
+		if _, ok := desired.Load(name); !ok {
+			s.arrs.Delete(name)
+		}
+		return true
+	})
+	desired.Range(func(name string, arr *Arr) bool {
+		s.arrs.Store(name, arr)
+		return true
+	})
 }
 
 func (s *Storage) Monitor() {
 	wg := sync.WaitGroup{}
-	wg.Add(s.arrs.Size())
 	s.arrs.Range(func(name string, arr *Arr) bool {
-		_, _, _ = s.sg.Do(fmt.Sprintf("cleanup_%s", arr.Name), func() (any, error) {
-			go func() {
-				defer wg.Done()
-				if err := arr.CleanupQueue(); err != nil {
-					s.logger.Error().Err(err).Msgf("Failed to cleanup arr %s", arr.Name)
-				}
-			}()
-			return nil, nil
-		})
+		if !arr.Cleanup {
+			return true
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err, _ := s.sg.Do(fmt.Sprintf("cleanup_%s", arr.Name), func() (any, error) {
+				return nil, arr.CleanupQueue()
+			})
+			if err != nil {
+				s.logger.Error().Err(err).Msgf("Failed to cleanup arr %s", arr.Name)
+			}
+		}()
 		return true
 	})
 	wg.Wait()

@@ -108,20 +108,20 @@ func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, e
 	a := s.manager.Arr().Get(category)
 	if a == nil {
 		// Arr is not yet in runtime storage — look for a matching config entry
-		// so we inherit its debrid routing settings. If no config match,
-		// leave the defaults so SendToDebrid uses provider policy.
-		var downloadUncached *bool
-		var selectedDebrid string
-		var fallbackOnFailure bool
-		for _, cfgArr := range config.Get().Arrs {
+		// so we inherit every Arr-scoped policy. This also prevents a later
+		// runtime sync from replacing configured values with zero values.
+		options := arr.Options{Source: arr.SourceAuto}
+		for _, cfgArr := range cfg.Arrs {
 			if cfgArr.Name == category {
-				downloadUncached = cfgArr.DownloadUncached
-				selectedDebrid = cfgArr.SelectedDebrid
-				fallbackOnFailure = cfgArr.FallbackOnFailure
+				options.Cleanup = cfgArr.Cleanup
+				options.SkipRepair = cfgArr.SkipRepair
+				options.DownloadUncached = cfgArr.DownloadUncached
+				options.SelectedDebrid = cfgArr.SelectedDebrid
+				options.FallbackOnFailure = cfgArr.FallbackOnFailure
 				break
 			}
 		}
-		a = arr.NewWithFallback(category, username, password, false, downloadUncached, selectedDebrid, fallbackOnFailure, "auto")
+		a = arr.NewWithOptions(category, username, password, options)
 	}
 	arrValidated := false // This is a flag to indicate if arr validation was successful
 	if (username == "" || password == "") && cfg.UseAuth {
