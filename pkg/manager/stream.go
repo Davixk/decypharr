@@ -12,6 +12,8 @@ import (
 	"sync"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/internal/retry"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -142,6 +144,40 @@ func (m *Manager) Stream(ctx context.Context, entry *storage.Entry, filename str
 	file, ok := entry.Files[filename]
 	if !ok {
 		return retry.Unrecoverable(fmt.Errorf("file %s not found", filename))
+	}
+	if entry.Protocol == config.ProtocolNZB {
+		if m.usenet == nil {
+			return retry.Unrecoverable(fmt.Errorf("usenet client not configured"))
+		}
+		actualSize, prepErr := m.usenet.PrepareStream(entry.InfoHash, filename)
+		if prepErr != nil {
+			var permanent *customerror.Error
+			if errors.As(prepErr, &permanent) && permanent.IsPermanent() {
+				m.markUsenetStreamFailure(entry, filename, prepErr, permanent.Code == "usenet_article_missing")
+			}
+			return retry.Unrecoverable(prepErr)
+		}
+		if actualSize != file.Size {
+			updated := false
+			m.usenetFailureMu.Lock()
+			if actualSize != file.Size {
+				file.Size = actualSize
+				var total int64
+				for _, entryFile := range entry.Files {
+					total += entryFile.Size
+				}
+				entry.Size = total
+				entry.Bytes = total
+				if updateErr := m.queue.Update(entry); updateErr != nil {
+					m.logger.Error().Err(updateErr).Str("entry", entry.Name).Str("file", filename).Msg("Failed to persist reconciled Usenet file size")
+				}
+				updated = true
+			}
+			m.usenetFailureMu.Unlock()
+			if updated {
+				m.entry.Refresh()
+			}
+		}
 	}
 	start, end, err := normalizeStreamRange(file.Size, start, end)
 
@@ -291,6 +327,10 @@ func (m *Manager) streamUsenet(ctx context.Context, entry *storage.Entry, filena
 	if !ok {
 		return retry.Unrecoverable(fmt.Errorf("file not found in entry: %s", filename))
 	}
+	if err := m.usenet.IsFilePermanentlyFailed(entry.InfoHash, filename); err != nil {
+		m.markUsenetStreamFailure(entry, filename, err, true)
+		return retry.Unrecoverable(err)
+	}
 
 	contentLength := end - start + 1
 
@@ -316,7 +356,34 @@ func (m *Manager) streamUsenet(ctx context.Context, entry *storage.Entry, filena
 	}
 
 	// Stream NZB content directly into writer
-	return m.usenet.Stream(ctx, entry.InfoHash, filename, start, end, writer)
+	err := m.usenet.Stream(ctx, entry.InfoHash, filename, start, end, writer)
+	if err != nil && nntp.IsArticleNotFoundError(err) {
+		m.markUsenetStreamFailure(entry, filename, err, true)
+	}
+	return err
+}
+
+func (m *Manager) markUsenetStreamFailure(entry *storage.Entry, filename string, cause error, articlesMissing bool) {
+	if entry == nil || cause == nil {
+		return
+	}
+	message := fmt.Errorf("usenet file %q failed: %w", filename, cause)
+	if articlesMissing {
+		message = fmt.Errorf("articles missing on provider for %q", filename)
+	}
+	m.usenetFailureMu.Lock()
+	if entry.State == storage.EntryStateError && entry.Bad && entry.LastError == message.Error() {
+		m.usenetFailureMu.Unlock()
+		return
+	}
+	entry.MarkAsError(message)
+	entry.Bad = true
+	updateErr := m.queue.Update(entry)
+	m.usenetFailureMu.Unlock()
+	if updateErr != nil {
+		m.logger.Error().Err(updateErr).Str("entry", entry.Name).Str("file", filename).Msg("Failed to persist Usenet stream failure")
+	}
+	m.entry.Refresh()
 }
 
 func normalizeStreamRange(size, start, end int64) (int64, int64, error) {

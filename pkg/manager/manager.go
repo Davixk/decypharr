@@ -74,7 +74,8 @@ type Manager struct {
 	debridSpeedTestResults *xsync.Map[string, debridTypes.SpeedTestResult]
 
 	// Active streams tracking
-	activeStreams *xsync.Map[string, *ActiveStream]
+	activeStreams   *xsync.Map[string, *ActiveStream]
+	usenetFailureMu sync.Mutex
 
 	// In-flight queue-processor dispatches, keyed by InfoHash, to prevent
 	// duplicate goroutines from processing the same entry when the scheduler

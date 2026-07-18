@@ -387,6 +387,7 @@ func (sc *SegmentCache) Put(segIdx int, data []byte) error {
 // the cache. Exactly one of Finalize/Discard is called per writer.
 type segmentWriter interface {
 	Write(p []byte) (int, error)
+	BytesWritten() int64
 	Finalize()
 	Discard()
 }
@@ -463,6 +464,8 @@ func (w *bufferStreamWriter) Write(p []byte) (int, error) {
 // and gets overwritten in place on the next attempt, so there's nothing
 // to release on a failed/partial write.
 func (w *bufferStreamWriter) Discard() {}
+
+func (w *bufferStreamWriter) BytesWritten() int64 { return w.written }
 
 // Finalize commits the segment to the cache: state to OnDisk, length
 // recorded, waiters woken.

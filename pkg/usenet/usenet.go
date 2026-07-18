@@ -213,11 +213,13 @@ type Usenet struct {
 	nntp                     *nntp.Client
 	logger                   zerolog.Logger
 	metadataDir              string
-	nzbStorage               *NZBStorage // File-based NZB metadata storage
-	maxConnections           int         // Connections allocated per streaming file
-	processingMaxConnections int         // Connections allocated per file for parsing and NZB downloads
-	prefetchSize             int64       // Streaming prefetch size in bytes
+	nzbStorage               *NZBStorage   // File-based NZB metadata storage
+	maxConnections           int           // Connections allocated per streaming file
+	processingMaxConnections int           // Connections allocated per file for parsing and NZB downloads
+	prefetchSize             int64         // Streaming prefetch size in bytes
+	readTimeout              time.Duration // Maximum idle time for one stream read
 	failedFiles              *xsync.Map[string, error]
+	preparedSizes            *xsync.Map[string, int64]
 
 	fs *xsync.Map[string, *fsEntry]
 }
@@ -282,6 +284,10 @@ func New() (*Usenet, error) {
 	if err != nil {
 		prefetchSize = 16 * 1024 * 1024 // Default to 16MB
 	}
+	readTimeout, err := utils.ParseDuration(usenetConfig.ReadTimeout)
+	if err != nil || readTimeout <= 0 {
+		readTimeout = 30 * time.Second
+	}
 
 	u := &Usenet{
 		nzbStorage:               nzbStorage,
@@ -291,8 +297,10 @@ func New() (*Usenet, error) {
 		maxConnections:           maxConns,
 		processingMaxConnections: processingMaxConns,
 		prefetchSize:             prefetchSize,
+		readTimeout:              readTimeout,
 		fs:                       xsync.NewMap[string, *fsEntry](),
 		failedFiles:              xsync.NewMap[string, error](),
+		preparedSizes:            xsync.NewMap[string, int64](),
 	}
 
 	// clean streams dir
@@ -321,7 +329,7 @@ func (u *Usenet) createEntry(file *storage.NZBFile) (*fsEntry, error) {
 
 	fsCtx := context.Background()
 
-	usenetFS, err := fs.NewFS(fsCtx, u.nntp, u.maxConnections, u.prefetchSize, volumes, u.logger)
+	usenetFS, err := fs.NewFS(fsCtx, u.nntp, u.maxConnections, u.prefetchSize, volumes, u.logger, fs.WithReadTimeout(u.readTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create usenet FS: %w", err)
 	}
@@ -677,15 +685,127 @@ func (u *Usenet) Close() error {
 }
 
 func (u *Usenet) getFile(nzoID, filename string) (*storage.NZBFile, error) {
-	files, err := u.getFiles(nzoID, []string{filename})
+	nzb, err := u.nzbStorage.GetNZB(nzoID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("metadata load failed: %w", err)
 	}
-	file := files[filename]
-	if file == nil {
-		return nil, fmt.Errorf("file %s not found in NZB %s", filename, nzoID)
+	for i := range nzb.Files {
+		source := nzb.Files[i]
+		if source.Name != filename {
+			continue
+		}
+		if source.IsDeleted {
+			return nil, customerror.NewArticleNotFoundError(fmt.Errorf("articles missing on provider for %q", filename))
+		}
+		file := source
+		if file.NzbID == "" {
+			file.NzbID = nzoID
+		}
+		return &file, nil
 	}
-	return file, nil
+	return nil, fmt.Errorf("file %s not found in NZB %s", filename, nzoID)
+}
+
+// IsFilePermanentlyFailed checks both the hot failure cache and durable NZB
+// metadata. Callers use it before committing HTTP headers.
+func (u *Usenet) IsFilePermanentlyFailed(nzoID, filename string) error {
+	key := fsKey(nzoID, filename)
+	if cause, ok := u.failedFiles.Load(key); ok {
+		return customerror.NewArticleNotFoundError(cause)
+	}
+	// PrepareStream populated this only after checking durable metadata. Any
+	// failure discovered later in this process populates failedFiles first, so
+	// a known-good file can skip repeated header reads on ranged requests.
+	if u.preparedSizes != nil {
+		if _, ok := u.preparedSizes.Load(key); ok {
+			return nil
+		}
+	}
+	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
+	if err != nil {
+		return nil
+	}
+	for i := range nzb.Files {
+		if nzb.Files[i].Name == filename && nzb.Files[i].IsDeleted {
+			cause := fmt.Errorf("articles missing on provider for %q", filename)
+			u.failedFiles.Store(key, cause)
+			return customerror.NewArticleNotFoundError(cause)
+		}
+	}
+	return nil
+}
+
+func segmentDerivedFileSize(file *storage.NZBFile) (int64, error) {
+	if file == nil || len(file.Segments) == 0 {
+		return 0, fmt.Errorf("file has no segments")
+	}
+	var total int64
+	hasOffsets := false
+	for _, seg := range file.Segments {
+		if seg.Bytes <= 0 {
+			return 0, fmt.Errorf("segment %d has invalid size %d", seg.Number, seg.Bytes)
+		}
+		total += seg.Bytes
+		if seg.StartOffset != 0 || seg.EndOffset != 0 {
+			hasOffsets = true
+		}
+	}
+	if !hasOffsets {
+		return total, nil
+	}
+	expectedStart := int64(0)
+	for _, seg := range file.Segments {
+		if seg.StartOffset != expectedStart {
+			return 0, fmt.Errorf("segment %d starts at %d, expected %d", seg.Number, seg.StartOffset, expectedStart)
+		}
+		if seg.EndOffset < seg.StartOffset || seg.EndOffset-seg.StartOffset+1 != seg.Bytes {
+			return 0, fmt.Errorf("segment %d has inconsistent byte range %d-%d for %d bytes", seg.Number, seg.StartOffset, seg.EndOffset, seg.Bytes)
+		}
+		expectedStart = seg.EndOffset + 1
+	}
+	if expectedStart != total {
+		return 0, fmt.Errorf("segment ranges total %d bytes, segment sizes total %d", expectedStart, total)
+	}
+	return total, nil
+}
+
+// PrepareStream validates durable failure state and clamps an advertised size
+// that exceeds the contiguous segment map before a caller writes headers. A
+// smaller advertised size is legitimate for encrypted stored files, whose
+// segment map can include cipher padding, so it must never be expanded here.
+func (u *Usenet) PrepareStream(nzoID, filename string) (int64, error) {
+	if err := u.IsFilePermanentlyFailed(nzoID, filename); err != nil {
+		return 0, err
+	}
+	key := fsKey(nzoID, filename)
+	if u.preparedSizes != nil {
+		if size, ok := u.preparedSizes.Load(key); ok {
+			return size, nil
+		}
+	}
+	file, err := u.getFile(nzoID, filename)
+	if err != nil {
+		return 0, err
+	}
+	streamableSize, err := segmentDerivedFileSize(file)
+	if err != nil {
+		wrapped := customerror.NewPermanentError(fmt.Errorf("invalid usenet file metadata for %q: %w", filename, err))
+		wrapped.Code = "usenet_metadata_invalid"
+		return 0, wrapped
+	}
+	size := file.Size
+	if size <= 0 || size > streamableSize {
+		size = streamableSize
+		if err := u.nzbStorage.reconcileFileSize(nzoID, filename, size); err != nil {
+			return 0, fmt.Errorf("persist corrected size for %q: %w", filename, err)
+		}
+		u.logger.Warn().Str("nzo_id", nzoID).Str("file", filename).Int64("advertised_size", file.Size).Int64("segment_size", streamableSize).Msg("Clamped Usenet file size before streaming")
+	}
+	if u.preparedSizes != nil {
+		actual, _ := u.preparedSizes.LoadOrStore(key, size)
+		return actual, nil
+	}
+	return size, nil
 }
 
 func (u *Usenet) getFiles(nzoID string, filenames []string) (map[string]*storage.NZBFile, error) {
@@ -725,7 +845,7 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 
 	// Check if file was marked as failed previously
 	if cause, ok := u.failedFiles.Load(fsKey(file.NzbID, file.Name)); ok {
-		return customerror.NewSilentError(cause).Permanent()
+		return customerror.NewArticleNotFoundError(cause)
 	}
 
 	return nil
@@ -733,6 +853,13 @@ func (u *Usenet) preStreamChecks(file *storage.NZBFile) error {
 
 // Stream streams a file using the new streaming system with caching and worker limiting
 func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end int64, writer io.Writer) error {
+	deadline := newProgressDeadline(ctx, u.readTimeout)
+	defer deadline.Close()
+	ctx = deadline.Context
+	if err := u.IsFilePermanentlyFailed(nzoID, filename); err != nil {
+		return err
+	}
+
 	if start < 0 {
 		start = 0
 	}
@@ -752,19 +879,16 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	rangeStart := start
 	rangeEnd := end
 
-	// Validate range against volume size
-	if rangeEnd >= ufsEntry.volumes[0].Size {
-		rangeEnd = ufsEntry.volumes[0].Size - 1
-	}
-
-	if rangeEnd < rangeStart {
-		return fmt.Errorf("invalid resolved byte range %d-%d", rangeStart, rangeEnd)
-	}
-
 	// get shared reader from entry (created once, reused by all streams)
-	readerAt, _, err := ufsEntry.getOrCreateReader()
+	readerAt, readerSize, err := ufsEntry.getOrCreateReader()
 	if err != nil {
 		return fmt.Errorf("failed to get reader: %w", err)
+	}
+	if rangeEnd >= readerSize {
+		rangeEnd = readerSize - 1
+	}
+	if rangeEnd < rangeStart {
+		return fmt.Errorf("invalid reader byte range %d-%d for size %d", rangeStart, rangeEnd, readerSize)
 	}
 
 	length := rangeEnd - rangeStart + 1
@@ -793,18 +917,24 @@ func (u *Usenet) Stream(ctx context.Context, nzoID, filename string, start, end 
 	defer releaseStreamBuffer(buf)
 
 	// Use a safe copy loop that checks context and validates read counts
-	_, err = safeCopyBuffer(ctx, writer, section, buf)
+	_, err = safeCopyBuffer(ctx, progressWriter{Writer: writer, progress: deadline.Progress}, section, buf)
 
 	// Handle context cancellation explicitly
 	if err != nil && ctx.Err() != nil {
-		return ctx.Err()
+		return contextError(ctx)
 	}
 
 	// Mark file as failed if article not found (permanent error)
 	if err != nil && nntp.IsArticleNotFoundError(err) {
-		u.failedFiles.Store(key, err) // Reuse pre-computed key
-		// Wrap error to mark as permanent
-		return customerror.NewArticleNotFoundError(err)
+		cause := fmt.Errorf("articles missing on provider for %q: %w", filename, err)
+		u.failedFiles.Store(key, cause)
+		if u.preparedSizes != nil {
+			u.preparedSizes.Delete(key)
+		}
+		if persistErr := u.nzbStorage.markFilePermanentlyFailed(nzoID, filename, cause.Error()); persistErr != nil {
+			u.logger.Error().Err(persistErr).Str("nzo_id", nzoID).Str("file", filename).Msg("Failed to persist permanent Usenet file failure")
+		}
+		return customerror.NewArticleNotFoundError(cause)
 	}
 
 	return err
@@ -1114,6 +1244,13 @@ func (u *Usenet) Delete(nzoID string) error {
 	// Delete from file-based storage
 	if err := u.nzbStorage.DeleteNZB(nzoID); err != nil {
 		return fmt.Errorf("failed to delete NZB from storage: %w", err)
+	}
+	for i := range nzb.Files {
+		key := fsKey(nzoID, nzb.Files[i].Name)
+		u.failedFiles.Delete(key)
+		if u.preparedSizes != nil {
+			u.preparedSizes.Delete(key)
+		}
 	}
 	return nil
 }

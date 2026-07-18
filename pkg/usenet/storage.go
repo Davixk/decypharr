@@ -102,7 +102,12 @@ func (s *NZBStorage) recalculateStatsLocked() error {
 func (s *NZBStorage) AddNZB(nzb *storage.NZB) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.writeNZBLocked(nzb)
+}
 
+// writeNZBLocked atomically writes metadata and updates cached storage stats.
+// Caller must hold s.mu.
+func (s *NZBStorage) writeNZBLocked(nzb *storage.NZB) error {
 	data, err := encodeNZBV2(nzb)
 	if err != nil {
 		return fmt.Errorf("failed to encode NZB: %w", err)
@@ -138,6 +143,67 @@ func (s *NZBStorage) AddNZB(nzb *storage.NZB) error {
 	}
 
 	return nil
+}
+
+// markFilePermanentlyFailed records a definitive provider-side content
+// failure while holding one lock across read-modify-write. This prevents two
+// simultaneous 430s for different files from overwriting each other.
+func (s *NZBStorage) markFilePermanentlyFailed(id, filename, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.metaFilePath(id))
+	if err != nil {
+		return fmt.Errorf("failed to read NZB metadata: %w", err)
+	}
+	nzb, err := decodeNZB(data)
+	if err != nil {
+		return err
+	}
+
+	found := false
+	for i := range nzb.Files {
+		if nzb.Files[i].Name == filename {
+			nzb.Files[i].IsDeleted = true
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("file %s not found in NZB %s", filename, id)
+	}
+	nzb.IsBad = true
+	nzb.Status = NZBStatusFailed
+	nzb.FailMessage = reason
+	return s.writeNZBLocked(nzb)
+}
+
+// reconcileFileSize atomically persists the segment-derived stream size.
+func (s *NZBStorage) reconcileFileSize(id, filename string, size int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.metaFilePath(id))
+	if err != nil {
+		return fmt.Errorf("failed to read NZB metadata: %w", err)
+	}
+	nzb, err := decodeNZB(data)
+	if err != nil {
+		return err
+	}
+	for i := range nzb.Files {
+		if nzb.Files[i].Name != filename {
+			continue
+		}
+		old := nzb.Files[i].Size
+		if old == size {
+			return nil
+		}
+		nzb.Files[i].Size = size
+		nzb.TotalSize += size - old
+		return s.writeNZBLocked(nzb)
+	}
+	return fmt.Errorf("file %s not found in NZB %s", filename, id)
 }
 
 // GetNZB retrieves an NZB from file storage

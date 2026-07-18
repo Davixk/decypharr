@@ -122,6 +122,19 @@ Prefetch buffer for smoother playback. Higher = smoother but more memory.
 - `max_active_downloads`: Shared active-download limit for torrents and NZBs
 - `processing_timeout`: Mark as bad if processing exceeds this
 
+### Stream Read Timeout
+
+```json
+{
+  "usenet": {"read_timeout": "30s"}
+}
+```
+
+`read_timeout` is a no-progress deadline. If a stream delivers no bytes while
+waiting for a reader slot, provider connection, or article body, Decypharr
+cancels the read and releases its resources instead of leaving a stuck WebDAV
+request. Article-not-found failures are persisted so later requests fail fast.
+
 ### Availability Checking
 
 ```json
@@ -216,6 +229,7 @@ Full Usenet config with optimal settings:
     "max_connections": 15,
     "processing_max_connections": 15,
     "read_ahead": "32MB",
+    "read_timeout": "30s",
     "processing_timeout": "15m",
     "availability_sample_percent": 5,
     "disk_buffer_path": "/cache/usenet",

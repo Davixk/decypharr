@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -31,14 +32,21 @@ type PrefetchableReaderAt interface {
 type FS struct {
 	ctx           context.Context
 	volumes       *xsync.Map[string, *types.Volume]
-	client        *nntp.Client // Connection client for all readers
-	maxConcurrent int          // Max concurrent connections per reader
-	prefetchSize  int64        // Prefetch size in bytes
+	client        *nntp.Client  // Connection client for all readers
+	maxConcurrent int           // Max concurrent connections per reader
+	prefetchSize  int64         // Prefetch size in bytes
+	readTimeout   time.Duration // Maximum time a stream may make no progress
 	logger        zerolog.Logger
 }
 
 // Option configures the filesystem
 type Option func(*FS)
+
+func WithReadTimeout(timeout time.Duration) Option {
+	return func(f *FS) {
+		f.readTimeout = timeout
+	}
+}
 
 // NewFS creates a new filesystem backed by the provided connection nntpClient.
 // prefetchSize is the amount of data to prefetch ahead in bytes (e.g., 16*1024*1024 for 16MB)
@@ -99,6 +107,7 @@ func (f *FS) Open(name string) (fs.File, error) {
 		manager:       f.client,
 		maxConcurrent: f.maxConcurrent,
 		prefetchSize:  f.prefetchSize,
+		readTimeout:   f.readTimeout,
 		logger:        f.logger,
 		volume:        vol,
 	}, nil
@@ -205,6 +214,9 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 	readerConfig.MaxConnections = f.maxConcurrent
 	readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(f.prefetchSize, segments)
 	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
+	if f.readTimeout > 0 {
+		readerConfig.DownloadTimeout = f.readTimeout
+	}
 
 	// Create the new streaming reader
 	var streamReader *reader.StreamingReader
@@ -220,6 +232,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithDownloadTimeout(readerConfig.DownloadTimeout),
 		)
 	} else {
 		streamReader, err = reader.NewStreamingReader(
@@ -230,6 +243,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithDownloadTimeout(readerConfig.DownloadTimeout),
 		)
 	}
 
@@ -240,7 +254,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 	cleanup := func() {
 		_ = streamReader.Close()
 	}
-	return streamReader, vol.Size, cleanup, nil
+	return streamReader, streamReader.Size(), cleanup, nil
 }
 
 func closeArchiveClosers(closers []io.Closer) {

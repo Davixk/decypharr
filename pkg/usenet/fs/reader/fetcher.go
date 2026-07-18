@@ -3,6 +3,7 @@ package reader
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -181,26 +182,28 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		}
 	}
 
+	// Start the attempt deadline before acquiring the local reader slot. This
+	// ensures a saturated per-file semaphore cannot wait forever.
+	timeout := sf.config.DownloadTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	downloadCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	// Acquire connection slot
 	select {
 	case sf.semaphore <- struct{}{}:
 		defer func() { <-sf.semaphore }()
-	case <-ctx.Done():
+	case <-downloadCtx.Done():
 		sf.cache.ReleaseFetching(segIdx)
-		return ctx.Err()
+		return downloadCtx.Err()
 	case <-sf.ctx.Done():
 		sf.cache.ReleaseFetching(segIdx)
 		return sf.ctx.Err()
 	}
 
 	messageID := seg.MessageID
-	timeout := sf.config.DownloadTimeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-
-	downloadCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	// ExecuteWithFailover already retries per provider and across providers —
 	// a single call is sufficient.  An outer retry loop would multiply the
@@ -218,7 +221,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		}
 
 		// Stream the decoded body into the chosen tier.
-		n, err := conn.StreamBody(messageID, writer)
+		_, err := conn.StreamBody(messageID, writer)
 		if err != nil {
 			writer.Discard()
 			if ctxErr := downloadCtx.Err(); ctxErr != nil {
@@ -231,14 +234,13 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			return ctxErr
 		}
 
-		// Treat zero-byte articles as missing — the article exists on the
-		// server but its body is empty/corrupted after yEnc decoding.
-		if n == 0 {
+		// A BODY response is not usable unless it contains every byte promised
+		// by the segment map. Previously a short final segment could Finalize
+		// with zero/partial data, leaving the cache in Fetching or causing a
+		// tail retry loop forever.
+		if err := validateSegmentLength(writer.BytesWritten(), seg.Bytes); err != nil {
 			writer.Discard()
-			return &nntp.Error{
-				Type:    nntp.ErrorTypeArticleNotFound,
-				Message: "article produced no data after decoding",
-			}
+			return err
 		}
 
 		// Commit (updates cache state to StateOnDisk).
@@ -259,6 +261,16 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 
 	sf.stats.Downloads.Add(1)
 	return nil
+}
+
+func validateSegmentLength(written, expected int64) error {
+	if written == expected {
+		return nil
+	}
+	return &nntp.Error{
+		Type:    nntp.ErrorTypeArticleNotFound,
+		Message: fmt.Sprintf("article body is short after decoding: got %d bytes, expected %d", written, expected),
+	}
 }
 
 func (sf *SegmentFetcher) markPrefetchQueued(segIdx int) bool {

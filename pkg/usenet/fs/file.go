@@ -28,6 +28,7 @@ type File struct {
 	manager         *nntp.Client                           // Connection manager
 	maxConcurrent   int                                    // Max concurrent connections for this file's reader
 	prefetchSize    int64                                  // Prefetch size in bytes
+	readTimeout     time.Duration                          // Maximum time a read may make no progress
 	pos             atomic.Int64
 	logger          zerolog.Logger
 	closed          atomic.Bool
@@ -170,6 +171,9 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 		readerConfig.MaxConnections = vf.maxConcurrent
 		readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(vf.prefetchSize, segments)
 		readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
+		if vf.readTimeout > 0 {
+			readerConfig.DownloadTimeout = vf.readTimeout
+		}
 
 		var r *reader.StreamingReader
 		var err error
@@ -184,6 +188,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				reader.WithMaxConnections(readerConfig.MaxConnections),
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 				reader.WithDiskPath(readerConfig.DiskPath),
+				reader.WithDownloadTimeout(readerConfig.DownloadTimeout),
 			)
 		} else {
 			r, err = reader.NewStreamingReader(
@@ -194,6 +199,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				reader.WithMaxConnections(readerConfig.MaxConnections),
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 				reader.WithDiskPath(readerConfig.DiskPath),
+				reader.WithDownloadTimeout(readerConfig.DownloadTimeout),
 			)
 		}
 
@@ -268,6 +274,9 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 	readerConfig.MaxConnections = vf.maxConcurrent
 	readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(vf.prefetchSize, segments)
 	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
+	if vf.readTimeout > 0 {
+		readerConfig.DownloadTimeout = vf.readTimeout
+	}
 
 	var r *reader.StreamingReader
 	var err error
@@ -282,6 +291,7 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithDownloadTimeout(readerConfig.DownloadTimeout),
 		)
 	} else {
 		r, err = reader.NewStreamingReader(
@@ -292,6 +302,7 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithDownloadTimeout(readerConfig.DownloadTimeout),
 		)
 	}
 
