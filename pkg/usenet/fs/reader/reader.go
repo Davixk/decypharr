@@ -195,7 +195,7 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	// Queue prefetch for read-ahead (non-blocking)
 	prefetchEnd := min(endSeg+sr.config.PrefetchAhead, sr.segCount-1)
 	if prefetchEnd > endSeg {
-		sr.fetcher.QueuePrefetchRange(endSeg+1, prefetchEnd)
+		sr.fetcher.QueuePrefetchRange(ctx, endSeg+1, prefetchEnd)
 	}
 
 	// Ensure all required segments are available (may block for downloads)
@@ -406,7 +406,7 @@ func (sr *StreamingReader) Prefetch(ctx context.Context, off, length int64) {
 	}
 
 	startSeg, endSeg := sr.cache.SegmentsForRange(off, length)
-	sr.fetcher.QueuePrefetchRange(startSeg, endSeg)
+	sr.fetcher.QueuePrefetchRange(ctx, startSeg, endSeg)
 }
 
 // Read implements io.Reader using ReadAt with tracked position.

@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 )
+
+type segmentClient interface {
+	ExecuteWithFailover(context.Context, func(*nntp.Connection) error) error
+}
 
 // SegmentFetcher handles downloading segments from NNTP with deduplication and retry.
 //
@@ -20,7 +23,7 @@ import (
 //   - Background prefetch queue for read-ahead
 //   - Streams directly to disk via cache's StreamWriter
 type SegmentFetcher struct {
-	client *nntp.Client
+	client segmentClient
 	cache  *SegmentCache
 	config Config
 	logger zerolog.Logger
@@ -32,27 +35,75 @@ type SegmentFetcher struct {
 	// Request deduplication
 	inFlight   map[int]*fetchPromise
 	inFlightMu sync.Mutex
+	fetchWg    sync.WaitGroup
+	closing    bool
 
 	// Background prefetch
-	prefetchCh     chan int
-	prefetchQueued []atomic.Uint64 // one deduplication bit per segment
-	prefetchWg     sync.WaitGroup
+	prefetchCh      chan *prefetchJob
+	prefetchMu      sync.Mutex
+	prefetchJobs    map[int]*prefetchJob
+	prefetchScopes  map[<-chan struct{}]*prefetchScope
+	prefetchWorkers int
+	prefetchWg      sync.WaitGroup
+	prefetchClosing bool
 
 	// Lifecycle
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeDone chan struct{}
 }
 
-// fetchPromise allows multiple goroutines to wait for the same segment download.
+// fetchPromise allows callers from independent stream requests to share one
+// download. Its operation context is rooted at the reader lifetime, not the
+// first caller; it is canceled only when the final interested caller leaves.
 type fetchPromise struct {
-	done chan struct{}
-	err  error
+	ctx      context.Context
+	cancel   context.CancelFunc
+	done     chan struct{}
+	err      error
+	users    int
+	finished bool
+}
+
+// prefetchScope groups every read-ahead hint issued by one request context, so
+// one context cancellation can promptly detach that request from all jobs.
+type prefetchScope struct {
+	key    <-chan struct{}
+	jobs   map[*prefetchJob]struct{}
+	stop   func() bool
+	closed bool
+}
+
+// prefetchJob is one segment download shared by all request scopes interested
+// in it. A stale canceled pointer may remain buffered in prefetchCh; workers
+// validate it against prefetchJobs before doing any work.
+type prefetchJob struct {
+	segIdx        int
+	ctx           context.Context
+	cancel        context.CancelFunc
+	scopes        map[*prefetchScope]struct{}
+	attemptScopes map[*prefetchScope]struct{} // guarded by prefetchMu
 }
 
 // NewSegmentFetcher creates a new segment fetcher.
 func NewSegmentFetcher(
 	ctx context.Context,
 	client *nntp.Client,
+	cache *SegmentCache,
+	config Config,
+	stats *ReaderStats,
+	logger zerolog.Logger,
+) *SegmentFetcher {
+	return newSegmentFetcher(ctx, client, cache, config, stats, logger)
+}
+
+// newSegmentFetcher accepts the narrow NNTP operation used by the fetcher so
+// cancellation and ownership tests can use deterministic clients without
+// changing the exported constructor's API.
+func newSegmentFetcher(
+	ctx context.Context,
+	client segmentClient,
 	cache *SegmentCache,
 	config Config,
 	stats *ReaderStats,
@@ -66,20 +117,19 @@ func NewSegmentFetcher(
 	}
 
 	sf := &SegmentFetcher{
-		client:     client,
-		cache:      cache,
-		config:     config,
-		logger:     logger.With().Str("component", "fetcher").Logger(),
-		stats:      stats,
-		semaphore:  make(chan struct{}, maxConns),
-		inFlight:   make(map[int]*fetchPromise),
-		prefetchCh: make(chan int, 256), // Buffer for prefetch hints
-		// A packed atomic bitmap keeps duplicate suppression cheap even for
-		// very large NZBs: 100k segments consume about 12 KiB, versus roughly
-		// 400 KiB for one atomic.Bool per segment.
-		prefetchQueued: make([]atomic.Uint64, (cache.SegmentCount()+63)/64),
+		client:         client,
+		cache:          cache,
+		config:         config,
+		logger:         logger.With().Str("component", "fetcher").Logger(),
+		stats:          stats,
+		semaphore:      make(chan struct{}, maxConns),
+		inFlight:       make(map[int]*fetchPromise),
+		prefetchCh:     make(chan *prefetchJob, 256), // Buffer for prefetch hints
+		prefetchJobs:   make(map[int]*prefetchJob),
+		prefetchScopes: make(map[<-chan struct{}]*prefetchScope),
 		ctx:            ctx,
 		cancel:         cancel,
+		closeDone:      make(chan struct{}),
 	}
 
 	// Start fewer prefetch workers than foreground connection slots. Seeky
@@ -87,6 +137,7 @@ func NewSegmentFetcher(
 	// still running; reserving at least one slot prevents background prefetch
 	// from starving the blocking read that the caller is waiting on.
 	numPrefetchWorkers := maxConns - 1
+	sf.prefetchWorkers = numPrefetchWorkers
 	if numPrefetchWorkers > 0 {
 		for i := range numPrefetchWorkers {
 			sf.prefetchWg.Add(1)
@@ -100,9 +151,19 @@ func NewSegmentFetcher(
 // Fetch downloads a segment synchronously, with deduplication.
 // Multiple goroutines calling Fetch for the same segment will share the download.
 func (sf *SegmentFetcher) Fetch(ctx context.Context, segIdx int) error {
-	// Fast path: already cached, or wait out an in-progress eviction so we
-	// don't dedup/fetch against a segment whose disk range is mid-punch.
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := sf.ctx.Err(); err != nil {
+			return err
+		}
+
+		// Fast path: already cached, or wait out an in-progress eviction so we
+		// don't dedup/fetch against a segment whose disk range is mid-punch.
 		state := sf.cache.GetState(segIdx)
 		if state == StateEvicting {
 			if err := sf.cache.WaitForEvictionRelease(ctx, segIdx); err != nil {
@@ -116,40 +177,95 @@ func (sf *SegmentFetcher) Fetch(ctx context.Context, segIdx int) error {
 		case StateFailed:
 			return sf.cache.GetError(segIdx)
 		}
-		break
-	}
 
-	// Check if someone else is already fetching
-	sf.inFlightMu.Lock()
-	if promise, ok := sf.inFlight[segIdx]; ok {
-		sf.inFlightMu.Unlock()
-		// Wait for existing fetch
-		select {
-		case <-promise.done:
-			return promise.err
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-sf.ctx.Done():
-			return sf.ctx.Err()
+		sf.inFlightMu.Lock()
+		if sf.closing {
+			err := sf.ctx.Err()
+			if err == nil {
+				err = context.Canceled
+			}
+			sf.inFlightMu.Unlock()
+			return err
 		}
+		if promise, ok := sf.inFlight[segIdx]; ok {
+			if promise.users == 0 && !promise.finished {
+				// The prior owners all canceled and cancellation is propagating
+				// through the download. Wait for that generation to release the
+				// cache slot, then start/join the replacement generation.
+				done := promise.done
+				sf.inFlightMu.Unlock()
+				select {
+				case <-done:
+					continue
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-sf.ctx.Done():
+					return sf.ctx.Err()
+				}
+			}
+			promise.users++
+			sf.inFlightMu.Unlock()
+			return sf.waitForFetch(ctx, promise)
+		}
+
+		flightCtx, flightCancel := context.WithCancel(sf.ctx)
+		promise := &fetchPromise{
+			ctx:    flightCtx,
+			cancel: flightCancel,
+			done:   make(chan struct{}),
+			users:  1,
+		}
+		sf.inFlight[segIdx] = promise
+		sf.fetchWg.Add(1)
+		sf.inFlightMu.Unlock()
+
+		go sf.runFetch(segIdx, promise)
+		return sf.waitForFetch(ctx, promise)
 	}
+}
 
-	// We're the first - create promise
-	promise := &fetchPromise{done: make(chan struct{})}
-	sf.inFlight[segIdx] = promise
-	sf.inFlightMu.Unlock()
+func (sf *SegmentFetcher) runFetch(segIdx int, promise *fetchPromise) {
+	defer sf.fetchWg.Done()
+	err := sf.doFetch(promise.ctx, segIdx)
+	promise.cancel()
 
-	// Actually fetch
-	err := sf.doFetch(ctx, segIdx)
-	promise.err = err
-	close(promise.done)
-
-	// Cleanup
 	sf.inFlightMu.Lock()
-	delete(sf.inFlight, segIdx)
+	promise.err = err
+	promise.finished = true
+	if sf.inFlight[segIdx] == promise {
+		delete(sf.inFlight, segIdx)
+	}
+	close(promise.done)
 	sf.inFlightMu.Unlock()
+}
 
+func (sf *SegmentFetcher) waitForFetch(ctx context.Context, promise *fetchPromise) error {
+	var err error
+	select {
+	case <-promise.done:
+		err = promise.err
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-sf.ctx.Done():
+		err = sf.ctx.Err()
+	}
+	sf.releaseFetchInterest(promise)
 	return err
+}
+
+func (sf *SegmentFetcher) releaseFetchInterest(promise *fetchPromise) {
+	var cancel context.CancelFunc
+	sf.inFlightMu.Lock()
+	if promise.users > 0 {
+		promise.users--
+	}
+	if promise.users == 0 && !promise.finished {
+		cancel = promise.cancel
+	}
+	sf.inFlightMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // doFetch performs the actual NNTP download.
@@ -268,60 +384,116 @@ func validateSegmentLength(written, expected int64) error {
 	}
 }
 
-func (sf *SegmentFetcher) markPrefetchQueued(segIdx int) bool {
-	if segIdx < 0 || segIdx >= sf.cache.SegmentCount() {
-		return false
+// QueuePrefetch adds request-owned interest in a segment to the background
+// queue. Multiple request scopes share one job; canceling one scope only
+// cancels the job when no other scope remains interested.
+func (sf *SegmentFetcher) QueuePrefetch(ctx context.Context, segIdx int) {
+	sf.QueuePrefetchRange(ctx, segIdx, segIdx)
+}
+
+// QueuePrefetchRange queues multiple segments for prefetch. The context's Done
+// channel is the request identity: all hints issued by the same stream share a
+// single cancellation callback, while wrappers that preserve Done naturally
+// remain part of the same scope.
+func (sf *SegmentFetcher) QueuePrefetchRange(ctx context.Context, startSeg, endSeg int) {
+	if sf.prefetchWorkers <= 0 || startSeg > endSeg {
+		return
 	}
-	word := &sf.prefetchQueued[segIdx>>6]
-	mask := uint64(1) << uint(segIdx&63)
-	for {
-		old := word.Load()
-		if old&mask != 0 {
-			return false
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil || sf.ctx.Err() != nil {
+		return
+	}
+
+	var stops []func() bool
+	sf.prefetchMu.Lock()
+	if sf.prefetchClosing || sf.ctx.Err() != nil || ctx.Err() != nil {
+		sf.prefetchMu.Unlock()
+		return
+	}
+	scope := sf.prefetchScopeLocked(ctx)
+	for segIdx := startSeg; segIdx <= endSeg; segIdx++ {
+		if segIdx < 0 || segIdx >= sf.cache.SegmentCount() || sf.cache.GetState(segIdx) == StateOnDisk {
+			continue
 		}
-		if word.CompareAndSwap(old, old|mask) {
-			return true
+		if job := sf.prefetchJobs[segIdx]; job != nil {
+			if _, exists := job.scopes[scope]; !exists {
+				job.scopes[scope] = struct{}{}
+				scope.jobs[job] = struct{}{}
+			}
+			continue
+		}
+
+		jobCtx, jobCancel := context.WithCancel(sf.ctx)
+		job := &prefetchJob{
+			segIdx: segIdx,
+			ctx:    jobCtx,
+			cancel: jobCancel,
+			scopes: map[*prefetchScope]struct{}{scope: {}},
+		}
+		sf.prefetchJobs[segIdx] = job
+		scope.jobs[job] = struct{}{}
+		select {
+		case sf.prefetchCh <- job:
+		default:
+			delete(sf.prefetchJobs, segIdx)
+			delete(scope.jobs, job)
+			job.cancel()
+			sf.stats.PrefetchMisses.Add(1)
 		}
 	}
-}
-
-func (sf *SegmentFetcher) clearPrefetchQueued(segIdx int) {
-	if segIdx < 0 || segIdx >= sf.cache.SegmentCount() {
-		return
+	if len(scope.jobs) == 0 {
+		delete(sf.prefetchScopes, scope.key)
+		scope.closed = true
+		if scope.stop != nil {
+			stops = append(stops, scope.stop)
+		}
 	}
-	word := &sf.prefetchQueued[segIdx>>6]
-	mask := uint64(1) << uint(segIdx&63)
-	word.And(^mask)
-}
-
-// QueuePrefetch adds a segment to the background prefetch queue (non-blocking).
-func (sf *SegmentFetcher) QueuePrefetch(segIdx int) {
-	// Check if already cached
-	state := sf.cache.GetState(segIdx)
-	if state == StateOnDisk || state == StateFetching {
-		return
-	}
-	// State remains Empty while a hint is waiting in prefetchCh. Track that
-	// interval separately so frequent small ReadAt calls cannot enqueue the
-	// same read-ahead window hundreds of times and crowd useful hints out.
-	if !sf.markPrefetchQueued(segIdx) {
-		return
-	}
-
-	select {
-	case sf.prefetchCh <- segIdx:
-		// Queued successfully
-	default:
-		sf.clearPrefetchQueued(segIdx)
-		// Queue full, drop the hint
-		sf.stats.PrefetchMisses.Add(1)
+	sf.prefetchMu.Unlock()
+	for _, stop := range stops {
+		stop()
 	}
 }
 
-// QueuePrefetchRange queues multiple segments for prefetch.
-func (sf *SegmentFetcher) QueuePrefetchRange(startSeg, endSeg int) {
-	for i := startSeg; i <= endSeg; i++ {
-		sf.QueuePrefetch(i)
+func (sf *SegmentFetcher) prefetchScopeLocked(ctx context.Context) *prefetchScope {
+	key := ctx.Done()
+	if scope := sf.prefetchScopes[key]; scope != nil && !scope.closed {
+		return scope
+	}
+	scope := &prefetchScope{
+		key:  key,
+		jobs: make(map[*prefetchJob]struct{}),
+	}
+	sf.prefetchScopes[key] = scope
+	if key != nil {
+		scope.stop = context.AfterFunc(ctx, func() {
+			sf.cancelPrefetchScope(scope)
+		})
+	}
+	return scope
+}
+
+func (sf *SegmentFetcher) cancelPrefetchScope(scope *prefetchScope) {
+	var cancels []context.CancelFunc
+	sf.prefetchMu.Lock()
+	if scope.closed || sf.prefetchScopes[scope.key] != scope {
+		sf.prefetchMu.Unlock()
+		return
+	}
+	delete(sf.prefetchScopes, scope.key)
+	scope.closed = true
+	for job := range scope.jobs {
+		delete(job.scopes, scope)
+		if len(job.scopes) == 0 && sf.prefetchJobs[job.segIdx] == job {
+			delete(sf.prefetchJobs, job.segIdx)
+			cancels = append(cancels, job.cancel)
+		}
+	}
+	scope.jobs = nil
+	sf.prefetchMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
 	}
 }
 
@@ -333,31 +505,122 @@ func (sf *SegmentFetcher) prefetchWorker(id int) {
 		select {
 		case <-sf.ctx.Done():
 			return
-		case segIdx, ok := <-sf.prefetchCh:
+		case job, ok := <-sf.prefetchCh:
 			if !ok {
 				return
 			}
-			sf.prefetchOne(segIdx)
-			sf.clearPrefetchQueued(segIdx)
+			// A transiently empty attempt may hand late request scopes to a
+			// replacement generation. Run it on this worker directly: the old
+			// queue token already provided the worker budget, and an inline handoff
+			// cannot deadlock when prefetchCh is full.
+			for job != nil {
+				if sf.startPrefetchJob(job) {
+					sf.prefetchOne(job)
+				}
+				job = sf.finishPrefetchJob(job)
+			}
 		}
 	}
 }
 
 // prefetchOne uses the deduplicated, failover-aware single-segment fetch path.
-func (sf *SegmentFetcher) prefetchOne(segIdx int) {
+func (sf *SegmentFetcher) prefetchOne(job *prefetchJob) {
+	ctx := job.ctx
+	segIdx := job.segIdx
 	state := sf.cache.GetState(segIdx)
 	if state == StateOnDisk {
 		sf.stats.PrefetchHits.Add(1)
 		return
 	}
 
-	fetchCtx, cancel := context.WithTimeout(sf.ctx, sf.config.DownloadTimeout)
+	timeout := sf.config.DownloadTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 	err := sf.Fetch(fetchCtx, segIdx)
 	cancel()
 
 	if err != nil && err != context.Canceled && err != context.DeadlineExceeded {
 		sf.logger.Debug().Err(err).Int("segment", segIdx).Msg("prefetch failed")
 	}
+}
+
+func (sf *SegmentFetcher) startPrefetchJob(job *prefetchJob) bool {
+	if job == nil || job.ctx.Err() != nil {
+		return false
+	}
+	sf.prefetchMu.Lock()
+	current := sf.prefetchJobs[job.segIdx] == job && len(job.scopes) > 0
+	if current {
+		job.attemptScopes = make(map[*prefetchScope]struct{}, len(job.scopes))
+		for scope := range job.scopes {
+			job.attemptScopes[scope] = struct{}{}
+		}
+	}
+	sf.prefetchMu.Unlock()
+	return current
+}
+
+// finishPrefetchJob retires one attempt. If a transient attempt left no usable
+// cache entry, request scopes that joined after the attempt began are moved to
+// a fresh generation rather than being discarded with the completed attempt.
+// The caller must run the returned job before accepting another channel item.
+func (sf *SegmentFetcher) finishPrefetchJob(job *prefetchJob) *prefetchJob {
+	if job == nil {
+		return nil
+	}
+	var stops []func() bool
+	var replacement *prefetchJob
+	sf.prefetchMu.Lock()
+	if sf.prefetchJobs[job.segIdx] == job {
+		state := sf.cache.GetState(job.segIdx)
+		canRetryLate := !sf.prefetchClosing && sf.ctx.Err() == nil &&
+			(state == StateEmpty || state == StateFetching)
+		if canRetryLate && len(job.attemptScopes) > 0 {
+			for scope := range job.scopes {
+				if _, attempted := job.attemptScopes[scope]; attempted || scope.closed {
+					continue
+				}
+				if replacement == nil {
+					replacementCtx, replacementCancel := context.WithCancel(sf.ctx)
+					replacement = &prefetchJob{
+						segIdx: job.segIdx,
+						ctx:    replacementCtx,
+						cancel: replacementCancel,
+						scopes: make(map[*prefetchScope]struct{}),
+					}
+				}
+				delete(job.scopes, scope)
+				delete(scope.jobs, job)
+				replacement.scopes[scope] = struct{}{}
+				scope.jobs[replacement] = struct{}{}
+			}
+		}
+		if replacement != nil {
+			sf.prefetchJobs[job.segIdx] = replacement
+		} else {
+			delete(sf.prefetchJobs, job.segIdx)
+		}
+	}
+	for scope := range job.scopes {
+		delete(scope.jobs, job)
+		if len(scope.jobs) == 0 && !scope.closed && sf.prefetchScopes[scope.key] == scope {
+			delete(sf.prefetchScopes, scope.key)
+			scope.closed = true
+			if scope.stop != nil {
+				stops = append(stops, scope.stop)
+			}
+		}
+	}
+	job.scopes = nil
+	job.attemptScopes = nil
+	sf.prefetchMu.Unlock()
+	job.cancel()
+	for _, stop := range stops {
+		stop()
+	}
+	return replacement
 }
 
 // EnsureSegments fetches all segments in the range, returning when all are
@@ -436,8 +699,54 @@ func (sf *SegmentFetcher) retryBackoff(attempt int) time.Duration {
 // closed channel panics even inside a select. Workers exit via sf.ctx instead,
 // and the channel is garbage-collected with the fetcher.
 func (sf *SegmentFetcher) Close() {
-	sf.cancel()
-	sf.prefetchWg.Wait()
+	sf.closeOnce.Do(func() {
+		// Fence out new flights before Wait begins. Every fetchWg.Add happens
+		// while holding inFlightMu after checking this flag.
+		var flightCancels []context.CancelFunc
+		sf.inFlightMu.Lock()
+		sf.closing = true
+		for _, promise := range sf.inFlight {
+			flightCancels = append(flightCancels, promise.cancel)
+		}
+		sf.inFlightMu.Unlock()
+
+		sf.cancel()
+		for _, cancel := range flightCancels {
+			cancel()
+		}
+		sf.cancelAllPrefetch()
+		sf.prefetchWg.Wait()
+		sf.fetchWg.Wait()
+		close(sf.closeDone)
+	})
+	<-sf.closeDone
+}
+
+func (sf *SegmentFetcher) cancelAllPrefetch() {
+	var cancels []context.CancelFunc
+	var stops []func() bool
+	sf.prefetchMu.Lock()
+	sf.prefetchClosing = true
+	for segIdx, job := range sf.prefetchJobs {
+		delete(sf.prefetchJobs, segIdx)
+		cancels = append(cancels, job.cancel)
+		job.scopes = nil
+	}
+	for key, scope := range sf.prefetchScopes {
+		delete(sf.prefetchScopes, key)
+		scope.closed = true
+		scope.jobs = nil
+		if scope.stop != nil {
+			stops = append(stops, scope.stop)
+		}
+	}
+	sf.prefetchMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, stop := range stops {
+		stop()
+	}
 }
 
 // Error types
