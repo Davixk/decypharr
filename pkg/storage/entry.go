@@ -268,7 +268,17 @@ func (s *Storage) Get(infohash string) (*Entry, error) {
 	return ProtoToEntry(&pb), nil
 }
 
-// List retrieves all cached entries with optional filtering
+// logCorruptRow records an undecodable row that a scan skipped. The row stays
+// on disk (and keeps failing per-key reads) but must not black-hole whole
+// listings or startup: one corrupt row in a large store should cost exactly
+// that one row, never the rest.
+func (s *Storage) logCorruptRow(store, key string, err error) {
+	s.logger.Error().Err(err).Str("store", store).Str("key", key).Msg("Skipping corrupt storage row")
+}
+
+// List retrieves all cached entries with optional filtering.
+// Rows that fail to decode are logged and skipped so a single corrupt record
+// cannot hide every other entry from callers.
 func (s *Storage) List(filter func(*Entry) bool) ([]*Entry, error) {
 	var entries []*Entry
 
@@ -278,7 +288,8 @@ func (s *Storage) List(filter func(*Entry) bool) ([]*Entry, error) {
 		}
 		var pb EntryProto
 		if err := proto.Unmarshal(value, &pb); err != nil {
-			return fmt.Errorf("decode main entry %s: %w", key, err)
+			s.logCorruptRow("entries", key, err)
+			return nil
 		}
 		entry := ProtoToEntry(&pb)
 		if filter == nil || filter(entry) {
@@ -290,7 +301,7 @@ func (s *Storage) List(filter func(*Entry) bool) ([]*Entry, error) {
 	return entries, err
 }
 
-// ForEach iterates over entries
+// ForEach iterates over entries. Undecodable rows are logged and skipped.
 func (s *Storage) ForEach(fn func(*Entry) error) error {
 	return s.entries.ForEach(func(key string, value []byte) error {
 		if strings.HasPrefix(key, "__") {
@@ -298,7 +309,8 @@ func (s *Storage) ForEach(fn func(*Entry) error) error {
 		}
 		var pb EntryProto
 		if err := proto.Unmarshal(value, &pb); err != nil {
-			return fmt.Errorf("decode main entry %s: %w", key, err)
+			s.logCorruptRow("entries", key, err)
+			return nil
 		}
 		return fn(ProtoToEntry(&pb))
 	})
@@ -321,7 +333,8 @@ func (s *Storage) ForEachBatch(batchSize int, fn func([]*Entry) error) error {
 		}
 		proto.Reset(&pb)
 		if err := proto.Unmarshal(value, &pb); err != nil {
-			return fmt.Errorf("decode main entry %s: %w", key, err)
+			s.logCorruptRow("entries", key, err)
+			return nil
 		}
 		batch = append(batch, ProtoToEntry(&pb))
 
@@ -370,8 +383,11 @@ func (s *Storage) ForEachMeta(fn func(*EntryMetaInfo) error) error {
 // MigrateMetadata re-saves all entries to populate the new metadata fields
 // (Protocol, Bad, AddedOn, computed folder Name) in the index.
 // This is a one-time migration for existing data.
-// Returns the number of entries migrated and any error.
-func (s *Storage) MigrateMetadata() (int, error) {
+// Returns the number of entries migrated, the number of corrupt rows skipped,
+// and any store-level error. A row that fails to decode is logged and skipped
+// so one bad record in real-world legacy state cannot abort startup; I/O
+// failures against the underlying store still abort.
+func (s *Storage) MigrateMetadata() (int, int, error) {
 	var mainKeys []string
 	if err := s.entries.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
 		// Skip special keys
@@ -384,7 +400,7 @@ func (s *Storage) MigrateMetadata() (int, error) {
 		}
 		return nil
 	}); err != nil {
-		return 0, fmt.Errorf("scan main entry metadata: %w", err)
+		return 0, 0, fmt.Errorf("scan main entry metadata: %w", err)
 	}
 	var queueKeys []string
 	if err := s.queue.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
@@ -393,14 +409,15 @@ func (s *Storage) MigrateMetadata() (int, error) {
 		}
 		return nil
 	}); err != nil {
-		return 0, fmt.Errorf("scan queue entry metadata: %w", err)
+		return 0, 0, fmt.Errorf("scan queue entry metadata: %w", err)
 	}
 
 	migrated := 0
+	skipped := 0
 	for _, key := range mainKeys {
 		unlock := s.lockEntryMutation(key)
-		entry, err := s.Get(key)
-		if err == nil {
+		entry, decodeErr, err := s.loadEntryClassified(s.entries, key)
+		if err == nil && decodeErr == nil && entry != nil {
 			pb := EntryToProto(entry)
 			var data []byte
 			data, err = proto.Marshal(pb)
@@ -413,29 +430,62 @@ func (s *Storage) MigrateMetadata() (int, error) {
 		}
 		unlock()
 		if err != nil {
-			return migrated, fmt.Errorf("migrate main metadata %s: %w", key, err)
+			return migrated, skipped, fmt.Errorf("migrate main metadata %s: %w", key, err)
+		}
+		if decodeErr != nil {
+			s.logCorruptRow("entries", key, decodeErr)
+			skipped++
+			continue
+		}
+		if entry == nil {
+			continue // deleted concurrently
 		}
 		migrated++
 	}
 	for _, key := range queueKeys {
 		unlock := s.lockQueueMutation(key)
-		entry, err := s.GetQueued(key)
-		if err == nil {
+		entry, decodeErr, err := s.loadEntryClassified(s.queue, strings.ToLower(key))
+		if err == nil && decodeErr == nil && entry != nil {
 			pb := EntryToProto(entry)
 			var data []byte
 			data, err = proto.Marshal(pb)
 			if err == nil {
-				err = s.queue.Put(key, data, entryMetadata(entry))
+				err = s.queue.Put(strings.ToLower(key), data, entryMetadata(entry))
 			}
 		}
 		unlock()
 		if err != nil {
-			return migrated, fmt.Errorf("migrate queue metadata %s: %w", key, err)
+			return migrated, skipped, fmt.Errorf("migrate queue metadata %s: %w", key, err)
+		}
+		if decodeErr != nil {
+			s.logCorruptRow("queue", key, decodeErr)
+			skipped++
+			continue
+		}
+		if entry == nil {
+			continue
 		}
 		migrated++
 	}
 
-	return migrated, nil
+	return migrated, skipped, nil
+}
+
+// loadEntryClassified separates row-level corruption from store-level I/O
+// failures. It returns (nil, nil, nil) when the key no longer exists.
+func (s *Storage) loadEntryClassified(store *hybrid.Store, key string) (*Entry, error, error) {
+	data, err := store.Get(key)
+	if err != nil {
+		if !store.Exists(key) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	var pb EntryProto
+	if err := proto.Unmarshal(data, &pb); err != nil {
+		return nil, err, nil
+	}
+	return ProtoToEntry(&pb), nil, nil
 }
 
 // Delete removes an entry
@@ -847,7 +897,11 @@ func SameQueueGeneration(first, second *Entry) bool {
 // rows before NewStorage exposes any snapshots. Lazy adoption alone is not
 // sufficient: an unversioned snapshot taken before delete/re-add could
 // otherwise be mistaken for a brand-new row and resurrect stale data.
-func (s *Storage) MigrateStoreVersions() (int, error) {
+// Returns the number of rows migrated and the number of corrupt rows skipped.
+// Per-row decode failures are logged and skipped so legacy state with one bad
+// record still boots; store-level I/O failures abort.
+func (s *Storage) MigrateStoreVersions() (int, int, error) {
+	skipped := 0
 	var mainKeys []string
 	if err := s.entries.ForEach(func(key string, value []byte) error {
 		if strings.HasPrefix(key, "__") {
@@ -855,35 +909,39 @@ func (s *Storage) MigrateStoreVersions() (int, error) {
 		}
 		var pb EntryProto
 		if err := proto.Unmarshal(value, &pb); err != nil {
-			return fmt.Errorf("decode main entry %s during version scan: %w", key, err)
+			s.logCorruptRow("entries", key, err)
+			skipped++
+			return nil
 		}
 		if pb.MainStoreGeneration == "" || pb.MainStoreRevision == 0 {
 			mainKeys = append(mainKeys, key)
 		}
 		return nil
 	}); err != nil {
-		return 0, fmt.Errorf("scan main entry versions: %w", err)
+		return 0, skipped, fmt.Errorf("scan main entry versions: %w", err)
 	}
 
 	var queueKeys []string
 	if err := s.queue.ForEach(func(key string, value []byte) error {
 		var pb EntryProto
 		if err := proto.Unmarshal(value, &pb); err != nil {
-			return fmt.Errorf("decode queue entry %s during version scan: %w", key, err)
+			s.logCorruptRow("queue", key, err)
+			skipped++
+			return nil
 		}
 		if pb.QueueStoreGeneration == "" || pb.QueueStoreRevision == 0 {
 			queueKeys = append(queueKeys, key)
 		}
 		return nil
 	}); err != nil {
-		return 0, fmt.Errorf("scan queue entry versions: %w", err)
+		return 0, skipped, fmt.Errorf("scan queue entry versions: %w", err)
 	}
 
 	migrated := 0
 	for _, key := range mainKeys {
 		changed, err := s.migrateMainStoreVersion(key)
 		if err != nil {
-			return migrated, err
+			return migrated, skipped, err
 		}
 		if changed {
 			migrated++
@@ -892,13 +950,13 @@ func (s *Storage) MigrateStoreVersions() (int, error) {
 	for _, key := range queueKeys {
 		changed, err := s.migrateQueueStoreVersion(key)
 		if err != nil {
-			return migrated, err
+			return migrated, skipped, err
 		}
 		if changed {
 			migrated++
 		}
 	}
-	return migrated, nil
+	return migrated, skipped, nil
 }
 
 func (s *Storage) migrateMainStoreVersion(key string) (bool, error) {

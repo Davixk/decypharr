@@ -79,7 +79,10 @@ func (s *Storage) projectEntryItem(name string) (*entryItemProjection, error) {
 		}
 		var pb EntryProto
 		if err := proto.Unmarshal(value, &pb); err != nil {
-			return fmt.Errorf("decode main entry %s while rebuilding folder %s: %w", key, name, err)
+			// A corrupt sibling row must not permanently break folder rebuilds
+			// for every healthy entry; it is skipped here just like in listings.
+			s.logCorruptRow("entries", key, err)
+			return nil
 		}
 		entry := ProtoToEntry(&pb)
 		if entry.GetFolder() == name {
@@ -165,7 +168,10 @@ func (s *Storage) rebuildEntryItem(name string, fallbackProtocol config.Protocol
 // reconcileEntryItemsAtStartup reconstructs the complete WebDAV folder index
 // from authoritative main rows. It runs before Storage is published to callers,
 // so its one-pass snapshot cannot overwrite a concurrent mutation.
-func (s *Storage) reconcileEntryItemsAtStartup() (int, error) {
+// It returns the number of items changed and the number of corrupt main rows
+// skipped; corrupt rows are logged and excluded rather than aborting startup.
+func (s *Storage) reconcileEntryItemsAtStartup() (int, int, error) {
+	skipped := 0
 	projections := make(map[string]*entryItemProjection)
 	if err := s.entries.ForEach(func(key string, value []byte) error {
 		if strings.HasPrefix(key, "__") {
@@ -173,22 +179,19 @@ func (s *Storage) reconcileEntryItemsAtStartup() (int, error) {
 		}
 		var pb EntryProto
 		if err := proto.Unmarshal(value, &pb); err != nil {
-			return fmt.Errorf("decode main entry %s while reconciling entry items: %w", key, err)
+			s.logCorruptRow("entries", key, err)
+			skipped++
+			return nil
 		}
 		addEntryToProjection(projections, ProtoToEntry(&pb))
 		return nil
 	}); err != nil {
-		return 0, err
+		return 0, skipped, err
 	}
 
-	type existingItem struct {
-		present  bool
-		readable bool
-		item     *EntryItem
-	}
-	existing := make(map[string]existingItem)
+	existing := make(map[string]existingEntryItem)
 	if err := s.entryItems.ForEach(func(key string, value []byte) error {
-		state := existingItem{present: true}
+		state := existingEntryItem{present: true}
 		var pb EntryItemProto
 		if err := proto.Unmarshal(value, &pb); err == nil {
 			state.readable = true
@@ -197,7 +200,7 @@ func (s *Storage) reconcileEntryItemsAtStartup() (int, error) {
 		existing[key] = state
 		return nil
 	}); err != nil {
-		return 0, fmt.Errorf("scan existing entry items: %w", err)
+		return 0, skipped, fmt.Errorf("scan existing entry items: %w", err)
 	}
 
 	names := make(map[string]struct{}, len(projections)+len(existing))
@@ -220,13 +223,19 @@ func (s *Storage) reconcileEntryItemsAtStartup() (int, error) {
 		itemChanged, err := s.writeEntryItemProjectionLocked(name, projections[name], state.present, state.readable, state.item)
 		unlock()
 		if err != nil {
-			return changed, err
+			return changed, skipped, err
 		}
 		if itemChanged {
 			changed++
 		}
 	}
-	return changed, nil
+	return changed, skipped, nil
+}
+
+type existingEntryItem struct {
+	present  bool
+	readable bool
+	item     *EntryItem
 }
 
 // GetEntryItems returns all entry item names
@@ -285,12 +294,15 @@ func (s *Storage) GetEntryItem(name string) (*EntryItem, error) {
 	return ProtoToEntryItem(&pb), nil
 }
 
-// ForEachEntryItem iterates over entry items
+// ForEachEntryItem iterates over entry items. Undecodable derived rows are
+// logged and skipped (they are rebuilt from authoritative entries by the
+// startup reconcile and repair passes).
 func (s *Storage) ForEachEntryItem(fn func(*EntryItem) error) error {
 	return s.entryItems.ForEach(func(key string, value []byte) error {
 		var pb EntryItemProto
 		if err := proto.Unmarshal(value, &pb); err != nil {
-			return fmt.Errorf("decode entry item %s: %w", key, err)
+			s.logCorruptRow("items", key, err)
+			return nil
 		}
 		return fn(ProtoToEntryItem(&pb))
 	})
