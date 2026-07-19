@@ -690,7 +690,19 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 	// Process the groups (archives)
 	updatedNZB, err := prs.Process(ctx, nzb, groups)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Cancellation is a workflow interruption, not evidence that the
+			// NZB is bad. Leave durable metadata resumable.
+			return nzb, ctxErr
+		}
 		processErr := fmt.Errorf("failed to process NZB archives: %w", err)
+		if errors.Is(err, parser.ErrProbeInfrastructure) {
+			// The NNTP substrate failed while processing the archives, so no
+			// verdict about the content exists. Durably marking the metadata
+			// failed here would block a rebuild from ever resuming it; keep it
+			// resumable and let the caller retry once the substrate recovers.
+			return nzb, processErr
+		}
 		if markErr := u.markAsFailed(nzb, err); markErr != nil {
 			return nzb, errors.Join(processErr, fmt.Errorf("record NZB processing failure: %w", markErr))
 		}

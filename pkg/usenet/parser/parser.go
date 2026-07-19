@@ -235,9 +235,31 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 	}()
 
 	// Parse each group (with deferred archive option)
-	files := p.processFileGroups(ctx, groups, nzb.Password)
+	files, groupFailures := p.processFileGroups(ctx, groups, nzb.Password)
 
 	if len(files) == 0 {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Cancellation (shutdown) or an expired processing deadline is a
+			// workflow interruption, not a verdict about the NZB's content.
+			// The generic "no valid files" text must never swallow it: during
+			// the 2026-07-19 incident every group failed on a collapsed NNTP
+			// substrate and the resulting bare verdict terminally error-parked
+			// 1,891 perfectly revivable entries.
+			return nil, ctxErr
+		}
+		if groupFailures.total() > 0 {
+			// Every file group was dropped and at least one drop was caused by
+			// a segment fetch failing on the network. Same verdict gating as
+			// the parse-time probes: only an all-genuine-430 failure set may
+			// carry the "articles missing" verdict; any infrastructure-class
+			// failure makes the availability of the content unknowable, so
+			// fail safe with the no-verdict sentinel.
+			verdict := error(ErrArticlesUnavailable)
+			if groupFailures.infrastructure > 0 {
+				verdict = ErrProbeInfrastructure
+			}
+			return nil, fmt.Errorf("%w: no valid files found in NZB after %d file group failure(s)", verdict, groupFailures.total())
+		}
 		return nil, fmt.Errorf("no valid files found in NZB")
 	}
 
@@ -274,6 +296,11 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 	if len(nzb.Files) == 0 {
 		if skippedFiles > 0 {
 			return nil, fmt.Errorf("all files were skipped due to size or extension restrictions(error %v)", skippedErr)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Same gating as above: never let an interruption masquerade as a
+			// content verdict.
+			return nil, ctxErr
 		}
 		return nil, fmt.Errorf("no valid files found in NZB after processing")
 	}
@@ -427,6 +454,27 @@ type probeFailureCounts struct {
 
 func (c probeFailureCounts) total() int {
 	return c.articlesMissing + c.infrastructure
+}
+
+// countGroupFailure classifies a file-group processing failure into the
+// probe-failure tally. Only failures that demonstrably came from the NNTP
+// substrate (or carry a genuine article-not-found verdict) are counted;
+// cancellation/deadline errors count as infrastructure because they leave no
+// verdict either. Unknown errors (corrupt archives, unsupported types,
+// inconsistent segment numbering) represent real content problems and are
+// deliberately NOT counted, so a genuinely unusable NZB keeps producing the
+// terminal "no valid files" outcome.
+func countGroupFailure(counts *probeFailureCounts, err error) {
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrArticlesUnavailable) || nntp.IsArticleNotFoundError(err):
+		counts.articlesMissing++
+	case errors.Is(err, ErrProbeInfrastructure) ||
+		nntp.IsInfrastructureError(err) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded):
+		counts.infrastructure++
+	}
 }
 
 // Batch process unknown files in parallel. The second return value counts
@@ -639,9 +687,22 @@ func (p *NZBParser) isRarFile(filename string) bool {
 		rarVolumePattern.MatchString(filename)
 }
 
-func (p *NZBParser) processFileGroups(ctx context.Context, groups map[string]*FileGroup, password string) []storage.NZBFile {
+// groupProcessResult carries one file group's processing outcome through the
+// mapper so Process can distinguish "group failed on the substrate" from
+// "group genuinely contained nothing usable".
+type groupProcessResult struct {
+	files []*storage.NZBFile
+	err   error
+}
+
+// processFileGroups processes every file group and returns the usable files
+// plus a tally of the groups that were dropped because of network probe
+// failures (split by verdict class). Callers use the tally to keep an NZB
+// whose groups all failed on a collapsed substrate from being misreported as
+// containing "no valid files".
+func (p *NZBParser) processFileGroups(ctx context.Context, groups map[string]*FileGroup, password string) ([]storage.NZBFile, probeFailureCounts) {
 	if len(groups) == 0 {
-		return nil
+		return nil, probeFailureCounts{}
 	}
 	rarCounts, sevenZCounts, zipCounts, mediaCounts, deferredCounts := 0, 0, 0, 0, 0
 
@@ -656,23 +717,25 @@ func (p *NZBParser) processFileGroups(ctx context.Context, groups map[string]*Fi
 
 	// Use a Mapper with limited concurrency to prevent goroutine explosion
 	// when nested with RAR/archive parsers that also use parallel processing
-	mapper := iter.Mapper[FileGroup, []*storage.NZBFile]{
+	mapper := iter.Mapper[FileGroup, groupProcessResult]{
 		MaxGoroutines: p.maxConcurrent,
 	}
 
-	results := mapper.Map(fileGroups, func(g *FileGroup) []*storage.NZBFile {
+	results := mapper.Map(fileGroups, func(g *FileGroup) groupProcessResult {
 		files, err := p.processFileGroup(ctx, g, password)
 		if err != nil {
 			p.logger.Warn().Err(err).Str("group", g.BaseName).Msg("Failed to process file group")
-			return nil
+			return groupProcessResult{err: err}
 		}
-		return files
+		return groupProcessResult{files: files}
 	})
 
-	// Filter nils
+	// Filter nils and tally probe failures
+	var groupFailures probeFailureCounts
 	var files []storage.NZBFile
-	for _, groupFiles := range results {
-		for _, f := range groupFiles {
+	for _, result := range results {
+		countGroupFailure(&groupFailures, result.err)
+		for _, f := range result.files {
 			if f != nil {
 				files = append(files, *f)
 				// Count types
@@ -698,7 +761,7 @@ func (p *NZBParser) processFileGroups(ctx context.Context, groups map[string]*Fi
 		}
 	}
 
-	return files
+	return files, groupFailures
 }
 
 // Simplified individual group processing
