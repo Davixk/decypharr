@@ -399,7 +399,11 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 	}
 	// Check if done or failed
 	if debridTorrent.Status == debridTypes.TorrentStatusDownloaded {
-		go m.processAction(entry)
+		// Hand the detached action its own snapshot: this function still reads
+		// the entry after spawning, and sharing the pointer would race with the
+		// action's snapshot refreshes.
+		actionEntry := *entry
+		go m.processAction(&actionEntry)
 	}
 }
 
@@ -460,8 +464,11 @@ func (m *Manager) processNewTorrent(torrent *storage.Entry, debridTorrent *debri
 		return nil
 	}
 
-	// Parse post-download action
-	go m.processAction(torrent)
+	// Parse post-download action. The action goroutine gets its own snapshot:
+	// the calling worker returns into waitForDownloadCompletion with the same
+	// pointer, and the two must not refresh a shared Entry concurrently.
+	actionEntry := *torrent
+	go m.processAction(&actionEntry)
 	return nil
 }
 

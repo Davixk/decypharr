@@ -377,15 +377,31 @@ func (m *Manager) resumeClaimedAction(entry *storage.Entry) {
 	m.runClaimedAction(entry)
 }
 
+// waitForDownloadCompletion parks a worker slot only while the entry still
+// represents in-flight provider/import work. It returns as soon as the entry
+// leaves the downloading state, the job is cancelled, or the post-download
+// action has been durably claimed (Status downloaded + IsDownloading): from
+// that point the detached action goroutine owns the entry lifecycle, and
+// keeping the slot parked would serialize slow mount-visibility waits behind
+// real download work (MaxActiveDownloads workers x mount refresh interval).
 func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.Entry) {
 	if entry == nil {
 		return
 	}
+	// Wait on a private snapshot. Detached post-download action goroutines and
+	// restore paths can retain the original pointer; refreshing a shared
+	// pointer from this loop would race with their own snapshot refreshes.
+	snapshot := *entry
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		current, err := m.queue.RefreshSnapshot(entry)
-		if err != nil || !current || entry.State != storage.EntryStateDownloading {
+		current, err := m.queue.RefreshSnapshot(&snapshot)
+		if err != nil || !current || snapshot.State != storage.EntryStateDownloading {
+			return
+		}
+		if snapshot.Status == debridTypes.TorrentStatusDownloaded && snapshot.IsDownloading {
+			// The post-download action is durably claimed; the action owns the
+			// entry from here on and the worker slot must free.
 			return
 		}
 		select {

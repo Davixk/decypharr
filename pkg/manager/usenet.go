@@ -221,7 +221,11 @@ func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata
 		return fmt.Errorf("nzb has no files")
 	}
 
-	go m.processAction(entry)
+	// Hand the detached action its own snapshot: the calling worker returns
+	// into waitForDownloadCompletion with the same pointer, and the two must
+	// not refresh a shared Entry concurrently.
+	actionEntry := *entry
+	go m.processAction(&actionEntry)
 	return nil
 }
 
