@@ -75,6 +75,16 @@ type prefetchScope struct {
 	closed bool
 }
 
+// prefetchLingerDuration is the grace period between the last interested
+// request scope detaching from a prefetch job and the job's teardown. Chatty
+// ranged readers (Plex direct play issues many short sequential ranged GETs)
+// end their request context at every range boundary; canceling in-flight
+// read-ahead immediately would tear down and refetch the same segments on
+// each boundary. If a new scope attaches within the grace, the teardown is
+// canceled; otherwise the job dies exactly as before. Declared as a var so
+// tests can shrink it.
+var prefetchLingerDuration = 2 * time.Second
+
 // prefetchJob is one segment download shared by all request scopes interested
 // in it. A stale canceled pointer may remain buffered in prefetchCh; workers
 // validate it against prefetchJobs before doing any work.
@@ -84,6 +94,13 @@ type prefetchJob struct {
 	cancel        context.CancelFunc
 	scopes        map[*prefetchScope]struct{}
 	attemptScopes map[*prefetchScope]struct{} // guarded by prefetchMu
+	// linger is the pending teardown timer armed when the last scope
+	// detaches. Guarded by prefetchMu; a non-nil value means the job is
+	// scope-less but kept alive for prefetchLingerDuration awaiting a
+	// re-attach. Identity is the ownership token: a stale timer callback
+	// that lost a Stop() race finds job.linger pointing elsewhere and
+	// does nothing.
+	linger *time.Timer
 }
 
 // NewSegmentFetcher creates a new segment fetcher.
@@ -421,6 +438,9 @@ func (sf *SegmentFetcher) QueuePrefetchRange(ctx context.Context, startSeg, endS
 			continue
 		}
 		if job := sf.prefetchJobs[segIdx]; job != nil {
+			// A new scope arriving within the linger grace cancels the
+			// pending teardown; the in-flight download keeps its progress.
+			sf.stopJobLingerLocked(job)
 			if _, exists := job.scopes[scope]; !exists {
 				job.scopes[scope] = struct{}{}
 				scope.jobs[job] = struct{}{}
@@ -478,7 +498,6 @@ func (sf *SegmentFetcher) prefetchScopeLocked(ctx context.Context) *prefetchScop
 }
 
 func (sf *SegmentFetcher) cancelPrefetchScope(scope *prefetchScope) {
-	var cancels []context.CancelFunc
 	sf.prefetchMu.Lock()
 	if scope.closed || sf.prefetchScopes[scope.key] != scope {
 		sf.prefetchMu.Unlock()
@@ -489,14 +508,50 @@ func (sf *SegmentFetcher) cancelPrefetchScope(scope *prefetchScope) {
 	for job := range scope.jobs {
 		delete(job.scopes, scope)
 		if len(job.scopes) == 0 && sf.prefetchJobs[job.segIdx] == job {
-			delete(sf.prefetchJobs, job.segIdx)
-			cancels = append(cancels, job.cancel)
+			// Do not tear the job down immediately: grant a short grace so a
+			// follow-up ranged request can re-attach and inherit the download
+			// (see prefetchLingerDuration). If nobody re-attaches, the timer
+			// cancels the job exactly as the pre-linger code did here.
+			sf.startJobLingerLocked(job)
 		}
 	}
 	scope.jobs = nil
 	sf.prefetchMu.Unlock()
-	for _, cancel := range cancels {
-		cancel()
+}
+
+// startJobLingerLocked arms the last-scope-detached teardown timer for job.
+// Caller holds prefetchMu; the callback re-acquires it, so the mutex
+// release/acquire pair orders the timer-variable capture safely.
+func (sf *SegmentFetcher) startJobLingerLocked(job *prefetchJob) {
+	if job.linger != nil {
+		return // already lingering
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(prefetchLingerDuration, func() {
+		var cancel context.CancelFunc
+		sf.prefetchMu.Lock()
+		if job.linger == timer {
+			job.linger = nil
+			if len(job.scopes) == 0 && sf.prefetchJobs[job.segIdx] == job {
+				delete(sf.prefetchJobs, job.segIdx)
+				cancel = job.cancel
+			}
+		}
+		sf.prefetchMu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	})
+	job.linger = timer
+}
+
+// stopJobLingerLocked disarms a pending teardown timer. Caller holds
+// prefetchMu. If the callback already fired and lost the Stop race it will
+// observe job.linger pointing elsewhere and do nothing.
+func (sf *SegmentFetcher) stopJobLingerLocked(job *prefetchJob) {
+	if job.linger != nil {
+		job.linger.Stop()
+		job.linger = nil
 	}
 }
 
@@ -576,6 +631,9 @@ func (sf *SegmentFetcher) finishPrefetchJob(job *prefetchJob) *prefetchJob {
 	var stops []func() bool
 	var replacement *prefetchJob
 	sf.prefetchMu.Lock()
+	// The attempt is over and the job object is being retired either way; a
+	// pending last-scope linger must not fire on it later.
+	sf.stopJobLingerLocked(job)
 	if sf.prefetchJobs[job.segIdx] == job {
 		state := sf.cache.GetState(job.segIdx)
 		canRetryLate := !sf.prefetchClosing && sf.ctx.Err() == nil &&
@@ -732,6 +790,10 @@ func (sf *SegmentFetcher) cancelAllPrefetch() {
 	sf.prefetchClosing = true
 	for segIdx, job := range sf.prefetchJobs {
 		delete(sf.prefetchJobs, segIdx)
+		// Close must fence pending linger timers: stop them here so no
+		// teardown callback outlives the fetcher. A callback that already
+		// fired and lost the Stop race sees job.linger == nil and no-ops.
+		sf.stopJobLingerLocked(job)
 		cancels = append(cancels, job.cancel)
 		job.scopes = nil
 	}
