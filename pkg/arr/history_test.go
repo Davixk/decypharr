@@ -1,6 +1,7 @@
 package arr
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -233,6 +234,42 @@ func TestGetQueueRejectsHTTPError(t *testing.T) {
 	}
 }
 
+func TestGetQueueRejectsIncompletePagination(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		response := QueueResponseScheme{Page: 2, PageSize: 200, TotalRecords: 2}
+		if r.URL.Query().Get("page") == "1" {
+			response.Page = 1
+			response.Records = []QueueSchema{{Id: 1}}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	a := newCleanupTestArr(server.URL, true)
+	if queue, err := a.GetQueue(); err == nil || queue != nil {
+		t.Fatalf("GetQueue returned a partial sweep: queue=%+v err=%v", queue, err)
+	}
+}
+
+func TestManualImportItemsRejectsLookupHTTPError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/v3/manualimport" {
+			http.Error(w, "invalid lookup", http.StatusBadRequest)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	a := newCleanupTestArr(server.URL, true)
+	if err := a.ManualImportItems(map[string]bool{"download-id": true}); err == nil {
+		t.Fatal("ManualImportItems accepted an HTTP 400 lookup response")
+	}
+}
+
 func TestManualImportItemsRejectsCommandHTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -250,6 +287,95 @@ func TestManualImportItemsRejectsCommandHTTPError(t *testing.T) {
 	a := newCleanupTestArr(server.URL, true)
 	if err := a.ManualImportItems(map[string]bool{"download-id": true}); err == nil {
 		t.Fatal("ManualImportItems accepted an HTTP 400 command response")
+	}
+}
+
+func TestCleanupQueueRearmsOnlyFailedDownloadImport(t *testing.T) {
+	config.SetConfigPath(t.TempDir())
+	liveConfig := config.Get()
+	originalConfig := *liveConfig
+	originalConfig.QueueCleanup.Rules = append([]config.QueueCleanupRule(nil), liveConfig.QueueCleanup.Rules...)
+	policy := config.QueueCleanup{
+		Rules: []config.QueueCleanupRule{{
+			ID:     "failed_download",
+			Action: string(QueueActionImport),
+		}},
+		ConfirmationSweeps: 1,
+		ConfirmationDelay:  "1ns",
+	}
+	updatedConfig := originalConfig
+	updatedConfig.QueueCleanup = policy
+	liveConfig.ApplyRuntime(&updatedConfig)
+	defer liveConfig.ApplyRuntime(&originalConfig)
+
+	failed := queueItem(301, "failed", "error", "download failed")
+	failed.DownloadId = "failed-download"
+	succeeded := queueItem(302, "failed", "error", "download failed")
+	succeeded.DownloadId = "successful-download"
+	queue := []QueueSchema{failed, succeeded}
+
+	processed := make(chan string, len(queue))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/queue":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(QueueResponseScheme{
+				Page:         1,
+				PageSize:     200,
+				TotalRecords: len(queue),
+				Records:      queue,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v3/manualimport":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]ImportResponseSchema{{Path: "/download/file.mkv"}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v3/command":
+			var request ManualImportRequestSchema
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil || len(request.Files) != 1 {
+				http.Error(w, "invalid command", http.StatusBadRequest)
+				return
+			}
+			downloadID := request.Files[0].DownloadId
+			if downloadID == failed.DownloadId {
+				http.Error(w, "invalid import", http.StatusBadRequest)
+			} else {
+				w.WriteHeader(http.StatusOK)
+			}
+			processed <- downloadID
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	a := newCleanupTestArr(server.URL, true)
+	_ = a.confirmedDecisions(queue, policy, time.Now().Add(-time.Second))
+	if err := a.CleanupQueue(); err != nil {
+		t.Fatalf("CleanupQueue: %v", err)
+	}
+
+	seen := make(map[string]bool, len(queue))
+	for len(seen) < len(queue) {
+		select {
+		case downloadID := <-processed:
+			seen[downloadID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for manual imports: seen=%v", seen)
+		}
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		a.cleanupMu.Lock()
+		failedActed := a.cleanupObservations[failed.Id].Acted
+		succeededActed := a.cleanupObservations[succeeded.Id].Acted
+		a.cleanupMu.Unlock()
+		if !failedActed && succeededActed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("unexpected rearm state: failed acted=%v successful acted=%v", failedActed, succeededActed)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
