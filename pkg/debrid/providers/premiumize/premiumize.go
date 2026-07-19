@@ -310,10 +310,6 @@ func (pm *Premiumize) IsAvailable(infohashes []string) map[string]bool {
 	return result
 }
 
-func (pm *Premiumize) SupportsInstantAvailability() bool {
-	return true
-}
-
 func (pm *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	transfers, err := pm.listTransfers()
 	if err != nil {

@@ -60,7 +60,6 @@ Array of Debrid services:
       "name": "RD Primary",
       "api_key": "YOUR_API_KEY",
       "download_uncached": false,
-      "priority": 1,
       "rate_limit": "200/minute",
       "workers": 50,
       "minimum_free_slot": 0,
@@ -84,7 +83,7 @@ Array of Debrid services:
 | `api_key`                         | string | API key from provider dashboard                                                | **Required**                    |
 | `download_api_keys`               | array  | Additional keys for download rotation                                          | `[api_key]`                     |
 | `download_uncached`               | bool   | Download torrents not in provider cache                                        | `false`                         |
-| `priority`                        | int    | Provider add priority (lower runs first; `0` follows `debrids[]` order)       | Config order                    |
+| `priority`                        | int    | Provider add priority (lower runs first; unset follows `debrids[]` order — reorder the array to reprioritize) | Unset (config order)            |
 | `rate_limit`                      | string | API rate limit (`200/minute`, `10/second`)                                     | `200/minute`                    |
 | `repair_rate_limit`               | string | Separate limit for repair operations                                           | Same as `rate_limit`            |
 | `download_rate_limit`             | string | Separate limit for downloads                                                   | Same as `rate_limit`            |
@@ -326,11 +325,13 @@ See the [Health Checker & Repair guide](/guides/repair/) for the full model, API
 | `source`              | Config source (`auto`, `config`)                                      | `config`    |
 
 With `fallback_on_failure: false`, a non-empty `selected_debrid` keeps the
-existing pin behavior. When fallback is enabled, the selected provider is still
-tried first; only a rejection or failure advances to the remaining providers.
-Each provider's `download_uncached` setting remains a hard ceiling, so a
-cache-only backup cannot start an uncached download even when the Arr permits
-uncached downloads.
+existing pin behavior, and the Arr's `download_uncached` setting keeps its
+original precedence over the provider's. When fallback is enabled, the selected
+provider is still tried first; only a rejection or failure advances to the
+remaining providers. While walking a multi-provider fallback chain, a provider
+with `download_uncached: false` only probes its cache: an uncached release is
+submitted, detected as not cached, cleaned up, and the chain advances — it
+cannot start an uncached download even when the Arr permits uncached downloads.
 
 ## Queue Cleanup
 

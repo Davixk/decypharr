@@ -232,10 +232,6 @@ func (tb *Torbox) IsAvailable(hashes []string) map[string]bool {
 	return result
 }
 
-func (tb *Torbox) SupportsInstantAvailability() bool {
-	return true
-}
-
 func (tb *Torbox) SubmitMagnet(torrent *types.Torrent) (*types.Torrent, error) {
 	var data AddMagnetResponse
 

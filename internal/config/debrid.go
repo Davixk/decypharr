@@ -43,10 +43,10 @@ type Debrid struct {
 func (c *Config) updateDebrid(index int, d Debrid) Debrid {
 	workers := runtime.NumCPU() * 50
 	perDebrid := workers / len(c.Debrids)
+	// Priority is never materialized here: an unset (0) priority stays 0 so a
+	// save round-trip keeps it absent from config.json, and selection derives
+	// the effective order from ConfigOrder at sort time.
 	d.ConfigOrder = index
-	if d.Priority == 0 {
-		d.Priority = index + 1
-	}
 
 	if d.Provider == "" {
 		d.Provider = d.Name

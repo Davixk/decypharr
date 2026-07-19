@@ -168,10 +168,6 @@ func (dl *DebridLink) IsAvailable(hashes []string) map[string]bool {
 	return result
 }
 
-func (dl *DebridLink) SupportsInstantAvailability() bool {
-	return true
-}
-
 func (dl *DebridLink) GetTorrent(torrentId string) (*types.Torrent, error) {
 	endpoint := fmt.Sprintf("/seedbox/%s", torrentId)
 	var res torrentInfo
