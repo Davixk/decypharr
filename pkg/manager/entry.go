@@ -537,9 +537,12 @@ func (m *Manager) copyFolderEntry(info *FileInfo, destinationName string, move, 
 	if destinationExists {
 		deleted, deleteErr := m.storage.DeleteIfCurrentWithCleanup(existing, m.removeTorrentPlacementsLocked)
 		if deleteErr != nil || !deleted {
-			// Cleanup runs only after the old destination row is deleted. When it
-			// fails, the new destination is already the sole durable owner and
-			// must not be rolled back to a deleted snapshot.
+			// Cleanup now runs before the old destination row is removed, so a
+			// cleanup failure leaves that row in place (deleted=false) and the
+			// copied destination is rolled back. The deleted==true guard stays
+			// as defense in depth for a failure after the row was removed; in
+			// that case the new destination is the sole durable owner and must
+			// not be rolled back to a deleted snapshot.
 			if deleted {
 				return false, changed, fmt.Errorf("replace destination folder %s: old placement cleanup failed: %w", destinationName, deleteErr)
 			}

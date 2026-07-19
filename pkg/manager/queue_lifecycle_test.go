@@ -274,6 +274,85 @@ func TestStaleDeleteWaiterDoesNotTakeReplacementQueueGeneration(t *testing.T) {
 	}
 }
 
+// TestDeleteEntryDoesNotBlockOnWorkerIgnoringCancellation pins the bounded
+// deletion join: a worker that never observes its cancelled context must not
+// hold a synchronous arr/WebUI DELETE hostage. The delete proceeds after the
+// bound; generation fencing keeps the straggler from resurrecting state.
+func TestDeleteEntryDoesNotBlockOnWorkerIgnoringCancellation(t *testing.T) {
+	store, queue, manager, entry := newQueueLifecycleFixture(t)
+	previous := queueActionJoinTimeout
+	queueActionJoinTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { queueActionJoinTimeout = previous })
+
+	queued, err := queue.GetTorrent(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("GetTorrent: %v", err)
+	}
+	actionCtx, release, err := queue.BeginAction(context.Background(), queued)
+	if err != nil {
+		t.Fatalf("BeginAction: %v", err)
+	}
+	// The worker deliberately ignores cancellation until the very end.
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			release()
+		}
+	})
+
+	deleteDone := make(chan error, 1)
+	go func() { deleteDone <- manager.DeleteEntry(entry.InfoHash, false) }()
+	select {
+	case err := <-deleteDone:
+		if err != nil {
+			t.Fatalf("DeleteEntry: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeleteEntry blocked past the bounded join on a worker that ignored cancellation")
+	}
+	if actionCtx.Err() == nil {
+		t.Fatal("worker context was not cancelled by the delete")
+	}
+	if _, err := store.Get(entry.InfoHash); err == nil {
+		t.Fatal("main entry survived the bounded delete")
+	}
+	if store.QueueExists(entry.InfoHash) {
+		t.Fatal("queue row survived the bounded delete")
+	}
+
+	// The straggler cannot resurrect any state: its row is gone.
+	queued.Progress = 50
+	if err := queue.Update(queued); !errors.Is(err, storage.ErrEntryNotFound) {
+		t.Fatalf("straggler update error = %v, want ErrEntryNotFound", err)
+	}
+
+	// A same-hash replacement can be admitted and can begin its own action
+	// even while the straggler still holds its stale lease open.
+	replacement := queueLifecycleEntry(t, entry.InfoHash)
+	if err := queue.Add(replacement); err != nil {
+		t.Fatalf("replacement Add: %v", err)
+	}
+	replacementRow, err := queue.GetTorrent(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("GetTorrent replacement: %v", err)
+	}
+	_, releaseNext, err := queue.BeginAction(context.Background(), replacementRow)
+	if err != nil {
+		t.Fatalf("BeginAction after timed-out join: %v", err)
+	}
+	releaseNext()
+
+	// The straggler's writes stay fenced off the replacement generation.
+	queued.Progress = 99
+	if err := queue.Update(queued); !errors.Is(err, storage.ErrStaleEntryGeneration) {
+		t.Fatalf("straggler update against replacement = %v, want ErrStaleEntryGeneration", err)
+	}
+
+	// Late release of the abandoned lease is harmless.
+	release()
+	released = true
+}
+
 func TestBeginActionRejectsDuplicateAndReleaseAllowsNext(t *testing.T) {
 	_, queue, _, entry := newQueueLifecycleFixture(t)
 	snapshot, err := queue.GetTorrent(entry.InfoHash)

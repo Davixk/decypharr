@@ -298,11 +298,21 @@ func TestMoveFolderCleanupFailureLeavesSource(t *testing.T) {
 	if exists, existsErr := m.storage.Exists(source.InfoHash); existsErr != nil || !exists {
 		t.Fatalf("source exists = %v, err=%v, want true", exists, existsErr)
 	}
-	if exists, existsErr := m.storage.Exists(existing.InfoHash); existsErr != nil || exists {
-		t.Fatalf("replaced destination exists = %v, err=%v, want false", exists, existsErr)
+	// Placement cleanup now runs before the old destination row is removed, so
+	// a cleanup failure keeps the old destination and rolls the copy back: the
+	// MOVE fails as a clean no-op instead of leaving half-replaced state.
+	if exists, existsErr := m.storage.Exists(existing.InfoHash); existsErr != nil || !exists {
+		t.Fatalf("old destination exists = %v, err=%v, want true after failed cleanup", exists, existsErr)
 	}
-	if _, loadErr := m.storage.GetEntryItem("Destination Folder"); loadErr != nil {
-		t.Fatalf("committed replacement missing after cleanup failure: %v", loadErr)
+	item, loadErr := m.storage.GetEntryItem("Destination Folder")
+	if loadErr != nil {
+		t.Fatalf("destination folder missing after rolled-back MOVE: %v", loadErr)
+	}
+	if _, fileErr := item.GetFile("destination.mkv"); fileErr != nil {
+		t.Fatalf("old destination content missing after rollback: %v", fileErr)
+	}
+	if _, fileErr := item.GetFile("source.mkv"); fileErr == nil {
+		t.Fatal("rolled-back copy left its file in the destination folder")
 	}
 }
 

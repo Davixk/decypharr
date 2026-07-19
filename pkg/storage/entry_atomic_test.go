@@ -654,6 +654,43 @@ func TestKeyedLockPoolReleasesInactiveKeys(t *testing.T) {
 	}
 }
 
+// TestDeleteIfCurrentWithCleanupRetainsRowWhenCleanupFails pins the recoverable
+// main-row delete ordering: failure-prone cleanup runs first, so a failure
+// leaves the authoritative row (and its folder projection) intact and the
+// delete retryable, instead of orphaning external metadata behind a 500.
+func TestDeleteIfCurrentWithCleanupRetainsRowWhenCleanupFails(t *testing.T) {
+	store, entry := newAtomicMutationTestStorage(t)
+	snapshot, err := store.Get(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("Get snapshot: %v", err)
+	}
+	cleanupErr := errors.New("provider cleanup failed")
+	deleted, err := store.DeleteIfCurrentWithCleanup(snapshot, func(current *Entry) error {
+		if current == nil || current.InfoHash != entry.InfoHash {
+			t.Fatalf("cleanup received wrong entry: %+v", current)
+		}
+		return cleanupErr
+	})
+	if deleted || !errors.Is(err, cleanupErr) {
+		t.Fatalf("DeleteIfCurrentWithCleanup = (deleted=%v, err=%v), want retained row and cleanup failure", deleted, err)
+	}
+	if _, err := store.Get(entry.InfoHash); err != nil {
+		t.Fatalf("main row disappeared after failed cleanup: %v", err)
+	}
+	if _, err := store.GetEntryItem(entry.GetFolder()); err != nil {
+		t.Fatalf("folder projection disappeared after failed cleanup: %v", err)
+	}
+
+	// The same snapshot stays valid for a retry once cleanup succeeds.
+	deleted, err = store.DeleteIfCurrentWithCleanup(snapshot, func(*Entry) error { return nil })
+	if err != nil || !deleted {
+		t.Fatalf("retried delete = (deleted=%v, err=%v), want success", deleted, err)
+	}
+	if _, err := store.Get(entry.InfoHash); err == nil {
+		t.Fatal("main row survived successful delete")
+	}
+}
+
 func TestQueueDeleteReportsCleanupFailureAfterCommittedDelete(t *testing.T) {
 	store, entry := newAtomicMutationTestStorage(t)
 	cleanupErr := errors.New("provider cleanup failed")

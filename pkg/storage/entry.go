@@ -506,7 +506,10 @@ func (s *Storage) DeleteIfCurrent(expected *Entry) (bool, error) {
 
 // DeleteIfCurrentWithCleanup keeps the main-row lifecycle lock through
 // synchronous external cleanup so a same-hash replacement cannot adopt a
-// provider/NZB resource that the old generation is still deleting.
+// provider/NZB resource that the old generation is still deleting. Cleanup
+// runs before the row is removed: if it fails, the row is retained and the
+// deletion is reported as (false, err), so the operation stays retryable and
+// external metadata is never orphaned by a half-finished delete.
 func (s *Storage) DeleteIfCurrentWithCleanup(expected *Entry, cleanup func(*Entry) error) (bool, error) {
 	if expected == nil {
 		return false, fmt.Errorf("expected entry is nil")
@@ -562,15 +565,21 @@ func (s *Storage) deleteEntryIfCurrent(infohash string, expected *Entry, cleanup
 	if expected != nil && (expected.mainStoreGeneration != entry.mainStoreGeneration || expected.mainStoreRevision != entry.mainStoreRevision) {
 		return false, nil
 	}
+	// Run failure-prone external cleanup while the authoritative row still
+	// exists. If cleanup fails, the row is retained and the delete can simply
+	// be retried; the old order (delete row, then cleanup) left the entry gone
+	// with its external metadata orphaned and unrecoverable. The per-key
+	// mutation lock still spans cleanup and delete, so a same-hash replacement
+	// cannot adopt the resource mid-delete.
+	if cleanup != nil {
+		if err := cleanup(entry); err != nil {
+			return false, fmt.Errorf("cleanup before deleting main entry %s failed: %w", infohash, err)
+		}
+	}
 	if err := s.entries.Delete(infohash); err != nil {
 		return false, err
 	}
 	s.removeFromEntryItem(entry)
-	if cleanup != nil {
-		if err := cleanup(entry); err != nil {
-			return true, fmt.Errorf("main entry %s deleted but cleanup failed: %w", infohash, err)
-		}
-	}
 	return true, nil
 }
 
