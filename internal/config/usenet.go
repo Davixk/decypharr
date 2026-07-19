@@ -35,7 +35,11 @@ type Usenet struct {
 	ProcessingMaxConnections int `json:"processing_max_connections,omitempty"` // Maximum concurrent connections per file for parsing and NZB downloads (default: max_connections)
 	// Read-ahead configuration
 	ReadAhead   string `json:"read_ahead,omitempty"`   // Bytes to prefetch ahead of streaming reads e.g. "16MB", "32MB" (default: 16MB)
-	ReadTimeout string `json:"read_timeout,omitempty"` // Maximum time a stream may make no forward progress (default: 30s)
+	ReadTimeout string `json:"read_timeout,omitempty"` // Maximum time a stream may make no forward progress (default: 30s; "0"/"off"/"none" disables)
+	// DownloadTimeout caps a single segment download attempt (default: 60s;
+	// "0"/"off"/"none" disables the cap, leaving attempts bounded only by
+	// read_timeout and connection-level idle detection).
+	DownloadTimeout string `json:"download_timeout,omitempty"`
 	// SocketReadBuffer / SocketWriteBuffer set the per-connection TCP
 	// SO_RCVBUF / SO_SNDBUF (e.g. "4MB"). At high RTT a single connection's
 	// throughput is capped at roughly buffer ÷ RTT, so the receive buffer must
@@ -73,7 +77,7 @@ func (u Usenet) BufferMemoryBytes() int64 {
 }
 
 func (u Usenet) IsZero() bool {
-	return len(u.Providers) == 0 && u.MaxConnections == 0 && u.ProcessingMaxConnections == 0 && u.ReadAhead == "" && u.ReadTimeout == "" && u.ProcessingTimeout == ""
+	return len(u.Providers) == 0 && u.MaxConnections == 0 && u.ProcessingMaxConnections == 0 && u.ReadAhead == "" && u.ReadTimeout == "" && u.DownloadTimeout == "" && u.ProcessingTimeout == ""
 }
 
 func (c *Config) updateUsenetConfig() {
@@ -91,6 +95,9 @@ func (c *Config) updateUsenetConfig() {
 	}
 	if c.Usenet.ReadTimeout == "" {
 		c.Usenet.ReadTimeout = "30s"
+	}
+	if c.Usenet.DownloadTimeout == "" {
+		c.Usenet.DownloadTimeout = "60s"
 	}
 
 	// TCP socket buffer defaults sized for high-RTT BDP. "0" (explicit) opts
@@ -192,6 +199,9 @@ func (c *Config) applyUsenetEnvVars() {
 	}
 	if readTimeout := getEnv("USENET__READ_TIMEOUT"); readTimeout != "" {
 		c.Usenet.ReadTimeout = readTimeout
+	}
+	if downloadTimeout := getEnv("USENET__DOWNLOAD_TIMEOUT"); downloadTimeout != "" {
+		c.Usenet.DownloadTimeout = downloadTimeout
 	}
 
 	if v := getEnv("USENET__SOCKET_READ_BUFFER"); v != "" {

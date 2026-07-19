@@ -58,6 +58,66 @@ func TestFetchTimeoutIncludesLocalSemaphoreWait(t *testing.T) {
 	}
 }
 
+// deadlineProbeClient records whether the operation context carries a deadline
+// and aborts the fetch with context.Canceled so the fetcher takes the simple
+// ReleaseFetching cleanup path on the minimal test cache.
+type deadlineProbeClient struct {
+	hasDeadline bool
+}
+
+func (c *deadlineProbeClient) ExecuteWithFailover(ctx context.Context, _ func(*nntp.Connection) error) error {
+	_, c.hasDeadline = ctx.Deadline()
+	return context.Canceled
+}
+
+// TestDownloadTimeoutDrivesAttemptDeadline proves that the per-attempt
+// deadline comes from Config.DownloadTimeout and that 0 disables it entirely
+// (the attempt then runs on the caller's context alone).
+func TestDownloadTimeoutDrivesAttemptDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		downloadTimeout time.Duration
+		wantDeadline    bool
+	}{
+		{name: "positive timeout sets attempt deadline", downloadTimeout: 5 * time.Second, wantDeadline: true},
+		{name: "zero timeout disables attempt deadline", downloadTimeout: 0, wantDeadline: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			stats := &ReaderStats{}
+			cache := &SegmentCache{
+				segments: []SegmentMeta{{
+					MessageID:   "probe",
+					Number:      1,
+					Bytes:       4,
+					StartOffset: 0,
+					EndOffset:   3,
+				}},
+				segCount: 1,
+				states:   make([]atomic.Uint32, 1),
+				ctx:      ctx,
+				stats:    stats,
+			}
+			client := &deadlineProbeClient{}
+			cfg := DefaultConfig()
+			cfg.MaxConnections = 1
+			cfg.PrefetchAhead = 0
+			cfg.DownloadTimeout = tc.downloadTimeout
+			fetcher := newSegmentFetcher(ctx, client, cache, cfg, stats, zerolog.Nop())
+			defer fetcher.Close()
+
+			if err := fetcher.Fetch(context.Background(), 0); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Fetch error = %v, want context canceled", err)
+			}
+			if client.hasDeadline != tc.wantDeadline {
+				t.Fatalf("attempt context deadline present = %v, want %v", client.hasDeadline, tc.wantDeadline)
+			}
+		})
+	}
+}
+
 func TestValidateSegmentLengthClassifiesShortBodiesAsMissing(t *testing.T) {
 	if err := validateSegmentLength(4, 4); err != nil {
 		t.Fatalf("exact segment length rejected: %v", err)

@@ -299,12 +299,15 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	}
 
 	// Start the attempt deadline before acquiring the local reader slot. This
-	// ensures a saturated per-file semaphore cannot wait forever.
-	timeout := sf.config.DownloadTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+	// ensures a saturated per-file semaphore cannot wait forever. A
+	// DownloadTimeout <= 0 disables the per-attempt cap: the attempt is then
+	// bounded only by the caller's context (stream progress deadline) and
+	// connection-level idle detection.
+	downloadCtx := ctx
+	cancel := context.CancelFunc(func() {})
+	if timeout := sf.config.DownloadTimeout; timeout > 0 {
+		downloadCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
-	downloadCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Acquire connection slot
@@ -533,11 +536,11 @@ func (sf *SegmentFetcher) prefetchOne(job *prefetchJob) {
 		return
 	}
 
-	timeout := sf.config.DownloadTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+	fetchCtx := ctx
+	cancel := context.CancelFunc(func() {})
+	if timeout := sf.config.DownloadTimeout; timeout > 0 {
+		fetchCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
-	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 	err := sf.Fetch(fetchCtx, segIdx)
 	cancel()
 

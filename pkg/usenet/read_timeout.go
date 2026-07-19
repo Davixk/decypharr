@@ -5,12 +5,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sirrobot01/decypharr/internal/utils"
 )
 
 var ErrReadTimeout = errors.New("usenet stream made no progress")
+
+// parseTimeoutSetting resolves a duration knob that supports an explicit off
+// switch. An empty value returns def. "off", "none", and any spelling that
+// parses to zero ("0", "0s", ...) return 0, meaning disabled. Invalid or
+// negative values return an error; callers keep def and warn.
+func parseTimeoutSetting(raw string, def time.Duration) (time.Duration, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return def, nil
+	}
+	switch strings.ToLower(trimmed) {
+	case "off", "none":
+		return 0, nil
+	}
+	d, err := utils.ParseDuration(trimmed)
+	if err != nil {
+		return def, err
+	}
+	if d < 0 {
+		return def, fmt.Errorf("negative duration %q", raw)
+	}
+	return d, nil
+}
 
 // progressDeadline owns one idle timer for an entire stream operation. The
 // context is cancelled when no bytes have been delivered for timeout, so the
@@ -32,7 +58,10 @@ func newProgressDeadline(parent context.Context, timeout time.Duration) *progres
 		parent = context.Background()
 	}
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		// Deadline disabled (read_timeout "0"/"off"/"none"): pure passthrough.
+		// No watchdog goroutine, and the caller context is left unwrapped, so a
+		// degraded-but-alive provider can stream arbitrarily slowly.
+		return &progressDeadline{Context: parent}
 	}
 	ctx, cancel := context.WithCancelCause(parent)
 	d := &progressDeadline{
@@ -79,6 +108,9 @@ func (d *progressDeadline) run() {
 }
 
 func (d *progressDeadline) Progress() {
+	if d.progress == nil {
+		return // deadline disabled
+	}
 	d.lastByte.Store(int64(time.Since(d.started)))
 	select {
 	case d.progress <- struct{}{}:
@@ -87,6 +119,9 @@ func (d *progressDeadline) Progress() {
 }
 
 func (d *progressDeadline) Close() {
+	if d.cancel == nil {
+		return // deadline disabled; nothing to cancel or join
+	}
 	d.close.Do(func() {
 		d.cancel(context.Canceled)
 		<-d.finished

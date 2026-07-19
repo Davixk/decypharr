@@ -14,6 +14,57 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
+func TestParseTimeoutSetting(t *testing.T) {
+	const def = 30 * time.Second
+	cases := []struct {
+		raw     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{raw: "", want: def},
+		{raw: "  ", want: def},
+		{raw: "0", want: 0},
+		{raw: "0s", want: 0},
+		{raw: "0m", want: 0},
+		{raw: "off", want: 0},
+		{raw: "OFF", want: 0},
+		{raw: "Off", want: 0},
+		{raw: "none", want: 0},
+		{raw: "None", want: 0},
+		{raw: " off ", want: 0},
+		{raw: "45s", want: 45 * time.Second},
+		{raw: "2m", want: 2 * time.Minute},
+		{raw: "garbage", want: def, wantErr: true},
+		{raw: "-5s", want: def, wantErr: true},
+	}
+	for _, tc := range cases {
+		got, err := parseTimeoutSetting(tc.raw, def)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("parseTimeoutSetting(%q) error = %v, wantErr %v", tc.raw, err, tc.wantErr)
+		}
+		if got != tc.want {
+			t.Errorf("parseTimeoutSetting(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestProgressDeadlineDisabledIsPassthrough(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+
+	deadline := newProgressDeadline(parent, 0)
+	// Disabled: the caller context must be handed through unwrapped — no
+	// derived context, no watchdog goroutine.
+	if deadline.Context != parent {
+		t.Fatalf("disabled deadline wrapped the parent context: %v", deadline.Context)
+	}
+	deadline.Progress() // must be a safe no-op
+	deadline.Close()    // must be a safe no-op
+	if parent.Err() != nil {
+		t.Fatalf("disabled deadline canceled the parent context: %v", parent.Err())
+	}
+}
+
 func TestProgressDeadlineExpiresWithoutProgress(t *testing.T) {
 	deadline := newProgressDeadline(context.Background(), 40*time.Millisecond)
 	defer deadline.Close()

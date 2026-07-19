@@ -119,6 +119,7 @@ Array of Debrid services:
     "processing_max_connections": 15,
     "read_ahead": "16MB",
     "read_timeout": "30s",
+    "download_timeout": "60s",
     "processing_timeout": "10m",
     "availability_sample_percent": 10,
     "import_availability_sample_percent": 1,
@@ -135,7 +136,8 @@ Array of Debrid services:
 | `max_connections`             | int    | Max connections per streaming file | `15`                      |
 | `processing_max_connections`  | int    | Max connections per file for parsing and NZB downloads | Same as `max_connections` |
 | `read_ahead`                  | string | Prefetch buffer size            | `16MB`                       |
-| `read_timeout`                | string | Max time without streamed bytes before the read fails | `30s` |
+| `read_timeout`                | string | Max time a stream may make no forward progress before the read fails. `"0"`, `"off"`, or `"none"` disables the deadline (slow links keep playing instead of erroring) | `30s` |
+| `download_timeout`            | string | Max time for a single segment download attempt. `"0"`, `"off"`, or `"none"` disables the per-attempt cap; the attempt is then bounded only by `read_timeout` and connection-level idle detection | `60s` |
 | `processing_timeout`          | string | Max time for NZB processing     | `10m`                        |
 | `availability_sample_percent` | int    | % of segments to check during repairs (1-100) | `10`             |
 | `import_availability_sample_percent` | int | % of segments to check when adding an NZB (1-100) | `1`         |
@@ -400,6 +402,7 @@ DEBRIDS__0__API_KEY=your_key
 # Usenet
 USENET__MAX_CONNECTIONS=20
 USENET__READ_TIMEOUT=30s
+USENET__DOWNLOAD_TIMEOUT=60s
 USENET__PROVIDERS__0__HOST=news.provider.com
 USENET__PROVIDERS__0__PORT=563
 USENET__PROVIDERS__0__BACKBONE=Omicron

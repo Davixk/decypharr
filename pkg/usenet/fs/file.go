@@ -28,8 +28,11 @@ type File struct {
 	manager         *nntp.Client                           // Connection manager
 	maxConcurrent   int                                    // Max concurrent connections for this file's reader
 	prefetchSize    int64                                  // Prefetch size in bytes
-	readTimeout     time.Duration                          // Maximum time a read may make no progress
-	pos             atomic.Int64
+	// downloadTimeout caps a single segment download attempt; only forwarded
+	// when downloadTimeoutSet is true, and an explicit 0 disables the cap.
+	downloadTimeout    time.Duration
+	downloadTimeoutSet bool
+	pos                atomic.Int64
 	logger          zerolog.Logger
 	closed          atomic.Bool
 }
@@ -171,8 +174,8 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 		readerConfig.MaxConnections = vf.maxConcurrent
 		readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(vf.prefetchSize, segments)
 		readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
-		if vf.readTimeout > 0 {
-			readerConfig.DownloadTimeout = vf.readTimeout
+		if vf.downloadTimeoutSet {
+			readerConfig.DownloadTimeout = vf.downloadTimeout
 		}
 
 		var r *reader.StreamingReader
@@ -274,8 +277,8 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 	readerConfig.MaxConnections = vf.maxConcurrent
 	readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(vf.prefetchSize, segments)
 	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
-	if vf.readTimeout > 0 {
-		readerConfig.DownloadTimeout = vf.readTimeout
+	if vf.downloadTimeoutSet {
+		readerConfig.DownloadTimeout = vf.downloadTimeout
 	}
 
 	var r *reader.StreamingReader
