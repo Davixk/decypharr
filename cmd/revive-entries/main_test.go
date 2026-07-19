@@ -457,6 +457,120 @@ func TestReviveEntriesSecondRunZeroCandidates(t *testing.T) {
 	}
 }
 
+// The -max-errors retry budget must gate ONLY class B (its revival re-parses
+// over the network); classes A, A-action and A2 resume or un-flip with zero
+// network work, so an inflated ErrorCount (the incident's premature boots
+// re-failed the same rows repeatedly) must not exclude them.
+func TestMaxErrorsCapAppliesOnlyToClassB(t *testing.T) {
+	stateDir := t.TempDir()
+	config.SetConfigPath(stateDir)
+
+	store, err := storage.NewStorage(filepath.Join(stateDir, "db"))
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	nzbs, err := usenet.NewNZBStorage()
+	if err != nil {
+		t.Fatalf("NewNZBStorage: %v", err)
+	}
+	nzbDir := filepath.Join(stateDir, "usenet", "nzbs")
+	if err := os.MkdirAll(nzbDir, 0o755); err != nil {
+		t.Fatalf("mkdir nzbs: %v", err)
+	}
+
+	// A-queued far above the cap: completed meta, no re-parse needed.
+	if err := nzbs.AddNZB(&storage.NZB{ID: "cap-a-queued", Name: "a.nzb", Status: usenet.NZBStatusCompleted}); err != nil {
+		t.Fatalf("AddNZB cap-a-queued: %v", err)
+	}
+	if err := store.AddQueue(erroredNZBEntry("cap-a-queued", "articles missing on provider: failed to stat segment 3 of a.mkv", inWindow, 7, false)); err != nil {
+		t.Fatalf("AddQueue cap-a-queued: %v", err)
+	}
+
+	// A-action above the cap: completed meta, mount-timeout resume.
+	if err := nzbs.AddNZB(&storage.NZB{ID: "cap-a-action", Name: "act.nzb", Status: usenet.NZBStatusCompleted}); err != nil {
+		t.Fatalf("AddNZB cap-a-action: %v", err)
+	}
+	if err := store.AddQueue(erroredNZBEntry("cap-a-action", "post-download: timeout waiting for mount files", inWindow, 8, false)); err != nil {
+		t.Fatalf("AddQueue cap-a-action: %v", err)
+	}
+
+	// A2 above the cap: failed meta still carrying its full segment map.
+	a2meta := failedMetaWithSegments("cap-a2", "gen-cap-a2", 100)
+	if err := nzbs.AddNZB(a2meta); err != nil {
+		t.Fatalf("AddNZB cap-a2: %v", err)
+	}
+	a2entry := erroredNZBEntry("cap-a2", archiveProductionError, archWindow, 9, false)
+	a2entry.NZBGeneration = "gen-cap-a2"
+	if err := store.AddQueue(a2entry); err != nil {
+		t.Fatalf("AddQueue cap-a2: %v", err)
+	}
+
+	// B above the cap: only the XML source survives; revival would re-parse.
+	if err := os.WriteFile(filepath.Join(nzbDir, "cap-b.beefbeef.source"), []byte("<nzb/>"), 0o644); err != nil {
+		t.Fatalf("write cap-b source: %v", err)
+	}
+	if err := store.AddQueue(erroredNZBEntry("cap-b", "no valid file groups found in NZB after 2 attempts", inWindow, 7, false)); err != nil {
+		t.Fatalf("AddQueue cap-b: %v", err)
+	}
+
+	// B exactly AT the cap (inclusive) still revives.
+	if err := os.WriteFile(filepath.Join(nzbDir, "cap-b-under.cafecafe.source"), []byte("<nzb/>"), 0o644); err != nil {
+		t.Fatalf("write cap-b-under source: %v", err)
+	}
+	if err := store.AddQueue(erroredNZBEntry("cap-b-under", "no valid file groups found in NZB after 2 attempts", inWindow, 3, false)); err != nil {
+		t.Fatalf("AddQueue cap-b-under: %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close seeding store: %v", err)
+	}
+
+	wantDecisions := map[string]string{
+		"cap-a-queued": "\twould-revive-as-A-queued",
+		"cap-a-action": "\twould-revive-as-A-action",
+		"cap-a2":       "\twould-unflip",
+		"cap-b":        "\tskip-max-errors",
+		"cap-b-under":  "\twould-revive-as-B",
+	}
+	var out, errOut bytes.Buffer
+	if code := run(testOptions(stateDir, false), &out, &errOut); code != exitOK {
+		t.Fatalf("dry-run exit = %d\nstdout:\n%s\nstderr:\n%s", code, out.String(), errOut.String())
+	}
+	dry := out.String()
+	for id, want := range wantDecisions {
+		if line := tsvLine(t, dry, id); !strings.HasSuffix(line, want) {
+			t.Errorf("dry-run decision for %s = %q, want suffix %q", id, line, want)
+		}
+	}
+	if !strings.Contains(dry, "# census: candidates=5 A-action=1 A-queued=1 A2-unflip=1 B=2 C=0 revived=0 skipped=1") {
+		t.Errorf("dry-run census missing or wrong:\n%s", dry)
+	}
+
+	// Apply: everything except the capped B row is revived.
+	out.Reset()
+	errOut.Reset()
+	if code := run(testOptions(stateDir, true), &out, &errOut); code != exitOK {
+		t.Fatalf("apply exit = %d\nstdout:\n%s\nstderr:\n%s", code, out.String(), errOut.String())
+	}
+	applied := out.String()
+	if line := tsvLine(t, applied, "cap-b"); !strings.HasSuffix(line, "\tskip-max-errors") {
+		t.Errorf("apply decision for cap-b = %q, want skip-max-errors", line)
+	}
+
+	store = openStore(t, stateDir)
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	assertUntouchedError(t, mustQueued(t, store, "cap-b"), "cap-b")
+	for _, id := range []string{"cap-a-queued", "cap-a-action", "cap-a2", "cap-b-under"} {
+		if e := mustQueued(t, store, id); e.State != storage.EntryStateDownloading {
+			t.Errorf("%s: state = %q, want revived despite ErrorCount %d", id, e.State, e.ErrorCount)
+		}
+	}
+}
+
 func TestReviveEntriesRejectsBogusStateDir(t *testing.T) {
 	dir := t.TempDir() // no db/ inside
 	var out, errOut bytes.Buffer
@@ -476,45 +590,51 @@ func TestSelectorWindowAndPatterns(t *testing.T) {
 		return erroredNZBEntry("x", patternStatSegment, inWindow, 1, false)
 	}
 
-	if e := base(); !matchesSelector(e, from, to, 3) {
+	if e := base(); !matchesSelector(e, from, to) {
 		t.Error("baseline in-window stat-segment entry must match")
 	}
-	if e := base(); matchesSelector(e, from, to, 0) {
-		t.Error("ErrorCount above max-errors must not match")
+	// ErrorCount is not part of the base selector: the -max-errors budget is
+	// applied per class (B only) after classification, because any premature
+	// fork.1 boot inflated the cohort's counts and no-network revivals carry
+	// no retry risk.
+	high := base()
+	high.ErrorCount = 40
+	if !matchesSelector(high, from, to) {
+		t.Error("a high ErrorCount must not exclude a row from candidacy")
 	}
 	e := base()
 	e.LastErrorTime = nil
-	if matchesSelector(e, from, to, 3) {
+	if matchesSelector(e, from, to) {
 		t.Error("nil LastErrorTime must not match")
 	}
 	e = base()
 	e.Protocol = config.ProtocolTorrent
-	if matchesSelector(e, from, to, 3) {
+	if matchesSelector(e, from, to) {
 		t.Error("torrent entries must not match")
 	}
 	e = base()
 	e.State = storage.EntryStatePausedUP
-	if matchesSelector(e, from, to, 3) {
+	if matchesSelector(e, from, to) {
 		t.Error("non-error entries must not match")
 	}
 	e = base()
 	e.LastError = "some unrelated failure"
-	if matchesSelector(e, from, to, 3) {
+	if matchesSelector(e, from, to) {
 		t.Error("unlisted error patterns must not match")
 	}
 	boundary := erroredNZBEntry("x", patternNoGroups+" 2 retries", from, 1, false)
-	if !matchesSelector(boundary, from, to, 3) {
+	if !matchesSelector(boundary, from, to) {
 		t.Error("window boundaries are inclusive")
 	}
 
 	// The dominant incident cohort: the exact Process-phase production string
 	// at the census timestamp (05:47:00, inside the default window).
 	production := erroredNZBEntry("x", archiveProductionError, archWindow, 1, false)
-	if !matchesSelector(production, from, to, 3) {
+	if !matchesSelector(production, from, to) {
 		t.Error("the archive-processing production string at 05:47:00 must match")
 	}
 	gated := erroredNZBEntry("x", "failed to process nzb: failed to process NZB archives: availability probe failed: provider connectivity problem: no valid files found in NZB after 3 file group failure(s)", archWindow, 1, false)
-	if !matchesSelector(gated, from, to, 3) {
+	if !matchesSelector(gated, from, to) {
 		t.Error("the gated archive-processing infrastructure string must match")
 	}
 }

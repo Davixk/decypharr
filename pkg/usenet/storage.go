@@ -599,6 +599,49 @@ func (s *NZBStorage) GetNZBHeader(id string) (*storage.NZB, error) {
 	return decodeNZB(data)
 }
 
+// HasSegmentedFiles reports whether any non-deleted file in the durable meta
+// carries at least one parsed segment. For v2 blobs it reads only the header
+// region (the file table stores per-file segment counts), so callers such as
+// the revival sweep can gauge rebuild viability without decompressing —
+// or holding — multi-megabyte segment maps. Legacy proto files fall back to a
+// full decode.
+func (s *NZBStorage) HasSegmentedFiles(id string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	data, err := os.ReadFile(s.metaFilePath(id))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
+		}
+		return false, fmt.Errorf("failed to read NZB meta file: %w", err)
+	}
+
+	if isCodecV2(data) {
+		nzb, counts, err := decodeNZBV2HeaderCounts(data)
+		if err != nil {
+			return false, err
+		}
+		for i := range nzb.Files {
+			if !nzb.Files[i].IsDeleted && counts[i] > 0 {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
+	nzb, err := decodeNZB(data)
+	if err != nil {
+		return false, err
+	}
+	for i := range nzb.Files {
+		if !nzb.Files[i].IsDeleted && len(nzb.Files[i].Segments) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // SampleFileMessageIDs returns the sampled message ids for a single file,
 // used by availability/repair probes. For v2 blobs it decodes only that file's
 // sampled ids (no numeric columns, no NZBSegment allocation, no other files),

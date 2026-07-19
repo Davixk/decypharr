@@ -117,7 +117,7 @@ func main() {
 	apply := fs.Bool("apply", false, "apply the resets (default is dry-run: report only)")
 	fromStr := fs.String("from", defaultFrom, "incident window start (RFC3339)")
 	toStr := fs.String("to", defaultTo, "incident window end (RFC3339)")
-	maxErrors := fs.Int("max-errors", defaultMaxErrors, "maximum ErrorCount for a revivable entry")
+	maxErrors := fs.Int("max-errors", defaultMaxErrors, "maximum ErrorCount for a class-B (re-parse) revival; no-network classes A/A-action/A2 are exempt")
 	tag := fs.String("tag", defaultTag, "tag appended to Tags of revived entries")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(exitBadState)
@@ -220,7 +220,7 @@ func run(opts options, stdout, stderr io.Writer) int {
 	}
 
 	candidates, err := store.FilterQueued(func(e *storage.Entry) bool {
-		return matchesSelector(e, opts.from, opts.to, opts.maxErrors)
+		return matchesSelector(e, opts.from, opts.to)
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error: scanning queue store: %v\n", err)
@@ -267,6 +267,15 @@ func run(opts options, stdout, stderr io.Writer) int {
 			case classB:
 				cens.b++
 			}
+			// The -max-errors retry budget applies only to class B: its revival
+			// re-parses over the network, so prior failures gate another
+			// attempt. A/A-action/A2 are no-network resumes/un-flips and are
+			// exempt (the incident's own boot loops inflated their ErrorCount).
+			if v.class == classB && entry.ErrorCount > opts.maxErrors {
+				cens.skipped++
+				decision = "skip-max-errors"
+				break
+			}
 			if !opts.apply {
 				decision = "would-revive-as-" + string(v.class)
 				if mainRowInError(store, entry.InfoHash) {
@@ -299,7 +308,15 @@ func run(opts options, stdout, stderr io.Writer) int {
 // matchesSelector reports whether a queue row is an incident candidate. It is
 // evaluated both during the scan and again inside the guarded mutation
 // callback, which is what makes revived rows drop out of a second run.
-func matchesSelector(e *storage.Entry, from, to time.Time, maxErrors int) bool {
+//
+// ErrorCount is deliberately NOT part of the base selector. The -max-errors
+// cap is a retry budget for revivals that will re-parse over the network
+// (class B) and is applied per-class in run/revive: classes A, A-action and
+// A2 resume or un-flip with ZERO network work, so a prior-failure budget is
+// meaningless for them — and the incident itself inflated ErrorCount on the
+// cohort (every premature fork.1 boot re-failed the same entries), which
+// would have silently excluded exactly the rows this tool exists to save.
+func matchesSelector(e *storage.Entry, from, to time.Time) bool {
 	if e == nil || !e.IsNZB() {
 		return false
 	}
@@ -307,9 +324,6 @@ func matchesSelector(e *storage.Entry, from, to time.Time, maxErrors int) bool {
 		return false
 	}
 	if e.Bad {
-		return false
-	}
-	if e.ErrorCount > maxErrors {
 		return false
 	}
 	if e.LastErrorTime == nil {
@@ -506,7 +520,8 @@ func resetEntryFields(e *storage.Entry, cls classification, tag string) {
 func revive(store *storage.Storage, hash string, cls classification, opts options) (revived, mainReset bool, err error) {
 	stale := false
 	_, present, err := store.MutateQueuedIfPresent(hash, func(cur *storage.Entry) (bool, error) {
-		if !matchesSelector(cur, opts.from, opts.to, opts.maxErrors) {
+		if !matchesSelector(cur, opts.from, opts.to) ||
+			(cls == classB && cur.ErrorCount > opts.maxErrors) {
 			stale = true
 			return false, nil
 		}
