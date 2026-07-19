@@ -136,6 +136,7 @@ const (
 	ModeGetScripts = "get_scripts"
 	ModeGetFiles   = "get_files"
 	ModeRetry      = "retry"
+	ModeRetryAll   = "retry_all"
 	ModeStatus     = "status"
 	ModeFullStatus = "fullstatus"
 )

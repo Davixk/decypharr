@@ -24,6 +24,13 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		ctx = m.jobQueue.Context()
 	}
 
+	// Boot-time revival: terminal-error NZB entries whose recorded failure
+	// carries an infrastructure/availability signature (and whose ErrorCount
+	// is still below the configured retries) are reset BEFORE the passes list
+	// the queue, so they flow through the normal restore paths below — the
+	// queued rebuild path or the claimed-action resume path.
+	m.reviveErrorEntries(ctx, 0, false)
+
 	entries := m.queue.ListFilter("", config.ProtocolAll, storage.EntryStateDownloading, nil, "", false)
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].AddedOn.Before(entries[j].AddedOn)

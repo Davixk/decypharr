@@ -8,10 +8,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -329,6 +332,161 @@ func TestAddFileMalformedNZBStillRejected(t *testing.T) {
 	}
 	if history := fetchHistory(t, s); len(history.Slots) != 0 {
 		t.Fatalf("malformed NZB appeared in history: %+v", history.Slots)
+	}
+}
+
+// addFailedNZBEntry seeds a terminal-error NZB queue entry with a staged
+// source file, the way the incident left ~1,794 entries behind.
+func addFailedNZBEntry(t *testing.T, m *manager.Manager, infohash, lastError string, errorCount int) *storage.Entry {
+	t.Helper()
+	stagedPath := filepath.Join(t.TempDir(), infohash+".nzb.queued")
+	if err := os.WriteFile(stagedPath, []byte(testNZB), 0o644); err != nil {
+		t.Fatalf("write staged NZB: %v", err)
+	}
+	now := time.Now()
+	entry := &storage.Entry{
+		InfoHash:         infohash,
+		Name:             "failed-" + infohash,
+		OriginalFilename: "failed-" + infohash + ".nzb",
+		Protocol:         config.ProtocolNZB,
+		Magnet:           stagedPath,
+		Status:           debridTypes.TorrentStatusDownloading,
+		State:            storage.EntryStateError,
+		LastError:        lastError,
+		ErrorCount:       errorCount,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		AddedOn:          now,
+		Providers:        make(map[string]*storage.ProviderEntry),
+		Files:            make(map[string]*storage.File),
+		Tags:             []string{},
+	}
+	if err := m.Queue().Add(entry); err != nil {
+		t.Fatalf("seed failed entry %s: %v", infohash, err)
+	}
+	return entry
+}
+
+func doRetryRequest(t *testing.T, s *SABnzbd, url string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, url, nil)
+	recorder := httptest.NewRecorder()
+	s.Routes().ServeHTTP(recorder, req)
+	return recorder
+}
+
+func historySlotFor(history History, nzoID string) *HistorySlot {
+	for i := range history.Slots {
+		if history.Slots[i].NzoId == nzoID {
+			return &history.Slots[i]
+		}
+	}
+	return nil
+}
+
+// mode=retry with value=<nzo_id> revives that failed entry: {"status":true},
+// the entry re-enters the active pipeline, and it disappears from the Failed
+// history — exactly how real SABnzbd behaves on retry.
+func TestRetryRevivesFailedEntryAndClearsFailedHistory(t *testing.T) {
+	server := newFakeNNTPServer(t, true) // healthy provider for the re-parse
+	s, m := newSABTestHarness(t, server)
+
+	entry := addFailedNZBEntry(t, m, "retry-entry-1", "articles missing on provider: failed to stat segment", 1)
+
+	if slot := historySlotFor(fetchHistory(t, s), entry.InfoHash); slot == nil || slot.Status != StatusFailed {
+		t.Fatalf("seeded entry missing from Failed history before retry: %+v", slot)
+	}
+
+	recorder := doRetryRequest(t, s, "/api?mode=retry&value=retry-entry-1")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, body=%q", recorder.Code, recorder.Body.String())
+	}
+	var response StatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if !response.Status {
+		t.Fatalf("retry response = %+v, want status true", response)
+	}
+
+	revived, err := m.Queue().GetTorrent(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("revived entry missing from queue: %v", err)
+	}
+	if revived.State != storage.EntryStateDownloading {
+		t.Fatalf("revived entry state = %q, want downloading", revived.State)
+	}
+	if slot := historySlotFor(fetchHistory(t, s), entry.InfoHash); slot != nil {
+		t.Fatalf("revived entry still projected in history as %q", slot.Status)
+	}
+}
+
+// mode=retry with an unknown nzo_id must report failure, not silently succeed.
+func TestRetryUnknownNzoIDFails(t *testing.T) {
+	server := newFakeNNTPServer(t, true)
+	s, _ := newSABTestHarness(t, server)
+
+	recorder := doRetryRequest(t, s, "/api?mode=retry&value=no-such-entry")
+	if recorder.Code == http.StatusOK {
+		t.Fatalf("retry of unknown nzo_id returned 200: %q", recorder.Body.String())
+	}
+	var response StatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if response.Status {
+		t.Fatal("retry of unknown nzo_id reported status true")
+	}
+}
+
+// mode=retry_all (and mode=retry without a value) revives every ELIGIBLE
+// failed entry: exhausted ones (ErrorCount >= retries) stay Failed.
+func TestRetryAllRevivesOnlyEligibleEntries(t *testing.T) {
+	server := newFakeNNTPServer(t, true)
+	s, m := newSABTestHarness(t, server)
+
+	eligible := addFailedNZBEntry(t, m, "retryall-eligible", "usenet parse failed: availability probe failed: provider connectivity problem", 1)
+	exhausted := addFailedNZBEntry(t, m, "retryall-exhausted", "articles missing on provider: failed to stat segment", 3)
+
+	recorder := doRetryRequest(t, s, "/api?mode=retry_all")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("retry_all status = %d, body=%q", recorder.Code, recorder.Body.String())
+	}
+	var response StatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode retry_all response: %v", err)
+	}
+	if !response.Status {
+		t.Fatalf("retry_all response = %+v, want status true", response)
+	}
+
+	revived, err := m.Queue().GetTorrent(eligible.InfoHash)
+	if err != nil {
+		t.Fatalf("eligible entry missing from queue: %v", err)
+	}
+	if revived.State != storage.EntryStateDownloading {
+		t.Fatalf("eligible entry state = %q, want downloading", revived.State)
+	}
+	stillFailed, err := m.Queue().GetTorrent(exhausted.InfoHash)
+	if err != nil {
+		t.Fatalf("exhausted entry missing from queue: %v", err)
+	}
+	if stillFailed.State != storage.EntryStateError {
+		t.Fatalf("exhausted entry state = %q, want it to stay failed", stillFailed.State)
+	}
+
+	history := fetchHistory(t, s)
+	if slot := historySlotFor(history, eligible.InfoHash); slot != nil {
+		t.Fatalf("eligible entry still projected in history as %q", slot.Status)
+	}
+	if slot := historySlotFor(history, exhausted.InfoHash); slot == nil || slot.Status != StatusFailed {
+		t.Fatalf("exhausted entry missing from Failed history: %+v", slot)
+	}
+
+	// mode=retry without a value routes through the same retry-all path.
+	recorder = doRetryRequest(t, s, "/api?mode=retry")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("bare retry status = %d, body=%q", recorder.Code, recorder.Body.String())
 	}
 }
 
