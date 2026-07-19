@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/notifications"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet"
+	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 	"github.com/sirrobot01/decypharr/pkg/version"
 	"golang.org/x/sync/singleflight"
 )
@@ -373,6 +375,23 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 				_ = m.queue.Update(job.Entry)
 			}
 			m.jobQueue.Retry(job, 30*time.Second)
+			return
+		}
+		if errors.Is(err, parser.ErrProbeInfrastructure) {
+			// The availability probe failed on the NNTP substrate, not on the
+			// content — there is no verdict about the articles. Keep the entry
+			// queued and retry through the job queue with backoff instead of
+			// surfacing a Failed history entry for a possibly healthy release.
+			m.logger.Warn().
+				Err(err).
+				Str("job_id", job.ID).
+				Int("retry", job.RetryCount+1).
+				Msg("NZB availability probe hit an infrastructure failure; retrying with backoff")
+			if job.Entry != nil {
+				job.Entry.Status = debridTypes.TorrentStatusQueued
+				_ = m.queue.Update(job.Entry)
+				m.scheduleQueuedNZBRetry(job.Entry, job.RetryCount+1)
+			}
 			return
 		}
 		m.logger.Error().Err(err).Str("job_id", job.ID).Str("type", string(job.Type)).Msg("Active download failed")

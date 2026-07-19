@@ -13,6 +13,7 @@ import (
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet"
+	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
 func (m *Manager) restoreActiveDownloadJobs() {
@@ -76,6 +77,21 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		}
 		job, err := m.rebuildQueuedJob(entry)
 		if err != nil {
+			if errors.Is(err, parser.ErrProbeInfrastructure) {
+				// The rebuild failed on the NNTP substrate, not on the content:
+				// there is no verdict about the articles, so the entry must NOT
+				// become a terminal error (a Failed history entry would make the
+				// arr blocklist a possibly healthy release). Leave it queued and
+				// eligible, and schedule a job-queue retry with backoff so a
+				// later pass reparses it once the substrate recovers.
+				m.logger.Warn().
+					Err(err).
+					Str("infohash", entry.InfoHash).
+					Str("name", entry.Name).
+					Msg("Restore rebuild hit an NNTP infrastructure failure; leaving entry eligible for retry")
+				m.scheduleQueuedNZBRetry(entry, 0)
+				continue
+			}
 			entry.MarkAsError(err)
 			if updateErr := m.queue.Update(entry); updateErr != nil {
 				m.logger.Debug().Err(updateErr).Str("infohash", entry.InfoHash).Msg("Skipped stale restore error update")

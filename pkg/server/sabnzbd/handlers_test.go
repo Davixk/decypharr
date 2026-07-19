@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/manager"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
@@ -264,6 +265,52 @@ func TestAddFileProbeFailureIsAcceptedAndRecordedAsFailed(t *testing.T) {
 	}
 	if !strings.Contains(slot.FailMessage, "articles missing on provider") {
 		t.Fatalf("history fail_message = %q, want it to mention missing articles", slot.FailMessage)
+	}
+}
+
+// An infrastructure-class probe failure (dead provider: connection refused)
+// carries no verdict about the articles. The add must be accepted (200 +
+// nzo_id) with the entry kept queued for retry, and the release must NOT
+// appear in the Failed history — a Failed projection would make the arr
+// blocklist a possibly healthy release.
+func TestAddFileInfraProbeFailureStaysQueuedAndOutOfFailedHistory(t *testing.T) {
+	server := newFakeNNTPServer(t, true)
+	s, m := newSABTestHarness(t, server)
+	// Collapse the substrate before the add: dialing the provider is refused.
+	server.Close()
+
+	recorder := postNZBFile(t, s, "movie.nzb", []byte(testNZB))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("addfile status = %d, want 200; body=%q", recorder.Code, recorder.Body.String())
+	}
+	var response AddNZBResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode addfile response: %v", err)
+	}
+	if !response.Status || len(response.NzoIds) != 1 || response.NzoIds[0] == "" {
+		t.Fatalf("addfile response = %+v, want status true with one nzo_id", response)
+	}
+	nzoID := response.NzoIds[0]
+
+	entry, err := m.Queue().GetTorrent(nzoID)
+	if err != nil {
+		t.Fatalf("accepted NZB has no queue entry: %v", err)
+	}
+	if entry.State != storage.EntryStateDownloading {
+		t.Fatalf("entry state = %q, want %q (must NOT be terminal error)", entry.State, storage.EntryStateDownloading)
+	}
+	if entry.Status != debridTypes.TorrentStatusQueued {
+		t.Fatalf("entry status = %q, want %q", entry.Status, debridTypes.TorrentStatusQueued)
+	}
+	if entry.LastError != "" {
+		t.Fatalf("entry LastError = %q, want empty for an infrastructure deferral", entry.LastError)
+	}
+
+	history := fetchHistory(t, s)
+	for _, slot := range history.Slots {
+		if slot.NzoId == nzoID {
+			t.Fatalf("infrastructure-deferred NZB appeared in history as %q: %+v", slot.Status, slot)
+		}
 	}
 }
 
