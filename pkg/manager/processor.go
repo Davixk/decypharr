@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -552,6 +551,12 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		return nil, joinDebridErrors(errs)
 	}
 
+	// Provider download_uncached=false only acts as a ceiling while walking a
+	// multi-provider fallback chain, where a cache-only provider merely probes
+	// its cache before the chain moves on. On the default path the import
+	// request keeps its original precedence over provider config.
+	fallbackChain := importRequest.FallbackOnFailure && len(clients) > 1
+
 	for _, db := range clients {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("debrid request canceled: %w", err))
@@ -563,22 +568,8 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		if providerName == "" {
 			providerName = dbConfig.Provider
 		}
-		downloadUncached := providerAllowsUncached(dbConfig.DownloadUncached, importRequest.DownloadUncached)
+		downloadUncached := resolveDownloadUncached(dbConfig.DownloadUncached, importRequest.DownloadUncached, fallbackChain)
 		debridTorrent := newDebridAttempt(importRequest, downloadUncached)
-
-		// Cache-only is a hard provider policy. If the provider supports an
-		// availability API, reject an uncached release before uploading it.
-		if !downloadUncached && db.SupportsInstantAvailability() && debridTorrent.InfoHash != "" {
-			availability := db.IsAvailable([]string{debridTorrent.InfoHash})
-			if !isHashAvailable(availability, debridTorrent.InfoHash) {
-				errs = append(errs, providerStageError(providerName, "availability check", errors.New("torrent is not cached and uncached downloads are disabled")))
-				continue
-			}
-			if err := ctx.Err(); err != nil {
-				errs = append(errs, fmt.Errorf("debrid request canceled: %w", err))
-				break
-			}
-		}
 
 		_logger := db.Logger()
 		arrName := ""
@@ -652,14 +643,10 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			continue
 		}
 		if err := ctx.Err(); err != nil {
-			cleanupID := torrent.Id
-			if cleanupID == "" {
-				cleanupID = dbt.Id
-			}
-			errs = append(errs, errors.Join(
-				fmt.Errorf("debrid request canceled: %w", err),
-				cleanupDebridAttempt(db, providerName, cleanupID),
-			))
+			// The provider accepted the torrent and the status check
+			// succeeded; deleting it now would remove content the user asked
+			// for. Keep the remote torrent and surface only the cancellation.
+			errs = append(errs, fmt.Errorf("debrid request canceled: %w", err))
 			break
 		}
 		return torrent, nil
@@ -709,20 +696,20 @@ func newDebridAttempt(importRequest *ImportRequest, downloadUncached bool) *debr
 	}
 }
 
-func providerAllowsUncached(providerAllows bool, requestOverride *bool) bool {
+// resolveDownloadUncached decides whether an attempt may start an uncached
+// download. On the default path (fallback disabled or a single candidate) the
+// import request's override wins outright over provider config, matching the
+// pre-fallback behavior. While walking a multi-provider fallback chain,
+// provider download_uncached=false is a hard ceiling: the cache-only provider
+// only probes its cache before the chain advances.
+func resolveDownloadUncached(providerAllows bool, requestOverride *bool, fallbackChain bool) bool {
+	if requestOverride != nil && !fallbackChain {
+		return *requestOverride
+	}
 	if !providerAllows {
 		return false
 	}
 	return requestOverride == nil || *requestOverride
-}
-
-func isHashAvailable(availability map[string]bool, infoHash string) bool {
-	for hash, available := range availability {
-		if available && strings.EqualFold(hash, infoHash) {
-			return true
-		}
-	}
-	return false
 }
 
 func providerStageError(providerName, stage string, err error) error {

@@ -554,8 +554,8 @@ class ConfigManager {
                                 </label>
                                 <input type="number" class="input w-full"
                                        name="debrid[${index}].priority" id="debrid[${index}].priority"
-                                       min="0" placeholder="0" value="0">
-                                <span class="text-sm opacity-70">Lower runs first; 0 follows provider order</span>
+                                       min="0" placeholder="Follows list order">
+                                <span class="text-sm opacity-70">Lower runs first; leave empty to follow the debrids list order</span>
                             </div>
                         </div>
                     </div>

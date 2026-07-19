@@ -87,7 +87,6 @@ func (c *lifecycleDebridClient) GetDownloadLink(string, *debridTypes.File) (debr
 	return debridTypes.DownloadLink{}, nil
 }
 func (c *lifecycleDebridClient) IsAvailable([]string) map[string]bool { return nil }
-func (c *lifecycleDebridClient) SupportsInstantAvailability() bool    { return false }
 func (c *lifecycleDebridClient) Config() config.Debrid                { return config.Debrid{Name: c.name} }
 func (c *lifecycleDebridClient) Logger() zerolog.Logger               { return zerolog.Nop() }
 func (c *lifecycleDebridClient) RefreshDownloadLinks() error          { return nil }

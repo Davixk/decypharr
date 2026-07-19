@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestUpdateDebridDefaultsPriorityToConfigurationOrder(t *testing.T) {
+func TestUpdateDebridKeepsUnsetPriorityUnmaterialized(t *testing.T) {
 	cfg := &Config{Debrids: []Debrid{
 		{Name: "first"},
 		{Name: "explicit", Priority: 20},
@@ -22,9 +22,9 @@ func TestUpdateDebridDefaultsPriorityToConfigurationOrder(t *testing.T) {
 		wantPriority  int
 		wantConfigPos int
 	}{
-		{index: 0, wantPriority: 1, wantConfigPos: 0},
+		{index: 0, wantPriority: 0, wantConfigPos: 0},
 		{index: 1, wantPriority: 20, wantConfigPos: 1},
-		{index: 2, wantPriority: 3, wantConfigPos: 2},
+		{index: 2, wantPriority: 0, wantConfigPos: 2},
 	}
 	for _, test := range tests {
 		provider := cfg.Debrids[test.index]
@@ -32,6 +32,25 @@ func TestUpdateDebridDefaultsPriorityToConfigurationOrder(t *testing.T) {
 			t.Fatalf("provider %d normalized to priority=%d order=%d, want priority=%d order=%d",
 				test.index, provider.Priority, provider.ConfigOrder, test.wantPriority, test.wantConfigPos)
 		}
+	}
+}
+
+func TestUpdateDebridSaveRoundTripLeavesUnsetPriorityAbsent(t *testing.T) {
+	cfg := &Config{Debrids: []Debrid{
+		{Provider: "realdebrid", Name: "rd", APIKey: "secret"},
+		{Provider: "alldebrid", Name: "ad", APIKey: "secret"},
+	}}
+
+	for index, provider := range cfg.Debrids {
+		cfg.Debrids[index] = cfg.updateDebrid(index, provider)
+	}
+
+	data, err := json.Marshal(cfg.Debrids)
+	if err != nil {
+		t.Fatalf("marshal debrids: %v", err)
+	}
+	if strings.Contains(string(data), `"priority"`) {
+		t.Fatalf("unset priority was materialized into persisted config: %s", data)
 	}
 }
 

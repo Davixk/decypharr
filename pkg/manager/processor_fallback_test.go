@@ -47,19 +47,17 @@ type torrentAttemptSnapshot struct {
 }
 
 type fakeDebridClient struct {
-	cfg                  config.Debrid
-	recorder             *fallbackCallRecorder
-	supportsAvailability bool
-	available            bool
-	submitFn             func(*debridTypes.Torrent) (*debridTypes.Torrent, error)
-	checkFn              func(*debridTypes.Torrent) (*debridTypes.Torrent, error)
-	deleteFn             func(string) error
-	mu                   sync.Mutex
-	submitCalls          int
-	checkCalls           int
-	availableCalls       int
-	submitSnapshots      []torrentAttemptSnapshot
-	deleteIDs            []string
+	cfg             config.Debrid
+	recorder        *fallbackCallRecorder
+	submitFn        func(*debridTypes.Torrent) (*debridTypes.Torrent, error)
+	checkFn         func(*debridTypes.Torrent) (*debridTypes.Torrent, error)
+	deleteFn        func(string) error
+	mu              sync.Mutex
+	submitCalls     int
+	checkCalls      int
+	availableCalls  int
+	submitSnapshots []torrentAttemptSnapshot
+	deleteIDs       []string
 }
 
 var _ common.Client = (*fakeDebridClient)(nil)
@@ -110,19 +108,12 @@ func (f *fakeDebridClient) IsAvailable(infohashes []string) map[string]bool {
 	f.mu.Lock()
 	f.availableCalls++
 	f.mu.Unlock()
-	result := make(map[string]bool, len(infohashes))
-	for _, hash := range infohashes {
-		result[hash] = f.available
-	}
-	return result
+	return make(map[string]bool, len(infohashes))
 }
 
 func (f *fakeDebridClient) Config() config.Debrid  { return f.cfg }
 func (f *fakeDebridClient) Logger() zerolog.Logger { return zerolog.Nop() }
-func (f *fakeDebridClient) SupportsInstantAvailability() bool {
-	return f.supportsAvailability
-}
-func (f *fakeDebridClient) SupportsCheck() bool { return true }
+func (f *fakeDebridClient) SupportsCheck() bool    { return true }
 func (f *fakeDebridClient) GetDownloadLink(string, *debridTypes.File) (debridTypes.DownloadLink, error) {
 	return debridTypes.DownloadLink{}, nil
 }
@@ -313,7 +304,7 @@ func TestSendToDebridCleansStatusFailureWithReturnedID(t *testing.T) {
 	}
 }
 
-func TestSendToDebridCacheOnlyProviderNeverStartsUncached(t *testing.T) {
+func TestSendToDebridFallbackProbesCacheOnlyProviderBySubmitting(t *testing.T) {
 	primary := &fakeDebridClient{
 		cfg: config.Debrid{Name: "primary", DownloadUncached: true, Priority: 1},
 		submitFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
@@ -321,21 +312,30 @@ func TestSendToDebridCacheOnlyProviderNeverStartsUncached(t *testing.T) {
 		},
 	}
 	backup := &fakeDebridClient{
-		cfg:                  config.Debrid{Name: "backup", DownloadUncached: false, Priority: 2},
-		supportsAvailability: true,
-		available:            false,
+		cfg: config.Debrid{Name: "backup", DownloadUncached: false, Priority: 2},
+		checkFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
+			torrent.Status = debridTypes.TorrentStatusDownloading
+			return torrent, nil
+		},
 	}
 
-	_, err := fallbackTestManager(primary, backup).SendToDebrid(context.Background(), fallbackTestRequest("", false, boolPointer(true)))
+	_, err := fallbackTestManager(primary, backup).SendToDebrid(context.Background(), fallbackTestRequest("", true, boolPointer(true)))
 	if err == nil {
 		t.Fatal("expected all providers to reject the torrent")
 	}
-	if !strings.Contains(err.Error(), `provider "backup" availability check failed`) {
+	if !strings.Contains(err.Error(), `provider "backup" status check failed`) || !strings.Contains(err.Error(), "not cached") {
 		t.Fatalf("missing provider-labelled cache error: %v", err)
 	}
 	submit, check, available := backup.counts()
-	if submit != 0 || check != 0 || available != 1 {
+	if submit != 1 || check != 1 || available != 0 {
 		t.Fatalf("cache-only backup calls: submit=%d check=%d available=%d", submit, check, available)
+	}
+	snapshots := backup.snapshots()
+	if len(snapshots) != 1 || snapshots[0].downloadUncached {
+		t.Fatalf("cache-only provider received uncached permission: %+v", snapshots)
+	}
+	if deleted := backup.deleted(); len(deleted) != 1 || deleted[0] != "backup-id" {
+		t.Fatalf("uncached probe was not cleaned up: %v", deleted)
 	}
 }
 
@@ -347,12 +347,10 @@ func TestSendToDebridCachedBackupKeepsUncachedDisabled(t *testing.T) {
 		},
 	}
 	backup := &fakeDebridClient{
-		cfg:                  config.Debrid{Name: "backup", DownloadUncached: false, Priority: 2},
-		supportsAvailability: true,
-		available:            true,
+		cfg: config.Debrid{Name: "backup", DownloadUncached: false, Priority: 2},
 	}
 
-	torrent, err := fallbackTestManager(primary, backup).SendToDebrid(context.Background(), fallbackTestRequest("", false, boolPointer(true)))
+	torrent, err := fallbackTestManager(primary, backup).SendToDebrid(context.Background(), fallbackTestRequest("", true, boolPointer(true)))
 	if err != nil {
 		t.Fatalf("SendToDebrid returned error: %v", err)
 	}
@@ -362,6 +360,35 @@ func TestSendToDebridCachedBackupKeepsUncachedDisabled(t *testing.T) {
 	snapshots := backup.snapshots()
 	if len(snapshots) != 1 || snapshots[0].downloadUncached {
 		t.Fatalf("cache-only provider received uncached permission: %+v", snapshots)
+	}
+}
+
+func TestSendToDebridDefaultPathRequestUncachedOverridesProvider(t *testing.T) {
+	primary := &fakeDebridClient{
+		cfg: config.Debrid{Name: "primary", DownloadUncached: false},
+		checkFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
+			torrent.Status = debridTypes.TorrentStatusDownloading
+			return torrent, nil
+		},
+	}
+
+	torrent, err := fallbackTestManager(primary).SendToDebrid(context.Background(), fallbackTestRequest("primary", false, boolPointer(true)))
+	if err != nil {
+		t.Fatalf("SendToDebrid returned error: %v", err)
+	}
+	if torrent.Status != debridTypes.TorrentStatusDownloading {
+		t.Fatalf("unexpected torrent status: %q", torrent.Status)
+	}
+	submit, _, available := primary.counts()
+	if submit != 1 || available != 0 {
+		t.Fatalf("default path calls: submit=%d available=%d", submit, available)
+	}
+	snapshots := primary.snapshots()
+	if len(snapshots) != 1 || !snapshots[0].downloadUncached {
+		t.Fatalf("request-level uncached override was lost: %+v", snapshots)
+	}
+	if deleted := primary.deleted(); len(deleted) != 0 {
+		t.Fatalf("accepted torrent was deleted: %v", deleted)
 	}
 }
 
@@ -438,26 +465,54 @@ func TestSendToDebridJoinsErrorsFromEveryAttempt(t *testing.T) {
 	}
 }
 
-func TestProviderAllowsUncachedTreatsProviderPolicyAsCeiling(t *testing.T) {
+func TestResolveDownloadUncachedPrecedence(t *testing.T) {
 	tests := []struct {
 		name            string
 		providerAllows  bool
 		requestOverride *bool
+		fallbackChain   bool
 		want            bool
 	}{
-		{name: "provider disabled request nil", providerAllows: false, want: false},
-		{name: "provider disabled request enabled", providerAllows: false, requestOverride: boolPointer(true), want: false},
-		{name: "provider enabled request disabled", providerAllows: true, requestOverride: boolPointer(false), want: false},
-		{name: "provider enabled request nil", providerAllows: true, want: true},
-		{name: "provider enabled request enabled", providerAllows: true, requestOverride: boolPointer(true), want: true},
+		// Default path: the import request wins outright over provider config.
+		{name: "default provider disabled request nil", providerAllows: false, want: false},
+		{name: "default provider disabled request enabled", providerAllows: false, requestOverride: boolPointer(true), want: true},
+		{name: "default provider enabled request disabled", providerAllows: true, requestOverride: boolPointer(false), want: false},
+		{name: "default provider enabled request nil", providerAllows: true, want: true},
+		// Fallback chain: provider download_uncached=false is a hard ceiling.
+		{name: "chain provider disabled request nil", providerAllows: false, fallbackChain: true, want: false},
+		{name: "chain provider disabled request enabled", providerAllows: false, requestOverride: boolPointer(true), fallbackChain: true, want: false},
+		{name: "chain provider enabled request disabled", providerAllows: true, requestOverride: boolPointer(false), fallbackChain: true, want: false},
+		{name: "chain provider enabled request nil", providerAllows: true, fallbackChain: true, want: true},
+		{name: "chain provider enabled request enabled", providerAllows: true, requestOverride: boolPointer(true), fallbackChain: true, want: true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := providerAllowsUncached(test.providerAllows, test.requestOverride); got != test.want {
-				t.Fatalf("providerAllowsUncached() = %v, want %v", got, test.want)
+			if got := resolveDownloadUncached(test.providerAllows, test.requestOverride, test.fallbackChain); got != test.want {
+				t.Fatalf("resolveDownloadUncached() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestSendToDebridCancellationAfterSuccessfulStatusKeepsTorrent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &fakeDebridClient{
+		cfg: config.Debrid{Name: "primary", DownloadUncached: true},
+		checkFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
+			cancel()
+			torrent.Status = debridTypes.TorrentStatusDownloaded
+			return torrent, nil
+		},
+	}
+
+	_, err := fallbackTestManager(client).SendToDebrid(ctx, fallbackTestRequest("", false, nil))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+	if deleted := client.deleted(); len(deleted) != 0 {
+		t.Fatalf("completed torrent was deleted after cancellation: %v", deleted)
 	}
 }
 
