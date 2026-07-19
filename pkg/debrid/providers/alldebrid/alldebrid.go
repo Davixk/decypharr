@@ -28,14 +28,14 @@ import (
 
 const (
 	allDebridAPIHost                  = "https://api.alldebrid.com"
-	allDebridMagnetUploadEndpoint     = "/v4/magnet/upload"
-	allDebridMagnetUploadFileEndpoint = "/v4/magnet/upload/file"
+	allDebridMagnetUploadEndpoint     = "/v4.1/magnet/upload"
+	allDebridMagnetUploadFileEndpoint = "/v4.1/magnet/upload/file"
 	allDebridMagnetStatusEndpoint     = "/v4.1/magnet/status"
-	allDebridMagnetDeleteEndpoint     = "/v4/magnet/delete"
-	allDebridLinkUnlockEndpoint       = "/v4/link/unlock"
-	allDebridLinkInfosEndpoint        = "/v4/link/infos"
-	allDebridUserEndpoint             = "/v4/user"
-	allDebridUserLinksDeleteEndpoint  = "/v4/user/links/delete"
+	allDebridMagnetDeleteEndpoint     = "/v4.1/magnet/delete"
+	allDebridLinkUnlockEndpoint       = "/v4.1/link/unlock"
+	allDebridLinkInfosEndpoint        = "/v4.1/link/infos"
+	allDebridUserEndpoint             = "/v4.1/user"
+	allDebridUserLinksDeleteEndpoint  = "/v4.1/user/links/delete"
 )
 
 type AllDebrid struct {
@@ -132,18 +132,20 @@ func decodeAllDebridResponse(resp *http.Response, result any) error {
 	}
 	body = bytes.TrimSpace(body)
 	if len(body) == 0 {
-		if resp.StatusCode == http.StatusNoContent {
-			return nil
-		}
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 			return fmt.Errorf("alldebrid API error: HTTP status %d", resp.StatusCode)
 		}
-		return fmt.Errorf("alldebrid API error: empty response")
+		// AllDebrid may answer some calls (e.g. deletes) with an empty body.
+		// That is only acceptable when the caller does not expect data.
+		if result == nil || resp.StatusCode == http.StatusNoContent {
+			return nil
+		}
+		return fmt.Errorf("alldebrid API error: HTTP status %d: empty response", resp.StatusCode)
 	}
 
 	var envelope apiResponse
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return fmt.Errorf("alldebrid API error: decoding response: %w", err)
+		return fmt.Errorf("alldebrid API error: HTTP status %d: decoding response: %w", resp.StatusCode, err)
 	}
 	if envelope.Status == "error" || envelope.Error != nil {
 		return newAllDebridAPIError(envelope.Error)
