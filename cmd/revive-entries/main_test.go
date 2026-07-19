@@ -263,7 +263,7 @@ func TestReviveEntriesSelectionClassificationAndApply(t *testing.T) {
 			t.Errorf("%s must not be selected, but appears in output:\n%s", id, dry)
 		}
 	}
-	if !strings.Contains(dry, "# census: candidates=6 A-action=1 A-queued=2 B=2 C=1") {
+	if !strings.Contains(dry, "# census: candidates=6 A-action=1 A-queued=2 A2-unflip=0 B=2 C=1") {
 		t.Errorf("dry-run census missing or wrong:\n%s", dry)
 	}
 
@@ -392,7 +392,7 @@ func TestReviveEntriesSelectionClassificationAndApply(t *testing.T) {
 	if code := run(applyOpts, &out, &errOut); code != exitOK {
 		t.Fatalf("second apply exit = %d, want %d\nstdout:\n%s", code, exitOK, out.String())
 	}
-	if !strings.Contains(out.String(), "# census: candidates=1 A-action=0 A-queued=0 B=0 C=1") {
+	if !strings.Contains(out.String(), "# census: candidates=1 A-action=0 A-queued=0 A2-unflip=0 B=0 C=1") {
 		t.Fatalf("second-run census should contain only the class-C row:\n%s", out.String())
 	}
 	for _, id := range []string{idAAction, idAQueued, idArchAQueued, idArchFailedMeta, idB} {

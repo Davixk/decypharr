@@ -71,8 +71,25 @@ outside the window are never touched.
   verdict), but the raw NZB XML survives (`entry.Magnet` path, `meta.Path`,
   or a `usenet/nzbs/<id>.*.source` / `.queued` artifact). Same reset as
   A-queued; boot pass-2 re-parses the XML and overwrites the stale meta.
-- **Class C** — neither (also: generation mismatch or undecodable meta).
-  Reported only, never mutated. Recourse: re-grab from the arr side.
+- **Class A2 ("un-flip")** — meta durably `failed` and no XML survives, but
+  the meta's `Files` still carry the full parsed segment map from an
+  earlier **completed** lifecycle: `markAsFailed` only flips `Status` and
+  `FailMessage`, it never clears `Files`. Requires `!IsBad`, no permanently
+  failed (`IsDeleted`) file, every file with at least one segment, a
+  positive size, and the class-A generation adopt-or-match rule. `-apply`
+  restores the meta to `completed` (clearing `FailMessage`) through
+  `usenet.RestoreCompleted` — a guarded write under the per-NZB lifecycle
+  lock that re-validates all of the above — then stages the entry with the
+  A-action triple so the symlink action re-runs from the intact segment
+  map. Zero network, zero re-download.
+  Near-misses stay class C with a precise reason:
+  `skip-meta-failed-bad-or-deleted` (genuine content verdict),
+  `skip-meta-failed-empty-files` (files present but segmentless or
+  zero-size), `skip-meta-failed-no-xml` (nothing parsed AND no XML — the
+  meta never got past the parse stage).
+- **Class C** — none of the above (also: generation mismatch or
+  undecodable meta). Reported only, never mutated. Recourse: re-grab from
+  the arr side.
 
 All writes go through the storage package's guarded mutation APIs
 (`MutateQueuedIfPresent` / `MutateEntryIfPresent`), so per-key locks are
@@ -90,11 +107,18 @@ holds the hash in `State=error`, it receives the same cosmetic reset.
 
 One TSV line per candidate on stdout
 (`hash  name(60)  class  meta-status  xml-present  decision`), where
-decision is `would-revive-as-<class>` (dry-run), `revived-as-<class>`
-(apply; `+main` when the main-store row was reset too), or
-`skip-<reason>`. A `# census:` summary line closes the report. The storage
-layer prints its own startup log lines to stdout as well; TSV consumers
-should keep only lines starting with a hash or drop `#`/log lines.
+decision is `would-revive-as-<class>` / `would-unflip` (dry-run),
+`revived-as-<class>` / `unflipped` (apply; `+main` when the main-store row
+was reset too), or `skip-<reason>`. A `# census:` summary line (including
+`A2-unflip=N`) closes the report.
+
+stdout carries **only** the `# hash...` header, TSV rows, and trailing `#`
+census/comment lines — safe to redirect straight into a file or pipe.
+Every banner, warning, and dependency log line (config loading, storage
+init) goes to stderr: the tool points the process-global `os.Stdout` at
+stderr while the stores are open, so writers that grab `os.Stdout` at
+construction time (zerolog console writers, `fmt.Printf` in config
+loading) can never leak into the TSV stream.
 
 Exit codes: `0` success, `1` the state dir looks wrong (no `db/`) or an
 operational failure, `2` zero candidates matched (distinct so operator
