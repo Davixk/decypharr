@@ -169,6 +169,16 @@ func TestWorkerSlotFreesOnceActionClaimed(t *testing.T) {
 	}
 }
 
+// TestDownloadCompletionParkCap pins the defensive worker-park bound: the
+// longest legitimate pipeline (mount wait + usenet processing) plus slack.
+func TestDownloadCompletionParkCap(t *testing.T) {
+	m := &Manager{usenetTimeout: 10 * time.Minute}
+	want := symlinkMountWaitTimeout + 10*time.Minute + downloadCompletionSlack
+	if got := m.downloadCompletionParkCap(); got != want {
+		t.Fatalf("downloadCompletionParkCap = %s, want %s", got, want)
+	}
+}
+
 // TestActionGateBoundsConcurrentClaimedActions pins fix 2: with a gate of
 // size G, N claimed post-download actions run at most G at a time while the
 // rest wait on the gate (already claimed, so worker slots stay free).

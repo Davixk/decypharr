@@ -403,6 +403,19 @@ func (m *Manager) resumeClaimedAction(entry *storage.Entry) {
 	m.runClaimedAction(entry)
 }
 
+// downloadCompletionSlack pads the worst-case post-download pipeline (mount
+// visibility wait + usenet processing) when computing the defensive park cap
+// for waitForDownloadCompletion.
+const downloadCompletionSlack = 5 * time.Minute
+
+// downloadCompletionParkCap bounds how long a single worker may stay parked on
+// one entry. It covers the longest legitimate pipeline (the mount wait plus
+// the usenet processing timeout) with slack; anything beyond that means the
+// entry's lifecycle has wedged and the slot is worth more than the wait.
+func (m *Manager) downloadCompletionParkCap() time.Duration {
+	return symlinkMountWaitTimeout + m.usenetTimeout + downloadCompletionSlack
+}
+
 // waitForDownloadCompletion parks a worker slot only while the entry still
 // represents in-flight provider/import work. It returns as soon as the entry
 // leaves the downloading state, the job is cancelled, or the post-download
@@ -418,6 +431,9 @@ func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.
 	// restore paths can retain the original pointer; refreshing a shared
 	// pointer from this loop would race with their own snapshot refreshes.
 	snapshot := *entry
+	maxPark := m.downloadCompletionParkCap()
+	capTimer := time.NewTimer(maxPark)
+	defer capTimer.Stop()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -432,6 +448,18 @@ func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.
 		}
 		select {
 		case <-ctx.Done():
+			return
+		case <-capTimer.C:
+			// Defensive: never let one wedged entry pin a worker forever. The
+			// slot frees; whatever state remains is picked up by the periodic
+			// scheduler or the orphaned-claim reconciler.
+			m.logger.Error().
+				Str("infohash", snapshot.InfoHash).
+				Str("name", snapshot.Name).
+				Str("state", string(snapshot.State)).
+				Str("status", string(snapshot.Status)).
+				Dur("waited", maxPark).
+				Msg("Download completion wait exceeded its cap; releasing the worker slot")
 			return
 		case <-ticker.C:
 		}
