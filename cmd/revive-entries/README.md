@@ -45,6 +45,13 @@ Queue-store entries with protocol `nzb`, `State=error`, `Bad=false`,
 - `articles missing on provider: failed to stat segment`
 - `no valid file groups found in NZB after`
 - `timeout waiting for mount files`
+- `failed to process NZB archives`
+- `no valid files found in NZB`
+
+The last two cover the dominant incident cohort (1,891 entries): the
+archive-processing phase stamped `failed to process nzb: failed to process
+NZB archives: no valid files found in NZB` when a collapsed substrate
+dropped every file group and the parser swallowed the real cause.
 
 `Bad=true` rows and genuine `NNTP ARTICLE_NOT_FOUND (code 430)` verdicts
 outside the window are never touched.
@@ -59,10 +66,11 @@ outside the window are never touched.
   - **A-queued** (all other A): reset to `State=downloading`,
     `Status=queued`, `IsDownloading=false`, `Progress=0` — boot pass-2
     resumes from the completed metadata without any network access.
-- **Class B** — meta missing or still `parsing`, but the raw NZB XML
-  survives (`entry.Magnet` path, `meta.Path`, or a
-  `usenet/nzbs/<id>.*.source` / `.queued` artifact). Same reset as
-  A-queued; boot pass-2 re-parses the XML.
+- **Class B** — meta missing, still `parsing`, or durably `failed` (the
+  archive-processing cohort ran `markAsFailed` despite having no content
+  verdict), but the raw NZB XML survives (`entry.Magnet` path, `meta.Path`,
+  or a `usenet/nzbs/<id>.*.source` / `.queued` artifact). Same reset as
+  A-queued; boot pass-2 re-parses the XML and overwrites the stale meta.
 - **Class C** — neither (also: generation mismatch or undecodable meta).
   Reported only, never mutated. Recourse: re-grab from the arr side.
 

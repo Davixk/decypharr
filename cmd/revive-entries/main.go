@@ -36,11 +36,20 @@ import (
 )
 
 // Incident error signatures. An entry is a candidate only when its LastError
-// contains one of the three revivable patterns.
+// contains one of the revivable patterns.
 const (
 	patternStatSegment = "articles missing on provider: failed to stat segment"
 	patternNoGroups    = "no valid file groups found in NZB after"
 	patternMountFiles  = "timeout waiting for mount files"
+	// patternProcessArchives/patternNoValidFiles cover the dominant incident
+	// cohort (1,891 entries, ~92%): the Process phase stamped 'failed to
+	// process nzb: failed to process NZB archives: no valid files found in
+	// NZB' when a collapsed substrate dropped every file group and the parser
+	// swallowed the real cause behind the generic content verdict. These
+	// entries parsed successfully at add-time, so "invalid NZB" was never a
+	// credible verdict for them.
+	patternProcessArchives = "failed to process NZB archives"
+	patternNoValidFiles    = "no valid files found in NZB"
 
 	// pattern430 marks a genuine provider-side article-not-found verdict.
 	// Outside the incident window it is trusted and never revived.
@@ -299,7 +308,9 @@ func matchesSelector(e *storage.Entry, from, to time.Time, maxErrors int) bool {
 	}
 	return strings.Contains(e.LastError, patternStatSegment) ||
 		strings.Contains(e.LastError, patternNoGroups) ||
-		strings.Contains(e.LastError, patternMountFiles)
+		strings.Contains(e.LastError, patternMountFiles) ||
+		strings.Contains(e.LastError, patternProcessArchives) ||
+		strings.Contains(e.LastError, patternNoValidFiles)
 }
 
 // classify decides how (and whether) a candidate can be revived, mirroring the
@@ -345,6 +356,18 @@ func classify(stateDir string, nzbs *usenet.NZBStorage, e *storage.Entry) verdic
 				return verdict{class: classB, metaStatus: metaStatus, xmlPresent: xml}
 			}
 			return verdict{class: classC, metaStatus: metaStatus, xmlPresent: xml, reason: "meta-parsing-no-xml"}
+		case usenet.NZBStatusFailed:
+			// The Process-phase incident cohort durably marked its metadata
+			// failed (markAsFailed ran for every 'failed to process NZB
+			// archives' entry) even though no content verdict existed. The
+			// selector has already gated on the incident signatures/window, and
+			// boot pass-2's rebuild path handles a failed meta exactly like a
+			// parsing one: it re-parses from the surviving XML source and
+			// overwrites the stale failed status.
+			if xml {
+				return verdict{class: classB, metaStatus: metaStatus, xmlPresent: xml}
+			}
+			return verdict{class: classC, metaStatus: metaStatus, xmlPresent: xml, reason: "meta-failed-no-xml"}
 		default:
 			return verdict{class: classC, metaStatus: metaStatus, xmlPresent: xml, reason: "meta-status-" + metaStatus}
 		}
