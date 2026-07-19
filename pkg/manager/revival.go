@@ -15,12 +15,20 @@ import (
 // infrastructure/availability failures — the classes that are safe to revive
 // because the content itself was never proven bad. A parse-time probe wrapped
 // in ErrArticlesUnavailable ("articles missing on provider") is included:
-// during the incident that signature was stamped on ~1,794 entries by a
-// collapsed substrate, and genuine misses are still capped by ErrorCount.
+// genuine misses are still capped by ErrorCount. The archive-processing
+// signatures cover the dominant 2026-07-19 incident cohort: 1,891 entries
+// were stamped 'failed to process nzb: failed to process NZB archives: no
+// valid files found in NZB' when every file group was dropped on a collapsed
+// substrate and the parser swallowed the real cause behind the generic
+// verdict (fixed since, but the parked rows still carry that text). Those
+// entries parsed successfully at add-time, so "invalid NZB" was never a
+// credible verdict for them.
 var revivableErrorSignatures = []string{
 	"articles missing on provider",
 	"availability probe failed",
 	"timeout waiting for mount files",
+	"failed to process NZB archives",
+	"no valid files found in NZB",
 }
 
 // mountTimeoutSignature marks failures where the download itself completed
