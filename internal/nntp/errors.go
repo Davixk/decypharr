@@ -106,6 +106,8 @@ func (et ErrorType) String() string {
 		return "PROTOCOL"
 	case ErrorTypeYencDecode:
 		return "YENC_DECODE"
+	case ErrorTypeNoAvailableConnection:
+		return "NO_AVAILABLE_CONNECTION"
 	default:
 		return "UNKNOWN"
 	}
@@ -140,6 +142,18 @@ func NewYencDecodeError(err error) *Error {
 	return &Error{
 		Type:    ErrorTypeYencDecode,
 		Message: "yEnc decode failed",
+		Err:     err,
+	}
+}
+
+// NewNoAvailableConnectionError classifies acquire-layer failures: no provider
+// connection could be obtained at all (every pool excluded, saturated, or
+// failing to dial). These are pure infrastructure failures — they carry no
+// verdict whatsoever about any article's existence on the providers.
+func NewNoAvailableConnectionError(message string, err error) *Error {
+	return &Error{
+		Type:    ErrorTypeNoAvailableConnection,
+		Message: message,
 		Err:     err,
 	}
 }
@@ -246,12 +260,40 @@ func connPoolableAfterError(err error) bool {
 	}
 }
 
+// IsArticleNotFoundError reports whether err carries a genuine provider
+// verdict that the article does not exist (430/423). This is the only error
+// class that may be treated as "content is missing"; everything else is either
+// an infrastructure failure or unclassified.
 func IsArticleNotFoundError(err error) bool {
 	var nntpErr *Error
 	if errors.As(err, &nntpErr) {
 		return nntpErr.Type == ErrorTypeArticleNotFound
 	}
 	return false
+}
+
+// IsInfrastructureError reports whether err represents a failure of the NNTP
+// substrate itself — connectivity, timeouts, busy servers, authentication or
+// permission rejections, or the inability to acquire any provider connection —
+// rather than a verdict about a specific article. Article-not-found (430/423)
+// deliberately returns false: that is the genuine "content is missing" verdict
+// and must never be conflated with a collapsed substrate.
+func IsInfrastructureError(err error) bool {
+	var nntpErr *Error
+	if !errors.As(err, &nntpErr) {
+		return false
+	}
+	switch nntpErr.Type {
+	case ErrorTypeConnection,
+		ErrorTypeTimeout,
+		ErrorTypeServerBusy,
+		ErrorTypeAuthentication,
+		ErrorTypePermissionDenied,
+		ErrorTypeNoAvailableConnection:
+		return true
+	default:
+		return false
+	}
 }
 
 func IsAuthenticationError(err error) bool {
