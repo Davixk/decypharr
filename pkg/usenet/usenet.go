@@ -1559,6 +1559,44 @@ func (u *Usenet) SpeedTest(ctx context.Context, providerHost string) nntp.SpeedT
 	return u.nntp.SpeedTest(ctx, providerHost, messageID)
 }
 
+// CheckHealth probes the NNTP substrate with a single STAT of a known
+// segment. A 430/423 answer still proves the substrate is healthy — a
+// provider accepted a connection and returned a genuine verdict — so only
+// infrastructure-class failures (dial/auth/timeouts/no acquirable provider
+// connection) report unhealthy. When no stored segment exists to probe, pool
+// saturation is used as a proxy: a substrate whose every provider slot is
+// checked out cannot serve new work.
+func (u *Usenet) CheckHealth(ctx context.Context) error {
+	messageID := u.findTestSegment()
+	if messageID == "" {
+		return u.checkPoolSaturation()
+	}
+	_, _, err := u.nntp.Stat(ctx, messageID)
+	if err == nil || nntp.IsArticleNotFoundError(err) {
+		return nil
+	}
+	return err
+}
+
+// checkPoolSaturation reports unhealthy when every provider connection slot is
+// checked out (active == max), the signature of a wedged substrate.
+func (u *Usenet) checkPoolSaturation() error {
+	stats := u.nntp.Stats()
+	if stats == nil {
+		return fmt.Errorf("nntp client is closed")
+	}
+	pool, ok := stats["pool"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	active, _ := pool["active"].(int)
+	maxConns, _ := pool["max_connections"].(int)
+	if maxConns > 0 && active >= maxConns {
+		return fmt.Errorf("nntp pools saturated: %d/%d connections checked out", active, maxConns)
+	}
+	return nil
+}
+
 // findTestSegment looks for a segment from any processed NZB to use for speed testing
 func (u *Usenet) findTestSegment() string {
 	var messageID string

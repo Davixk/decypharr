@@ -106,6 +106,9 @@ type Manager struct {
 	// claimedActionTestHook, when set, replaces the real post-download action
 	// body so tests can observe gate concurrency without touching mounts.
 	claimedActionTestHook func(*storage.Entry)
+	// restoreCanaryTestHook, when set, replaces the restore circuit-breaker's
+	// NNTP canary probe so tests can drive pause/resume deterministically.
+	restoreCanaryTestHook func(ctx context.Context) error
 
 	// Notifications service
 	Notifications *notifications.Service

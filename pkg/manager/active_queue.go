@@ -17,6 +17,13 @@ import (
 )
 
 func (m *Manager) restoreActiveDownloadJobs() {
+	// The restore loop must respect shutdown: the job queue's lifecycle
+	// context is cancelled by Close, which Stop always invokes.
+	ctx := context.Background()
+	if m.jobQueue != nil {
+		ctx = m.jobQueue.Context()
+	}
+
 	entries := m.queue.ListFilter("", config.ProtocolAll, storage.EntryStateDownloading, nil, "", false)
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].AddedOn.Before(entries[j].AddedOn)
@@ -24,6 +31,9 @@ func (m *Manager) restoreActiveDownloadJobs() {
 
 	// Existing active downloads reserve slots before queued imports are resumed.
 	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return
+		}
 		current, err := m.queue.RefreshSnapshot(entry)
 		if err != nil {
 			m.logger.Warn().Err(err).Str("infohash", entry.InfoHash).Msg("Failed to refresh active queue entry during restore")
@@ -63,7 +73,20 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		})
 	}
 
+	// Pass 2 re-parses queued NZBs over the network. When the NNTP substrate
+	// has collapsed, ploughing ahead serially converts one outage into
+	// thousands of failed rebuilds — the breaker pauses the loop after
+	// consecutive infrastructure failures and resumes on a healthy canary.
+	canary := m.probeNNTPHealth
+	if m.restoreCanaryTestHook != nil {
+		canary = m.restoreCanaryTestHook
+	}
+	breaker := newRestoreCircuitBreaker(m.logger, canary)
 	for _, entry := range entries {
+		if !breaker.pauseUntilHealthy(ctx) {
+			// Shutdown while paused (or between entries).
+			return
+		}
 		current, err := m.queue.RefreshSnapshot(entry)
 		if err != nil {
 			m.logger.Warn().Err(err).Str("infohash", entry.InfoHash).Msg("Failed to refresh queued entry during restore")
@@ -90,14 +113,19 @@ func (m *Manager) restoreActiveDownloadJobs() {
 					Str("name", entry.Name).
 					Msg("Restore rebuild hit an NNTP infrastructure failure; leaving entry eligible for retry")
 				m.scheduleQueuedNZBRetry(entry, 0)
+				breaker.recordFailure()
 				continue
 			}
+			// Terminal, non-infrastructure outcome: the substrate answered, so
+			// the consecutive-infrastructure chain is broken.
+			breaker.recordSuccess()
 			entry.MarkAsError(err)
 			if updateErr := m.queue.Update(entry); updateErr != nil {
 				m.logger.Debug().Err(updateErr).Str("infohash", entry.InfoHash).Msg("Skipped stale restore error update")
 			}
 			continue
 		}
+		breaker.recordSuccess()
 		if job.DebridTorrent == nil && job.NZBMeta == nil {
 			entry.Status = debridTypes.TorrentStatusQueued
 		}
