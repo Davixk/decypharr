@@ -111,7 +111,10 @@ type Config struct {
 	// PrefetchAhead is the number of segments to prefetch ahead of reads (default: 8).
 	PrefetchAhead int
 
-	// DownloadTimeout is the timeout for a single segment download (default: 60s).
+	// DownloadTimeout is the timeout for a single segment download attempt
+	// (default: 60s). A value <= 0 disables the per-attempt deadline; the
+	// attempt is then bounded only by the caller's context (e.g. the stream
+	// progress deadline) and connection-level idle detection.
 	DownloadTimeout time.Duration
 
 	// MaxRetries is the maximum retry attempts for failed downloads (default: 3).
@@ -190,7 +193,8 @@ func WithPrefetchAhead(n int) Option {
 	}
 }
 
-// WithDownloadTimeout sets the timeout for a single segment download.
+// WithDownloadTimeout sets the timeout for a single segment download attempt.
+// A value <= 0 disables the per-attempt deadline.
 func WithDownloadTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		c.DownloadTimeout = d

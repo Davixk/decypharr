@@ -420,7 +420,16 @@
                                                 <input type="text" class="input w-full" name="usenet.read_timeout"
                                                        id="usenet.read_timeout" placeholder="30s">
                                                 <span class="text-sm opacity-70">Maximum time without streamed data before
-                                                    cancelling provider and queue waits (default: 30s)</span>
+                                                    cancelling provider and queue waits (default: 30s, 0 disables)</span>
+                                            </div>
+                                            <div>
+                                                <label class="label" for="usenet.download_timeout">
+                                                    <span class="font-medium">Segment Download Timeout</span>
+                                                </label>
+                                                <input type="text" class="input w-full" name="usenet.download_timeout"
+                                                       id="usenet.download_timeout" placeholder="60s">
+                                                <span class="text-sm opacity-70">Maximum time for a single segment download
+                                                    attempt (default: 60s, 0 disables)</span>
                                             </div>
                                             <div>
                                                 <label class="label" for="usenet.processing_timeout">

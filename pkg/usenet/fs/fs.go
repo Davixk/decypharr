@@ -32,19 +32,27 @@ type PrefetchableReaderAt interface {
 type FS struct {
 	ctx           context.Context
 	volumes       *xsync.Map[string, *types.Volume]
-	client        *nntp.Client  // Connection client for all readers
-	maxConcurrent int           // Max concurrent connections per reader
-	prefetchSize  int64         // Prefetch size in bytes
-	readTimeout   time.Duration // Maximum time a stream may make no progress
-	logger        zerolog.Logger
+	client        *nntp.Client // Connection client for all readers
+	maxConcurrent int          // Max concurrent connections per reader
+	prefetchSize  int64        // Prefetch size in bytes
+	// downloadTimeout caps a single segment download attempt in the streaming
+	// reader. Only forwarded when downloadTimeoutSet is true; an explicit 0
+	// disables the per-attempt cap.
+	downloadTimeout    time.Duration
+	downloadTimeoutSet bool
+	logger             zerolog.Logger
 }
 
 // Option configures the filesystem
 type Option func(*FS)
 
-func WithReadTimeout(timeout time.Duration) Option {
+// WithDownloadTimeout sets the per-segment download attempt cap forwarded to
+// the streaming reader. 0 disables the cap (attempts remain bounded by the
+// caller's stream progress deadline and connection-level idle detection).
+func WithDownloadTimeout(timeout time.Duration) Option {
 	return func(f *FS) {
-		f.readTimeout = timeout
+		f.downloadTimeout = timeout
+		f.downloadTimeoutSet = true
 	}
 }
 
@@ -102,14 +110,15 @@ func (f *FS) Open(name string) (fs.File, error) {
 	}
 
 	return &File{
-		info:          info,
-		ctx:           f.ctx,
-		manager:       f.client,
-		maxConcurrent: f.maxConcurrent,
-		prefetchSize:  f.prefetchSize,
-		readTimeout:   f.readTimeout,
-		logger:        f.logger,
-		volume:        vol,
+		info:               info,
+		ctx:                f.ctx,
+		manager:            f.client,
+		maxConcurrent:      f.maxConcurrent,
+		prefetchSize:       f.prefetchSize,
+		downloadTimeout:    f.downloadTimeout,
+		downloadTimeoutSet: f.downloadTimeoutSet,
+		logger:             f.logger,
+		volume:             vol,
 	}, nil
 }
 
@@ -214,8 +223,8 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 	readerConfig.MaxConnections = f.maxConcurrent
 	readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(f.prefetchSize, segments)
 	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
-	if f.readTimeout > 0 {
-		readerConfig.DownloadTimeout = f.readTimeout
+	if f.downloadTimeoutSet {
+		readerConfig.DownloadTimeout = f.downloadTimeout
 	}
 
 	// Create the new streaming reader

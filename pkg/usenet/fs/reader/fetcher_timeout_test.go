@@ -58,6 +58,66 @@ func TestFetchTimeoutIncludesLocalSemaphoreWait(t *testing.T) {
 	}
 }
 
+// deadlineProbeClient records whether the operation context carries a deadline
+// and aborts the fetch with context.Canceled so the fetcher takes the simple
+// ReleaseFetching cleanup path on the minimal test cache.
+type deadlineProbeClient struct {
+	hasDeadline bool
+}
+
+func (c *deadlineProbeClient) ExecuteWithFailover(ctx context.Context, _ func(*nntp.Connection) error) error {
+	_, c.hasDeadline = ctx.Deadline()
+	return context.Canceled
+}
+
+// TestDownloadTimeoutDrivesAttemptDeadline proves that the per-attempt
+// deadline comes from Config.DownloadTimeout and that 0 disables it entirely
+// (the attempt then runs on the caller's context alone).
+func TestDownloadTimeoutDrivesAttemptDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		downloadTimeout time.Duration
+		wantDeadline    bool
+	}{
+		{name: "positive timeout sets attempt deadline", downloadTimeout: 5 * time.Second, wantDeadline: true},
+		{name: "zero timeout disables attempt deadline", downloadTimeout: 0, wantDeadline: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			stats := &ReaderStats{}
+			cache := &SegmentCache{
+				segments: []SegmentMeta{{
+					MessageID:   "probe",
+					Number:      1,
+					Bytes:       4,
+					StartOffset: 0,
+					EndOffset:   3,
+				}},
+				segCount: 1,
+				states:   make([]atomic.Uint32, 1),
+				ctx:      ctx,
+				stats:    stats,
+			}
+			client := &deadlineProbeClient{}
+			cfg := DefaultConfig()
+			cfg.MaxConnections = 1
+			cfg.PrefetchAhead = 0
+			cfg.DownloadTimeout = tc.downloadTimeout
+			fetcher := newSegmentFetcher(ctx, client, cache, cfg, stats, zerolog.Nop())
+			defer fetcher.Close()
+
+			if err := fetcher.Fetch(context.Background(), 0); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Fetch error = %v, want context canceled", err)
+			}
+			if client.hasDeadline != tc.wantDeadline {
+				t.Fatalf("attempt context deadline present = %v, want %v", client.hasDeadline, tc.wantDeadline)
+			}
+		})
+	}
+}
+
 func TestValidateSegmentLengthClassifiesShortBodiesAsMissing(t *testing.T) {
 	if err := validateSegmentLength(4, 4); err != nil {
 		t.Fatalf("exact segment length rejected: %v", err)
@@ -243,6 +303,99 @@ func TestLatePrefetchInterestRequeuesCompletedEmptyAttempt(t *testing.T) {
 	}
 }
 
+// TestPrefetchLastScopeDetachLingersForReattach exercises the range-boundary
+// churn fix: when the last interested request context ends, the in-flight
+// prefetch must survive for the linger grace, and a follow-up request that
+// attaches within the grace must inherit the same download instead of paying
+// for a teardown + refetch. Close must still fence a pending linger promptly.
+func TestPrefetchLastScopeDetachLingersForReattach(t *testing.T) {
+	fetcher, _, client := newCancellationTestFetcher(t, 1)
+	// Effectively-infinite grace makes "the linger did not expire" a
+	// deterministic assertion rather than a timing race.
+	prefetchLingerDuration = time.Hour
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	fetcher.QueuePrefetch(firstCtx, 0)
+	waitForTestSignal(t, client.started, "prefetch provider call")
+
+	lingeringJob := func() (*prefetchJob, bool, bool, int) {
+		fetcher.prefetchMu.Lock()
+		defer fetcher.prefetchMu.Unlock()
+		job := fetcher.prefetchJobs[0]
+		if job == nil {
+			return nil, false, false, 0
+		}
+		return job, job.linger != nil, job.ctx.Err() == nil, len(job.scopes)
+	}
+
+	cancelFirst()
+	var jobBeforeReattach *prefetchJob
+	waitForTestCondition(t, "last scope to detach into a linger", func() bool {
+		job, lingering, alive, scopes := lingeringJob()
+		jobBeforeReattach = job
+		return job != nil && lingering && alive && scopes == 0
+	})
+	select {
+	case <-client.stopped:
+		t.Fatal("in-flight prefetch was canceled during the linger grace")
+	default:
+	}
+
+	// A new request scope attaching within the grace must cancel the teardown
+	// and inherit the same in-flight job.
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	fetcher.QueuePrefetch(secondCtx, 0)
+	job, lingering, alive, scopes := lingeringJob()
+	if job == nil || job != jobBeforeReattach || lingering || !alive || scopes != 1 {
+		t.Fatalf("re-attach did not inherit the lingering job: job=%p want=%p lingering=%v alive=%v scopes=%d",
+			job, jobBeforeReattach, lingering, alive, scopes)
+	}
+	if calls := client.calls.Load(); calls != 1 {
+		t.Fatalf("provider calls after linger re-attach = %d, want 1 (no refetch)", calls)
+	}
+
+	// Detach again so a linger is pending, then prove Close does not wait for
+	// the (1 hour) timer and still tears everything down.
+	cancelSecond()
+	waitForTestCondition(t, "second scope to detach into a linger", func() bool {
+		job, lingering, alive, scopes := lingeringJob()
+		return job != nil && lingering && alive && scopes == 0
+	})
+	closeStart := time.Now()
+	fetcher.Close()
+	if elapsed := time.Since(closeStart); elapsed > 5*time.Second {
+		t.Fatalf("Close took %s with a pending linger, want prompt fencing", elapsed)
+	}
+	waitForTestSignal(t, client.stopped, "provider cancellation during Close")
+	fetcher.prefetchMu.Lock()
+	jobs, scopesLeft := len(fetcher.prefetchJobs), len(fetcher.prefetchScopes)
+	fetcher.prefetchMu.Unlock()
+	if jobs != 0 || scopesLeft != 0 {
+		t.Fatalf("state after Close: jobs=%d scopes=%d, want 0/0", jobs, scopesLeft)
+	}
+}
+
+// TestPrefetchLingerExpiryCancelsOrphanedJob proves the linger does not
+// resurrect the zombie problem: with no re-attach, the job dies after the
+// grace exactly as immediate teardown used to.
+func TestPrefetchLingerExpiryCancelsOrphanedJob(t *testing.T) {
+	fetcher, cache, client := newCancellationTestFetcher(t, 1)
+	prefetchLingerDuration = 20 * time.Millisecond
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	fetcher.QueuePrefetch(requestCtx, 0)
+	waitForTestSignal(t, client.started, "prefetch provider call")
+
+	cancelRequest()
+	waitForTestSignal(t, client.stopped, "linger expiry to cancel the orphaned job")
+	waitForTestCondition(t, "linger expiry to release all work", func() bool {
+		return cancellationFetcherIdle(fetcher, cache, client)
+	})
+	if calls := client.calls.Load(); calls != 1 {
+		t.Fatalf("provider calls after linger expiry = %d, want 1", calls)
+	}
+}
+
 type cancellationTestClient struct {
 	calls   atomic.Int32
 	active  atomic.Int32
@@ -291,10 +444,16 @@ func newCancellationTestFetcher(t *testing.T, segmentCount int) (*SegmentFetcher
 	cfg.MaxConnections = 2
 	cfg.PrefetchAhead = segmentCount
 	cfg.DownloadTimeout = 10 * time.Second
+	// These tests assert prompt teardown after scope cancellation; shrink the
+	// production linger grace so they don't stall on it. Individual tests that
+	// exercise the linger override this again.
+	oldLinger := prefetchLingerDuration
+	prefetchLingerDuration = time.Millisecond
 	fetcher := newSegmentFetcher(ctx, client, cache, cfg, stats, zerolog.Nop())
 	t.Cleanup(func() {
 		fetcher.Close()
 		cancel()
+		prefetchLingerDuration = oldLinger
 	})
 	return fetcher, cache, client
 }

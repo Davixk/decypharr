@@ -227,7 +227,8 @@ type Usenet struct {
 	maxConnections           int           // Connections allocated per streaming file
 	processingMaxConnections int           // Connections allocated per file for parsing and NZB downloads
 	prefetchSize             int64         // Streaming prefetch size in bytes
-	readTimeout              time.Duration // Maximum idle time for one stream read
+	readTimeout              time.Duration // Maximum idle time for one stream read (0 = disabled)
+	downloadTimeout          time.Duration // Cap on one segment download attempt (0 = disabled)
 	failedFiles              *xsync.Map[string, error]
 	preparedSizes            *xsync.Map[string, int64]
 
@@ -368,9 +369,15 @@ func New() (*Usenet, error) {
 	if err != nil {
 		prefetchSize = 16 * 1024 * 1024 // Default to 16MB
 	}
-	readTimeout, err := utils.ParseDuration(usenetConfig.ReadTimeout)
-	if err != nil || readTimeout <= 0 {
-		readTimeout = 30 * time.Second
+	readTimeout, err := parseTimeoutSetting(usenetConfig.ReadTimeout, 30*time.Second)
+	if err != nil {
+		_logger.Warn().Err(err).Str("read_timeout", usenetConfig.ReadTimeout).
+			Msg("Invalid usenet read_timeout; using 30s")
+	}
+	downloadTimeout, err := parseTimeoutSetting(usenetConfig.DownloadTimeout, 60*time.Second)
+	if err != nil {
+		_logger.Warn().Err(err).Str("download_timeout", usenetConfig.DownloadTimeout).
+			Msg("Invalid usenet download_timeout; using 60s")
 	}
 
 	u := &Usenet{
@@ -382,6 +389,7 @@ func New() (*Usenet, error) {
 		processingMaxConnections: processingMaxConns,
 		prefetchSize:             prefetchSize,
 		readTimeout:              readTimeout,
+		downloadTimeout:          downloadTimeout,
 		fs:                       xsync.NewMap[string, *fsEntry](),
 		failedFiles:              xsync.NewMap[string, error](),
 		preparedSizes:            xsync.NewMap[string, int64](),
@@ -413,7 +421,7 @@ func (u *Usenet) createEntry(file *storage.NZBFile, generation string) (*fsEntry
 
 	fsCtx := context.Background()
 
-	usenetFS, err := fs.NewFS(fsCtx, u.nntp, u.maxConnections, u.prefetchSize, volumes, u.logger, fs.WithReadTimeout(u.readTimeout))
+	usenetFS, err := fs.NewFS(fsCtx, u.nntp, u.maxConnections, u.prefetchSize, volumes, u.logger, fs.WithDownloadTimeout(u.downloadTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create usenet FS: %w", err)
 	}

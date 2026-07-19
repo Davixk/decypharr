@@ -184,6 +184,14 @@ func (d *pureGoYencDecoder) processLine(line []byte) (bool, error) {
 		}
 	}
 
+	// After =yend the only meaningful token is NNTP's bare "." terminator,
+	// handled above. Drain everything else without interpretation: a stray
+	// control-looking line (e.g. "=ybegin ...") between =yend and the dot must
+	// not clobber the already-parsed Meta.
+	if d.sawEnd {
+		return false, nil
+	}
+
 	switch {
 	case bytes.HasPrefix(line, []byte("=ybegin ")):
 		d.sawBegin = true
@@ -202,9 +210,6 @@ func (d *pureGoYencDecoder) processLine(line []byte) (bool, error) {
 	}
 
 	if !d.sawBegin {
-		return false, nil
-	}
-	if d.sawEnd {
 		return false, nil
 	}
 
