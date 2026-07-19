@@ -74,6 +74,22 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		}
 	}
 
+	// Orphaned post-download claim reconciler. A claimed action whose goroutine
+	// died leaves the entry invisible to the scheduler (IsDownloading) with no
+	// recovery path other than a restart; this resubmits such claims through
+	// the action gate at runtime.
+	if jd, err := utils.ConvertToJobDef("1m"); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to convert orphaned claim reconciler interval to job definition")
+	} else {
+		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
+			m.reconcileOrphanedClaims()
+		}), gocron.WithContext(ctx), gocron.WithName("orphaned-claim-reconciler")); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to create orphaned claim reconciler job")
+		} else {
+			m.logger.Debug().Msg("Orphaned claim reconciler job scheduled for every 1m")
+		}
+	}
+
 	// NZB refresh job for pending archives (every 5 minutes)
 	if m.usenet != nil {
 		if jd, err := utils.ConvertToJobDef("10m"); err != nil {

@@ -92,18 +92,28 @@ func addActionLifecycleEntry(t *testing.T, m *Manager, infohash string) *storage
 }
 
 // markClaimed flips the queue row into the durable post-download claim shape
-// (Status downloaded + IsDownloading true) with the given UpdatedAt.
-func markClaimed(t *testing.T, m *Manager, infohash string, updatedAt time.Time) {
+// (Status downloaded + IsDownloading true). The storage layer stamps
+// UpdatedAt on every queue write, so tests that need a "stale" claim shrink
+// orphanedClaimGrace instead of backdating the row.
+func markClaimed(t *testing.T, m *Manager, infohash string) {
 	t.Helper()
 	if _, err := m.queue.Mutate(infohash, func(current *storage.Entry) bool {
 		current.State = storage.EntryStateDownloading
 		current.Status = debridTypes.TorrentStatusDownloaded
 		current.IsDownloading = true
-		current.UpdatedAt = updatedAt
 		return true
 	}); err != nil {
 		t.Fatalf("mark claimed(%s): %v", infohash, err)
 	}
+}
+
+// shrinkOrphanGrace temporarily lowers the reconciler grace window so tests
+// can age claims in milliseconds.
+func shrinkOrphanGrace(t *testing.T, grace time.Duration) {
+	t.Helper()
+	previous := orphanedClaimGrace
+	orphanedClaimGrace = grace
+	t.Cleanup(func() { orphanedClaimGrace = previous })
 }
 
 // TestWorkerSlotFreesOnceActionClaimed pins fix 1: a single-worker job queue
@@ -142,7 +152,7 @@ func TestWorkerSlotFreesOnceActionClaimed(t *testing.T) {
 	// Durably claim the post-download action. The parked worker must observe
 	// the claim on its next refresh and free the slot while the entry is still
 	// non-terminal (State stays "downloading" for the whole action).
-	markClaimed(t, m, entry.InfoHash, time.Now())
+	markClaimed(t, m, entry.InfoHash)
 
 	select {
 	case <-secondStarted:
@@ -235,7 +245,7 @@ func TestActionGateBoundsConcurrentClaimedActions(t *testing.T) {
 func TestResumeActionDetachesFromWorkerAndWaitsOnGate(t *testing.T) {
 	m := newActionLifecycleFixture(t, 1)
 	entry := addActionLifecycleEntry(t, m, "resume-detach-entry")
-	markClaimed(t, m, entry.InfoHash, time.Now())
+	markClaimed(t, m, entry.InfoHash)
 	snapshot, err := m.queue.GetTorrent(entry.InfoHash)
 	if err != nil {
 		t.Fatalf("GetTorrent claimed snapshot: %v", err)
@@ -287,5 +297,119 @@ func TestResumeActionDetachesFromWorkerAndWaitsOnGate(t *testing.T) {
 	case <-actionRan:
 	case <-time.After(3 * time.Second):
 		t.Fatal("resumed action did not run after the gate slot freed")
+	}
+}
+
+// TestReconcilerResubmitsOrphanedClaimAndCompletes pins fix 3: a durably
+// claimed entry with no live action lease, no in-process registration, and a
+// stale UpdatedAt is resubmitted through the action gate and runs the real
+// post-download action to completion (Action "none": complete + dequeue).
+func TestReconcilerResubmitsOrphanedClaimAndCompletes(t *testing.T) {
+	m := newActionLifecycleFixture(t, 2)
+	shrinkOrphanGrace(t, 50*time.Millisecond)
+	entry := addActionLifecycleEntry(t, m, "orphaned-claim-entry")
+	markClaimed(t, m, entry.InfoHash)
+	time.Sleep(100 * time.Millisecond) // age the claim past the grace window
+
+	m.reconcileOrphanedClaims()
+
+	// The resumed action completes the entry and (Action none) removes the
+	// queue row; the persisted main row proves the action really ran.
+	deadline := time.Now().Add(5 * time.Second)
+	for m.storage.QueueExists(entry.InfoHash) {
+		if time.Now().After(deadline) {
+			queued, _ := m.queue.GetTorrent(entry.InfoHash)
+			t.Fatalf("orphaned claim was not reconciled to completion; row=%+v", queued)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	main, err := m.storage.Get(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("completed main entry missing after reconciled action: %v", err)
+	}
+	if main.InfoHash != entry.InfoHash {
+		t.Fatalf("unexpected main entry: %q", main.InfoHash)
+	}
+	// The in-process registration must clear once the action returns.
+	deadline = time.Now().Add(2 * time.Second)
+	for m.isActionInflight(entry.InfoHash) {
+		if time.Now().After(deadline) {
+			t.Fatal("reconciled action left its in-flight registration behind")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestReconcilerSkipsLiveAndFreshClaims pins the negative space of fix 3:
+// claims with a live action lease, claims registered in-process (waiting on
+// the gate), and freshly claimed entries are never resubmitted.
+func TestReconcilerSkipsLiveAndFreshClaims(t *testing.T) {
+	m := newActionLifecycleFixture(t, 2)
+	// Storage serializes UpdatedAt at second precision, so the grace window
+	// must stay comfortably above 1s for the "fresh claim" to be observable.
+	shrinkOrphanGrace(t, 3*time.Second)
+
+	var runsMu sync.Mutex
+	var ranHashes []string
+	m.claimedActionTestHook = func(entry *storage.Entry) {
+		runsMu.Lock()
+		defer runsMu.Unlock()
+		ranHashes = append(ranHashes, entry.InfoHash)
+	}
+
+	// Entry A: claimed and (soon) stale, but a live action lease exists.
+	leased := addActionLifecycleEntry(t, m, "leased-claim-entry")
+	markClaimed(t, m, leased.InfoHash)
+	leasedSnapshot, err := m.queue.GetTorrent(leased.InfoHash)
+	if err != nil {
+		t.Fatalf("GetTorrent leased: %v", err)
+	}
+	_, release, err := m.queue.BeginAction(context.Background(), leasedSnapshot)
+	if err != nil {
+		t.Fatalf("BeginAction leased: %v", err)
+	}
+	defer release()
+	if !m.queue.HasActionLease(leased.InfoHash) {
+		t.Fatal("HasActionLease = false for a held lease")
+	}
+
+	// Entry B: claimed and (soon) stale, but registered in-process (gate wait).
+	inflight := addActionLifecycleEntry(t, m, "inflight-claim-entry")
+	markClaimed(t, m, inflight.InfoHash)
+	if !m.beginActionInflight(inflight.InfoHash) {
+		t.Fatal("could not pre-register in-flight action")
+	}
+	defer m.endActionInflight(inflight.InfoHash)
+
+	// Age A and B past the grace window; the lease (A) and the in-process
+	// registration (B) are then the only things protecting them.
+	time.Sleep(4200 * time.Millisecond)
+
+	// Entry C: claimed just now, still inside the grace window.
+	fresh := addActionLifecycleEntry(t, m, "fresh-claim-entry")
+	markClaimed(t, m, fresh.InfoHash)
+
+	m.reconcileOrphanedClaims()
+	time.Sleep(300 * time.Millisecond)
+
+	runsMu.Lock()
+	ran := append([]string(nil), ranHashes...)
+	runsMu.Unlock()
+	if len(ran) != 0 {
+		t.Fatalf("reconciler resubmitted protected claims %v, want none", ran)
+	}
+	for _, hash := range []string{leased.InfoHash, fresh.InfoHash} {
+		if m.isActionInflight(hash) {
+			t.Fatalf("reconciler registered a resume for protected claim %s", hash)
+		}
+	}
+	for _, hash := range []string{leased.InfoHash, inflight.InfoHash, fresh.InfoHash} {
+		queued, err := m.queue.GetTorrent(hash)
+		if err != nil {
+			t.Fatalf("GetTorrent(%s): %v", hash, err)
+		}
+		if queued.Status != debridTypes.TorrentStatusDownloaded || !queued.IsDownloading {
+			t.Fatalf("protected claim %s was mutated: status=%s downloading=%t", hash, queued.Status, queued.IsDownloading)
+		}
 	}
 }
