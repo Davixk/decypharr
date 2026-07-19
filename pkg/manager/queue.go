@@ -432,6 +432,13 @@ func (q *Queue) mutateTerminalLocked(infohash string, update func(*storage.Entry
 	return updated, true, nil
 }
 
+// queueActionJoinTimeout bounds how long a deletion waits for an in-flight
+// worker to observe cancellation before proceeding without it. Deletion paths
+// run synchronously inside HTTP handlers (arr/WebUI DELETE), so an unbounded
+// join lets any worker that ignores its context hang the request forever.
+// Overridable in tests.
+var queueActionJoinTimeout = 30 * time.Second
+
 func (q *Queue) cancelAndWaitAction(infohash string, expected *storage.Entry) {
 	key := strings.ToLower(infohash)
 	q.actionMu.Lock()
@@ -443,9 +450,30 @@ func (q *Queue) cancelAndWaitAction(infohash string, expected *storage.Entry) {
 		lease.cancel()
 	}
 	q.actionMu.Unlock()
-	if lease != nil {
-		q.runLifecycleTestHook("action-wait-started")
-		<-lease.done
+	if lease == nil {
+		return
+	}
+	q.runLifecycleTestHook("action-wait-started")
+	timer := time.NewTimer(queueActionJoinTimeout)
+	defer timer.Stop()
+	select {
+	case <-lease.done:
+	case <-timer.C:
+		// The worker did not exit after cancellation. Proceed with the delete:
+		// its queue row is already gone (or replaced), so every straggler write
+		// fails the generation fence (ErrStaleEntryGeneration/ErrEntryNotFound)
+		// and cannot resurrect state. Drop the stale lease from the table so a
+		// same-hash replacement can begin its own action; the straggler's own
+		// release still closes the lease exactly once.
+		q.logger.Error().
+			Str("infohash", key).
+			Dur("timeout", queueActionJoinTimeout).
+			Msg("Queued action ignored cancellation; proceeding with deletion without joining the worker")
+		q.actionMu.Lock()
+		if q.actionLeases[key] == lease {
+			delete(q.actionLeases, key)
+		}
+		q.actionMu.Unlock()
 	}
 }
 

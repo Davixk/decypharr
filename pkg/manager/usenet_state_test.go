@@ -125,6 +125,124 @@ func TestEnsureNZBGenerationCoversLegacyCrashStates(t *testing.T) {
 	})
 }
 
+// TestDeleteEntryAdoptsLegacyBlankNZBGeneration covers entries migrated from
+// pre-generation releases: their main rows carry no NZBGeneration and their
+// metadata files carry no generation either. A WebUI-style delete (placement
+// removal included) must succeed and must not orphan the NZB metadata.
+func TestDeleteEntryAdoptsLegacyBlankNZBGeneration(t *testing.T) {
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	cfg := config.Get()
+	previousUsenet := cfg.Usenet
+	cfg.Usenet.Providers = []config.UsenetProvider{{Host: "127.0.0.1", Port: 119, MaxConnections: 1}}
+	t.Cleanup(func() { cfg.Usenet = previousUsenet })
+
+	const id = "legacy-delete-blank-generation"
+	metaDir := filepath.Join(config.GetMainPath(), "usenet", "meta")
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatalf("create metadata dir: %v", err)
+	}
+	legacyBlob, err := proto.Marshal(&usenet.NZBProto{Id: id, Name: "legacy.nzb", Status: usenet.NZBStatusCompleted})
+	if err != nil {
+		t.Fatalf("marshal legacy metadata: %v", err)
+	}
+	metaPath := filepath.Join(metaDir, id+".meta")
+	if err := os.WriteFile(metaPath, legacyBlob, 0o644); err != nil {
+		t.Fatalf("write legacy metadata: %v", err)
+	}
+
+	u, err := usenet.New()
+	if err != nil {
+		t.Fatalf("usenet.New: %v", err)
+	}
+	t.Cleanup(func() { _ = u.Close() })
+	store, err := storage.NewStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	queue := newQueue(store, "")
+	m := &Manager{storage: store, queue: queue, usenet: u}
+
+	entry := &storage.Entry{
+		Protocol:       config.ProtocolNZB,
+		InfoHash:       id,
+		Name:           "legacy.nzb",
+		ActiveProvider: "usenet",
+		Providers: map[string]*storage.ProviderEntry{
+			"usenet": {Provider: "usenet", ID: id, Status: debridTypes.TorrentStatusDownloaded},
+		},
+		Files: map[string]*storage.File{
+			"movie.mkv": {Name: "movie.mkv", Size: 10, InfoHash: id},
+		},
+	}
+	if err := store.AddOrUpdate(entry); err != nil {
+		t.Fatalf("AddOrUpdate legacy entry: %v", err)
+	}
+
+	if err := m.DeleteEntry(id, true); err != nil {
+		t.Fatalf("WebUI-style delete of legacy blank-generation entry: %v", err)
+	}
+	if _, err := store.Get(id); err == nil {
+		t.Fatal("main row survived the legacy delete")
+	}
+	if _, err := u.GetNZBHeader(id); !errors.Is(err, usenet.ErrNZBNotFound) {
+		t.Fatalf("GetNZBHeader after delete = %v, want ErrNZBNotFound (no orphaned metadata)", err)
+	}
+	if _, statErr := os.Stat(metaPath); !os.IsNotExist(statErr) {
+		t.Fatalf("legacy metadata file still on disk after delete: stat=%v", statErr)
+	}
+}
+
+// TestDeleteEntryLegacyNZBIsIdempotentWhenMetadataAlreadyGone ensures a
+// retried legacy delete (metadata removed by an earlier partial attempt) still
+// succeeds instead of failing the whole deletion.
+func TestDeleteEntryLegacyNZBIsIdempotentWhenMetadataAlreadyGone(t *testing.T) {
+	config.Reset()
+	config.SetConfigPath(t.TempDir())
+	t.Cleanup(config.Reset)
+	cfg := config.Get()
+	previousUsenet := cfg.Usenet
+	cfg.Usenet.Providers = []config.UsenetProvider{{Host: "127.0.0.1", Port: 119, MaxConnections: 1}}
+	t.Cleanup(func() { cfg.Usenet = previousUsenet })
+
+	u, err := usenet.New()
+	if err != nil {
+		t.Fatalf("usenet.New: %v", err)
+	}
+	t.Cleanup(func() { _ = u.Close() })
+	store, err := storage.NewStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	m := &Manager{storage: store, queue: newQueue(store, ""), usenet: u}
+
+	const id = "legacy-delete-missing-metadata"
+	entry := &storage.Entry{
+		Protocol:       config.ProtocolNZB,
+		InfoHash:       id,
+		Name:           "legacy.nzb",
+		ActiveProvider: "usenet",
+		Providers: map[string]*storage.ProviderEntry{
+			"usenet": {Provider: "usenet", ID: id, Status: debridTypes.TorrentStatusDownloaded},
+		},
+		Files: map[string]*storage.File{
+			"movie.mkv": {Name: "movie.mkv", Size: 10, InfoHash: id},
+		},
+	}
+	if err := store.AddOrUpdate(entry); err != nil {
+		t.Fatalf("AddOrUpdate legacy entry: %v", err)
+	}
+	if err := m.DeleteEntry(id, true); err != nil {
+		t.Fatalf("legacy delete without metadata: %v", err)
+	}
+	if _, err := store.Get(id); err == nil {
+		t.Fatal("main row survived the legacy delete")
+	}
+}
+
 func TestProcessNZBRejectsStaleMetadataBeforeMutation(t *testing.T) {
 	entry := &storage.Entry{
 		Protocol:      config.ProtocolNZB,

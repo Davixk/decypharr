@@ -148,25 +148,40 @@ func NewStorage(dbPath string) (*Storage, error) {
 		dir:         dbPath,
 		logger:      log,
 	}
-	if count, err := s.MigrateStoreVersions(); err != nil {
+	// Startup migrations distinguish two failure classes. Per-row corruption
+	// (a record that no longer decodes) is logged and skipped inside each pass
+	// so one bad row in real legacy state cannot prevent the container from
+	// booting; only store-level I/O failures abort startup.
+	// The version scan reads every row of both entry stores, so its skip count
+	// is the authoritative number of corrupt rows (later passes revisit the
+	// same rows and must not double-count them).
+	corruptRows := 0
+	if count, skipped, err := s.MigrateStoreVersions(); err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("failed to migrate entry store versions: %w", err)
-	} else if count > 0 {
-		log.Info().Int("count", count).Msg("Assigned exact versions to legacy entry rows")
+	} else {
+		corruptRows = skipped
+		if count > 0 {
+			log.Info().Int("count", count).Msg("Assigned exact versions to legacy entry rows")
+		}
 	}
 
-	if count, err := s.MigrateMetadata(); err != nil {
+	if count, _, err := s.MigrateMetadata(); err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("failed to migrate entry metadata: %w", err)
 	} else if count > 0 {
 		log.Info().Int("count", count).Msg("Migrated entry metadata to new format")
 	}
 
-	if count, err := s.reconcileEntryItemsAtStartup(); err != nil {
+	if count, _, err := s.reconcileEntryItemsAtStartup(); err != nil {
 		_ = s.Close()
 		return nil, fmt.Errorf("failed to reconcile derived entry items: %w", err)
 	} else if count > 0 {
 		log.Info().Int("count", count).Msg("Rebuilt derived entry items from authoritative entries")
+	}
+
+	if corruptRows > 0 {
+		log.Warn().Int("count", corruptRows).Msg("Corrupt rows skipped during startup; the affected entries are unavailable but startup continued")
 	}
 
 	return s, nil
@@ -254,6 +269,6 @@ func (s *Storage) copyFrom(other *Storage) error {
 			return fmt.Errorf("failed to copy %s: %w", p.name, err)
 		}
 	}
-	_, err := s.MigrateStoreVersions()
+	_, _, err := s.MigrateStoreVersions()
 	return err
 }

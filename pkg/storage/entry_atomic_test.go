@@ -2,7 +2,6 @@ package storage
 
 import (
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -11,7 +10,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestNewStorageRejectsCorruptVersionRows(t *testing.T) {
+// TestNewStorageToleratesCorruptRowsAtStartup replaces the old abort-on-corrupt
+// test: production NAS state can contain a single undecodable v2.3-era row, and
+// startup must skip that row (logging it) instead of refusing to boot.
+func TestNewStorageToleratesCorruptRowsAtStartup(t *testing.T) {
 	for _, storeName := range []string{"main", "queue"} {
 		t.Run(storeName, func(t *testing.T) {
 			config.SetConfigPath(t.TempDir())
@@ -19,6 +21,13 @@ func TestNewStorageRejectsCorruptVersionRows(t *testing.T) {
 			store, err := NewStorage(dbPath)
 			if err != nil {
 				t.Fatalf("NewStorage: %v", err)
+			}
+			valid := atomicTestEntry()
+			if err := store.AddOrUpdate(valid); err != nil {
+				t.Fatalf("AddOrUpdate valid row: %v", err)
+			}
+			if err := store.AddQueue(valid); err != nil {
+				t.Fatalf("AddQueue valid row: %v", err)
 			}
 			key := "corrupt-" + storeName
 			target := store.entries
@@ -33,12 +42,30 @@ func TestNewStorageRejectsCorruptVersionRows(t *testing.T) {
 			}
 
 			reopened, err := NewStorage(dbPath)
-			if reopened != nil {
-				_ = reopened.Close()
-				t.Fatal("NewStorage returned a store containing a corrupt row")
+			if err != nil {
+				t.Fatalf("NewStorage aborted on a single corrupt %s row: %v", storeName, err)
 			}
-			if err == nil || !strings.Contains(err.Error(), storeName) || !strings.Contains(err.Error(), key) {
-				t.Fatalf("NewStorage error = %v, want store and key context", err)
+			t.Cleanup(func() { _ = reopened.Close() })
+
+			if _, err := reopened.Get(valid.InfoHash); err != nil {
+				t.Fatalf("valid main row unavailable after reopen: %v", err)
+			}
+			if _, err := reopened.GetQueued(valid.InfoHash); err != nil {
+				t.Fatalf("valid queue row unavailable after reopen: %v", err)
+			}
+			entries, err := reopened.List(nil)
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if len(entries) != 1 || entries[0].InfoHash != valid.InfoHash {
+				t.Fatalf("List returned %d entries, want only the valid row", len(entries))
+			}
+			item, err := reopened.GetEntryItem(valid.GetFolder())
+			if err != nil {
+				t.Fatalf("GetEntryItem after tolerant startup: %v", err)
+			}
+			if file := item.Files["movie.mkv"]; file == nil || file.InfoHash != valid.InfoHash {
+				t.Fatalf("folder projection lost the valid row: %+v", item.Files)
 			}
 		})
 	}
@@ -262,15 +289,46 @@ func TestStartupReconcilesMissingAndCorruptModernEntryItems(t *testing.T) {
 	}
 }
 
-func TestAuthoritativeIterationReportsRuntimeCorruption(t *testing.T) {
-	store, _ := newAtomicMutationTestStorage(t)
+// TestAuthoritativeIterationSkipsCorruptRows replaces the old error-on-corrupt
+// assertion: one undecodable row must cost exactly that row, not black-hole
+// GetTorrents/listings for every healthy entry.
+func TestAuthoritativeIterationSkipsCorruptRows(t *testing.T) {
+	store, entry := newAtomicMutationTestStorage(t)
 	const key = "runtime-corrupt-main"
 	if err := store.entries.Put(key, []byte{0xff, 0x80, 0xff}, nil); err != nil {
 		t.Fatalf("insert corrupt row: %v", err)
 	}
-	err := store.ForEach(func(*Entry) error { return nil })
-	if err == nil || !strings.Contains(err.Error(), key) {
-		t.Fatalf("ForEach error = %v, want corrupt key context", err)
+	var visited []string
+	if err := store.ForEach(func(e *Entry) error {
+		visited = append(visited, e.InfoHash)
+		return nil
+	}); err != nil {
+		t.Fatalf("ForEach with corrupt row: %v", err)
+	}
+	if len(visited) != 1 || visited[0] != entry.InfoHash {
+		t.Fatalf("ForEach visited %v, want only %q", visited, entry.InfoHash)
+	}
+	entries, err := store.List(nil)
+	if err != nil {
+		t.Fatalf("List with corrupt row: %v", err)
+	}
+	if len(entries) != 1 || entries[0].InfoHash != entry.InfoHash {
+		t.Fatalf("List returned %d entries, want the single valid row", len(entries))
+	}
+	var batched []string
+	if err := store.ForEachBatch(10, func(batch []*Entry) error {
+		for _, e := range batch {
+			batched = append(batched, e.InfoHash)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("ForEachBatch with corrupt row: %v", err)
+	}
+	if len(batched) != 1 || batched[0] != entry.InfoHash {
+		t.Fatalf("ForEachBatch visited %v, want only %q", batched, entry.InfoHash)
+	}
+	if _, err := store.Get(key); err == nil {
+		t.Fatal("per-key read of the corrupt row unexpectedly succeeded")
 	}
 }
 
@@ -483,10 +541,10 @@ func TestLegacyRowsAreVersionedBeforeSnapshotsEscape(t *testing.T) {
 		t.Fatalf("insert legacy queue: %v", err)
 	}
 
-	if _, err := store.MigrateStoreVersions(); err != nil {
+	if _, _, err := store.MigrateStoreVersions(); err != nil {
 		t.Fatalf("MigrateStoreVersions: %v", err)
 	}
-	if _, err := store.MigrateMetadata(); err != nil {
+	if _, _, err := store.MigrateMetadata(); err != nil {
 		t.Fatalf("MigrateMetadata: %v", err)
 	}
 	mainEntry, err := store.Get(legacy.InfoHash)
@@ -593,6 +651,43 @@ func TestKeyedLockPoolReleasesInactiveKeys(t *testing.T) {
 	defer pool.mu.Unlock()
 	if len(pool.locks) != 0 {
 		t.Fatalf("inactive lock keys retained: %d", len(pool.locks))
+	}
+}
+
+// TestDeleteIfCurrentWithCleanupRetainsRowWhenCleanupFails pins the recoverable
+// main-row delete ordering: failure-prone cleanup runs first, so a failure
+// leaves the authoritative row (and its folder projection) intact and the
+// delete retryable, instead of orphaning external metadata behind a 500.
+func TestDeleteIfCurrentWithCleanupRetainsRowWhenCleanupFails(t *testing.T) {
+	store, entry := newAtomicMutationTestStorage(t)
+	snapshot, err := store.Get(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("Get snapshot: %v", err)
+	}
+	cleanupErr := errors.New("provider cleanup failed")
+	deleted, err := store.DeleteIfCurrentWithCleanup(snapshot, func(current *Entry) error {
+		if current == nil || current.InfoHash != entry.InfoHash {
+			t.Fatalf("cleanup received wrong entry: %+v", current)
+		}
+		return cleanupErr
+	})
+	if deleted || !errors.Is(err, cleanupErr) {
+		t.Fatalf("DeleteIfCurrentWithCleanup = (deleted=%v, err=%v), want retained row and cleanup failure", deleted, err)
+	}
+	if _, err := store.Get(entry.InfoHash); err != nil {
+		t.Fatalf("main row disappeared after failed cleanup: %v", err)
+	}
+	if _, err := store.GetEntryItem(entry.GetFolder()); err != nil {
+		t.Fatalf("folder projection disappeared after failed cleanup: %v", err)
+	}
+
+	// The same snapshot stays valid for a retry once cleanup succeeds.
+	deleted, err = store.DeleteIfCurrentWithCleanup(snapshot, func(*Entry) error { return nil })
+	if err != nil || !deleted {
+		t.Fatalf("retried delete = (deleted=%v, err=%v), want success", deleted, err)
+	}
+	if _, err := store.Get(entry.InfoHash); err == nil {
+		t.Fatal("main row survived successful delete")
 	}
 }
 

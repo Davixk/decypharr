@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -116,7 +117,7 @@ func TestStreamHTTPURLTranslatesBackingRangesAndPreservesClientSemantics(t *test
 			var body bytes.Buffer
 			var meta StreamMetadata
 			readyCalled := false
-			err := m.streamHTTPURL(context.Background(), server.URL, tc.file, tc.file.Name, tc.start, tc.end, tc.rangeRequested, &body, func(got *StreamMetadata) error {
+			err := m.streamHTTPURL(context.Background(), server.URL, "test-provider", tc.file, tc.file.Name, tc.start, tc.end, tc.rangeRequested, &body, func(got *StreamMetadata) error {
 				readyCalled = true
 				meta = *got
 				meta.Header = got.Header.Clone()
@@ -150,10 +151,112 @@ func TestStreamHTTPURLTranslatesBackingRangesAndPreservesClientSemantics(t *test
 	}
 }
 
-func TestStreamHTTPURLRejectsUpstreamThatIgnoresRangeBeforeReady(t *testing.T) {
-	seenRange := make(chan string, 1)
+// TestStreamHTTPURLToleratesUpstreamIgnoringRange replaces the old
+// reject-on-200 test: upstreams that answer a Range request with 200 OK were
+// tolerated before the response validation rework and must keep streaming.
+// The requested window is reached by discarding the full-body prefix.
+func TestStreamHTTPURLToleratesUpstreamIgnoringRange(t *testing.T) {
+	source := []byte("0123456789")
+	tests := []struct {
+		name             string
+		file             *storage.File
+		start            int64
+		end              int64
+		rangeRequested   bool
+		wantRange        string
+		wantBody         string
+		wantStatus       int
+		wantContentRange string
+	}{
+		{
+			name:      "stored byte range with zero client offset",
+			file:      &storage.File{Name: "inside.mkv", Size: 4, ByteRange: &[2]int64{3, 6}},
+			start:     0,
+			end:       3,
+			wantRange: "bytes=3-6",
+			wantBody:  "3456",
+			// The client sent no Range header, so the response stays 200.
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:             "client range with non-zero offset",
+			file:             &storage.File{Name: "plain.mkv", Size: 10},
+			start:            2,
+			end:              4,
+			rangeRequested:   true,
+			wantRange:        "bytes=2-4",
+			wantBody:         "234",
+			wantStatus:       http.StatusPartialContent,
+			wantContentRange: "bytes 2-4/10",
+		},
+		{
+			name:           "client range starting at zero",
+			file:           &storage.File{Name: "plain.mkv", Size: 10},
+			start:          0,
+			end:            3,
+			rangeRequested: true,
+			wantRange:      "bytes=0-3",
+			wantBody:       "0123",
+			wantStatus:     http.StatusPartialContent,
+			// Served from the full-body stream, stopped at the range length.
+			wantContentRange: "bytes 0-3/10",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			seenRange := make(chan string, 4)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenRange <- r.Header.Get("Range")
+				// Ignore any Range header and always send the full body.
+				w.Header().Set("Content-Length", strconv.Itoa(len(source)))
+				_, _ = w.Write(source)
+			}))
+			t.Cleanup(server.Close)
+
+			m := &Manager{streamClient: server.Client(), config: &config.Config{}}
+			var body bytes.Buffer
+			var meta StreamMetadata
+			readyCalled := false
+			err := m.streamHTTPURL(context.Background(), server.URL, "tolerant-provider", tc.file, tc.file.Name, tc.start, tc.end, tc.rangeRequested, &body, func(got *StreamMetadata) error {
+				readyCalled = true
+				meta = *got
+				meta.Header = got.Header.Clone()
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("streamHTTPURL: %v", err)
+			}
+			if !readyCalled {
+				t.Fatal("ready callback was not called")
+			}
+			if got := <-seenRange; got != tc.wantRange {
+				t.Fatalf("upstream Range = %q, want %q", got, tc.wantRange)
+			}
+			if got := body.String(); got != tc.wantBody {
+				t.Fatalf("body = %q, want %q", got, tc.wantBody)
+			}
+			if meta.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", meta.StatusCode, tc.wantStatus)
+			}
+			if got := meta.Header.Get("Content-Range"); got != tc.wantContentRange {
+				t.Fatalf("downstream Content-Range = %q, want %q", got, tc.wantContentRange)
+			}
+			if meta.ContentLength != int64(len(tc.wantBody)) {
+				t.Fatalf("content length = %d, want %d", meta.ContentLength, len(tc.wantBody))
+			}
+		})
+	}
+}
+
+func TestStreamHTTPURLRetriesOnceThenFailsWhenIgnoredRangeOffsetTooLarge(t *testing.T) {
+	previous := streamRangeIgnoredMaxDiscard
+	streamRangeIgnoredMaxDiscard = 2
+	t.Cleanup(func() { streamRangeIgnoredMaxDiscard = previous })
+
+	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenRange <- r.Header.Get("Range")
+		requests.Add(1)
 		w.Header().Set("Content-Length", "10")
 		_, _ = w.Write([]byte("0123456789"))
 	}))
@@ -163,21 +266,96 @@ func TestStreamHTTPURLRejectsUpstreamThatIgnoresRangeBeforeReady(t *testing.T) {
 	file := &storage.File{Name: "inside.mkv", Size: 4, ByteRange: &[2]int64{3, 6}}
 	var body bytes.Buffer
 	readyCalled := false
-	err := m.streamHTTPURL(context.Background(), server.URL, file, file.Name, 0, 3, false, &body, func(*StreamMetadata) error {
+	err := m.streamHTTPURL(context.Background(), server.URL, "stubborn-provider", file, file.Name, 0, 3, false, &body, func(*StreamMetadata) error {
 		readyCalled = true
 		return nil
 	})
 	if err == nil || !strings.Contains(err.Error(), "ignored requested byte range") {
 		t.Fatalf("stream error = %v, want ignored-range error", err)
 	}
-	if got := <-seenRange; got != "bytes=3-6" {
-		t.Fatalf("upstream Range = %q, want bytes=3-6", got)
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("upstream requests = %d, want exactly one retry (2 total)", got)
 	}
 	if readyCalled {
 		t.Fatal("ready callback ran before ignored range was rejected")
 	}
 	if body.Len() != 0 {
 		t.Fatalf("wrote %d bytes before rejecting ignored range", body.Len())
+	}
+}
+
+func TestStreamHTTPURLRetryAfterIgnoredRangeSucceeds(t *testing.T) {
+	previous := streamRangeIgnoredMaxDiscard
+	streamRangeIgnoredMaxDiscard = 2
+	t.Cleanup(func() { streamRangeIgnoredMaxDiscard = previous })
+
+	source := []byte("0123456789")
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			// First attempt ignores the Range header entirely.
+			w.Header().Set("Content-Length", strconv.Itoa(len(source)))
+			_, _ = w.Write(source)
+			return
+		}
+		body := source[3:7]
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.Header().Set("Content-Range", buildContentRange(3, 6, int64(len(source))))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+
+	m := &Manager{streamClient: server.Client(), config: &config.Config{}}
+	file := &storage.File{Name: "inside.mkv", Size: 4, ByteRange: &[2]int64{3, 6}}
+	var body bytes.Buffer
+	err := m.streamHTTPURL(context.Background(), server.URL, "flaky-provider", file, file.Name, 0, 3, false, &body, nil)
+	if err != nil {
+		t.Fatalf("streamHTTPURL: %v", err)
+	}
+	if got := body.String(); got != "3456" {
+		t.Fatalf("body = %q, want %q", got, "3456")
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("upstream requests = %d, want 2", got)
+	}
+}
+
+// TestStreamHTTPURLToleratesInexactContentRange ensures a mislabeled but
+// otherwise coherent 206 keeps streaming (the pre-validation code never parsed
+// Content-Range at all).
+func TestStreamHTTPURLToleratesInexactContentRange(t *testing.T) {
+	source := []byte("0123456789")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := source[2:5]
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		// Off-by-one Content-Range that some CDNs emit.
+		w.Header().Set("Content-Range", buildContentRange(1, 3, int64(len(source))))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+
+	m := &Manager{streamClient: server.Client(), config: &config.Config{}}
+	file := &storage.File{Name: "plain.mkv", Size: 10}
+	var body bytes.Buffer
+	var meta StreamMetadata
+	err := m.streamHTTPURL(context.Background(), server.URL, "sloppy-provider", file, file.Name, 2, 4, true, &body, func(got *StreamMetadata) error {
+		meta = *got
+		meta.Header = got.Header.Clone()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("streamHTTPURL: %v", err)
+	}
+	if got := body.String(); got != "234" {
+		t.Fatalf("body = %q, want %q", got, "234")
+	}
+	if meta.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", meta.StatusCode)
+	}
+	if got := meta.Header.Get("Content-Range"); got != "bytes 2-4/10" {
+		t.Fatalf("downstream Content-Range = %q, want the requested logical range", got)
 	}
 }
 
