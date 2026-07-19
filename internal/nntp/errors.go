@@ -212,6 +212,40 @@ func classifyNNTPError(code int, message string) *Error {
 	}
 }
 
+// connPoolableAfterError reports whether a connection whose operation failed
+// with err is known to sit at a protocol boundary and may safely return to the
+// pool. Status-line rejections (430 article-not-found, auth, protocol errors)
+// consume the full response line, leaving the connection aligned for its next
+// command. Connection/timeout/server-busy errors only reach the terminal
+// failure path after the failing connection was already released and replaced
+// by a fresh, unused one, so those are poolable too.
+//
+// Everything else — yEnc decode failures, mid-body cache-write errors
+// (io.ErrShortWrite), and unclassified errors — may leave unread BODY bytes
+// buffered on the wire. Pooling such a connection would hand the next borrower
+// leftover article data in place of a status line, corrupting framing and
+// cascading misclassified errors, so the safe default is to close it.
+func connPoolableAfterError(err error) bool {
+	var nntpErr *Error
+	if !errors.As(err, &nntpErr) {
+		return false
+	}
+	switch nntpErr.Type {
+	case ErrorTypeArticleNotFound,
+		ErrorTypeGroupNotFound,
+		ErrorTypePermissionDenied,
+		ErrorTypeAuthentication,
+		ErrorTypeInvalidCommand,
+		ErrorTypeProtocol,
+		ErrorTypeServerBusy,
+		ErrorTypeTimeout,
+		ErrorTypeConnection:
+		return true
+	default:
+		return false
+	}
+}
+
 func IsArticleNotFoundError(err error) bool {
 	var nntpErr *Error
 	if errors.As(err, &nntpErr) {

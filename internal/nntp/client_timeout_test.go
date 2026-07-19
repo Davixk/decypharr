@@ -2,17 +2,22 @@ package nntp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/textproto"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	nntpyenc "github.com/sirrobot01/decypharr/internal/nntp/yenc"
 )
 
 func TestArticleNotFoundIsNotRetriedOnSameProvider(t *testing.T) {
@@ -229,6 +234,200 @@ func TestRaceForConnectionReturnsBeforeBlockedLoserHandshake(t *testing.T) {
 	if got := len(fastPool.slots); got != 0 {
 		t.Fatalf("fast provider checked-out slots = %d, want 0", got)
 	}
+}
+
+// TestMidBodyWriteFailureDoesNotPoolPoisonedConnection reproduces the framing
+// corruption scenario: a cache-write failure mid-BODY is classified as a yEnc
+// decode error, which previously fell into ExecuteWithFailover's default
+// branch and POOLED the connection with unread body bytes still buffered. The
+// next borrower would then read leftover article data instead of a status
+// line. The failing connection must be closed; the follow-up request must
+// arrive on a NEW connection and decode cleanly.
+func TestMidBodyWriteFailureDoesNotPoolPoisonedConnection(t *testing.T) {
+	oldPureGo := nntpyenc.UsePureGo
+	nntpyenc.UsePureGo = true
+	t.Cleanup(func() { nntpyenc.UsePureGo = oldPureGo })
+
+	server := newBodyTestServer(t)
+	t.Cleanup(server.Close)
+
+	provider := config.UsenetProvider{Host: server.host, Port: server.port, MaxConnections: 1, Priority: 1}
+	pool := &ProviderPool{
+		conns:  make([]*connectionEntry, 0, 1),
+		slots:  make(chan struct{}, 1),
+		max:    1,
+		config: provider,
+	}
+	client := &Client{
+		pools:     map[string]*ProviderPool{provider.Host: pool},
+		providers: []config.UsenetProvider{provider},
+		retries:   1,
+		logger:    zerolog.Nop(),
+	}
+
+	// Request 1: the destination writer fails mid-body (e.g. disk cache
+	// io.ErrShortWrite), leaving the response partially consumed.
+	writeErr := errors.New("cache write failed mid-body")
+	err := client.ExecuteWithFailover(context.Background(), func(conn *Connection) error {
+		_, streamErr := conn.StreamBody("<seg-0@test>", failingWriter{err: writeErr})
+		return streamErr
+	})
+	var nntpErr *Error
+	if !errors.As(err, &nntpErr) || nntpErr.Type != ErrorTypeYencDecode {
+		t.Fatalf("mid-body write failure classified as %v, want yEnc decode error", err)
+	}
+	if got := len(pool.slots); got != 0 {
+		t.Fatalf("checked-out slots after mid-body failure = %d, want 0", got)
+	}
+	// The poisoned connection must NOT have been pooled for reuse.
+	pool.mu.Lock()
+	pooled := len(pool.conns)
+	pool.mu.Unlock()
+	if pooled != 0 {
+		t.Fatalf("poisoned connection was returned to the pool (pooled=%d), want 0", pooled)
+	}
+
+	// Request 2 must arrive on a fresh connection and decode cleanly.
+	var decoded bytes.Buffer
+	err = client.ExecuteWithFailover(context.Background(), func(conn *Connection) error {
+		_, streamErr := conn.StreamBody("<seg-0@test>", &decoded)
+		return streamErr
+	})
+	if err != nil {
+		t.Fatalf("follow-up request failed: %v", err)
+	}
+	if decoded.String() != bodyTestPayload {
+		t.Fatalf("follow-up decode = %q, want %q", decoded.String(), bodyTestPayload)
+	}
+	if got := server.connections.Load(); got != 2 {
+		t.Fatalf("server connection count = %d, want 2 (second request must use a new connection)", got)
+	}
+}
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
+
+// bodyTestPayload decodes from bodyTestYenc ('A'+42 = 'k', no escapes needed).
+const bodyTestPayload = "AAAA"
+
+const bodyTestYenc = "=ybegin line=128 size=4 name=t.bin\r\nkkkk\r\n=yend size=4\r\n.\r\n"
+
+type bodyTestServer struct {
+	listener    net.Listener
+	host        string
+	port        int
+	connections atomic.Int32
+
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+	wg    sync.WaitGroup
+	once  sync.Once
+}
+
+func newBodyTestServer(t *testing.T) *bodyTestServer {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for fake NNTP server: %v", err)
+	}
+	host, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("split fake NNTP address: %v", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse fake NNTP port: %v", err)
+	}
+	s := &bodyTestServer{
+		listener: listener,
+		host:     host,
+		port:     port,
+		conns:    make(map[net.Conn]struct{}),
+	}
+	s.wg.Add(1)
+	go s.acceptLoop()
+	return s
+}
+
+func (s *bodyTestServer) acceptLoop() {
+	defer s.wg.Done()
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			return
+		}
+		s.connections.Add(1)
+		s.mu.Lock()
+		s.conns[conn] = struct{}{}
+		s.mu.Unlock()
+		s.wg.Add(1)
+		go s.serve(conn)
+	}
+}
+
+func (s *bodyTestServer) serve(conn net.Conn) {
+	defer s.wg.Done()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		_ = conn.Close()
+	}()
+
+	writer := bufio.NewWriter(conn)
+	if _, err := writer.WriteString("200 body test server ready\r\n"); err != nil {
+		return
+	}
+	if err := writer.Flush(); err != nil {
+		return
+	}
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		switch strings.ToUpper(fields[0]) {
+		case "BODY":
+			if _, err := fmt.Fprintf(writer, "222 0 %s\r\n%s", fields[1], bodyTestYenc); err != nil {
+				return
+			}
+			if err := writer.Flush(); err != nil {
+				return
+			}
+		case "DATE":
+			_, _ = writer.WriteString("111 20260718000000\r\n")
+			if err := writer.Flush(); err != nil {
+				return
+			}
+		case "QUIT":
+			_, _ = writer.WriteString("205 closing connection\r\n")
+			_ = writer.Flush()
+			return
+		default:
+			_, _ = writer.WriteString("500 unsupported command\r\n")
+			if err := writer.Flush(); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (s *bodyTestServer) Close() {
+	s.once.Do(func() {
+		_ = s.listener.Close()
+		s.mu.Lock()
+		for conn := range s.conns {
+			_ = conn.Close()
+		}
+		s.mu.Unlock()
+		s.wg.Wait()
+	})
 }
 
 func newPoolTestClient(t *testing.T, retries int) (*Client, *ProviderPool, func()) {

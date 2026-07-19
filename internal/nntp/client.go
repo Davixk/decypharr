@@ -424,8 +424,15 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			return nil
 		}
 
-		// Handle failure
-		c.returnOrReleaseConn(currentConn, currentProvider)
+		// Handle failure. Only pool the connection when the error type proves
+		// it is parked at a protocol boundary; a mid-body failure (yEnc decode,
+		// cache write) leaves unread BODY bytes buffered, and pooling it would
+		// corrupt framing for the next borrower.
+		if connPoolableAfterError(err) {
+			c.returnOrReleaseConn(currentConn, currentProvider)
+		} else {
+			c.release(currentConn)
+		}
 		lastErr = err
 
 		// Check if we should exclude this provider
