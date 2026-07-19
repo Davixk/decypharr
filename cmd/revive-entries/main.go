@@ -77,6 +77,7 @@ type classification string
 const (
 	classAAction classification = "A-action" // completed meta, was mid post-download action
 	classAQueued classification = "A-queued" // completed meta, resumes via no-network ResumeExisting
+	classA2      classification = "A2"       // failed meta still carrying its full segment map: un-flip it
 	classB       classification = "B"        // meta missing/parsing but the XML source survives
 	classC       classification = "C"        // not revivable offline; recourse: arr-side re-grab
 )
@@ -94,6 +95,7 @@ type census struct {
 	candidates int
 	aAction    int
 	aQueued    int
+	a2Unflip   int
 	b          int
 	c          int
 	revived    int
@@ -222,6 +224,25 @@ func run(opts options, stdout, stderr io.Writer) int {
 		case classC:
 			cens.c++
 			decision = "skip-" + v.reason
+		case classA2:
+			cens.a2Unflip++
+			if !opts.apply {
+				decision = "would-unflip"
+				if mainRowInError(store, entry.InfoHash) {
+					decision += "+main"
+				}
+			} else if uerr := nzbs.RestoreCompleted(entry.InfoHash, entry.NZBGeneration); uerr != nil {
+				// Durable meta first. RestoreCompleted re-validates everything
+				// the classifier saw (failed + !IsBad + populated segments +
+				// generation) under the lifecycle lock; a refusal leaves both
+				// the meta and the entry untouched.
+				cens.skipped++
+				decision = "skip-unflip-error"
+				fmt.Fprintf(stderr, "warning: %s: meta un-flip refused (entry left untouched): %v\n", entry.InfoHash, uerr)
+			} else {
+				revived, mainReset, rerr := revive(store, entry.InfoHash, v.class, opts)
+				decision = applyDecision(&cens, entry.InfoHash, v.class, revived, mainReset, rerr, stderr)
+			}
 		default:
 			switch v.class {
 			case classAAction:
@@ -238,27 +259,7 @@ func run(opts options, stdout, stderr io.Writer) int {
 				}
 			} else {
 				revived, mainReset, rerr := revive(store, entry.InfoHash, v.class, opts)
-				switch {
-				case rerr != nil && !revived:
-					cens.skipped++
-					decision = "skip-mutate-error"
-					fmt.Fprintf(stderr, "warning: %s: queue mutation failed: %v\n", entry.InfoHash, rerr)
-				case rerr != nil && revived:
-					// Queue row is reset; only the cosmetic main-store pass failed.
-					cens.revived++
-					decision = "revived-as-" + string(v.class)
-					fmt.Fprintf(stderr, "warning: %s: main-store reset failed (queue row already revived): %v\n", entry.InfoHash, rerr)
-				case !revived:
-					cens.skipped++
-					decision = "skip-stale"
-				default:
-					cens.revived++
-					decision = "revived-as-" + string(v.class)
-					if mainReset {
-						cens.mainResets++
-						decision += "+main"
-					}
-				}
+				decision = applyDecision(&cens, entry.InfoHash, v.class, revived, mainReset, rerr, stderr)
 			}
 		}
 
@@ -266,8 +267,8 @@ func run(opts options, stdout, stderr io.Writer) int {
 			entry.InfoHash, truncateName(entry.Name, 60), v.class, v.metaStatus, v.xmlPresent, decision)
 	}
 
-	fmt.Fprintf(stdout, "# census: candidates=%d A-action=%d A-queued=%d B=%d C=%d revived=%d skipped=%d main-store-resets=%d mode=%s\n",
-		cens.candidates, cens.aAction, cens.aQueued, cens.b, cens.c, cens.revived, cens.skipped, cens.mainResets,
+	fmt.Fprintf(stdout, "# census: candidates=%d A-action=%d A-queued=%d A2-unflip=%d B=%d C=%d revived=%d skipped=%d main-store-resets=%d mode=%s\n",
+		cens.candidates, cens.aAction, cens.aQueued, cens.a2Unflip, cens.b, cens.c, cens.revived, cens.skipped, cens.mainResets,
 		map[bool]string{true: "apply", false: "dry-run"}[opts.apply])
 	if cens.c > 0 {
 		fmt.Fprintf(stdout, "# %d class-C entries are not revivable offline; recourse: arr-side re-grab\n", cens.c)
@@ -324,8 +325,14 @@ func matchesSelector(e *storage.Entry, from, to time.Time, maxErrors int) bool {
 //   - Class B: meta missing or still parsing, but the raw NZB XML source
 //     survives (entry.Magnet path, meta.Path, or a usenet/nzbs/<id>.*.source
 //     or .queued artifact) so pass-2 can re-parse it.
-//   - Class C: neither. A generation mismatch or an undecodable meta blob is
-//     also class C: the stale meta blocks both restore branches at boot.
+//   - Class A2 ("un-flip"): meta durably failed with no surviving XML, but its
+//     Files still carry the full parsed segment map from an earlier completed
+//     lifecycle (markAsFailed never clears Files). -apply restores the meta to
+//     completed via usenet.RestoreCompleted and stages the entry with the
+//     A-action triple, so the symlink action re-runs with zero network.
+//   - Class C: none of the above. A generation mismatch or an undecodable meta
+//     blob is also class C: the stale meta blocks both restore branches at
+//     boot.
 func classify(stateDir string, nzbs *usenet.NZBStorage, e *storage.Entry) verdict {
 	var meta *storage.NZB
 	metaStatus := "missing"
@@ -367,7 +374,11 @@ func classify(stateDir string, nzbs *usenet.NZBStorage, e *storage.Entry) verdic
 			if xml {
 				return verdict{class: classB, metaStatus: metaStatus, xmlPresent: xml}
 			}
-			return verdict{class: classC, metaStatus: metaStatus, xmlPresent: xml, reason: "meta-failed-no-xml"}
+			// No XML left to re-parse. markAsFailed only flips Status and
+			// FailMessage — it never clears Files — so a meta that completed in
+			// an earlier lifecycle still carries its full parsed segment map
+			// and can be un-flipped in place (class A2, zero network).
+			return classifyFailedMetaOffline(nzbs, e, metaStatus)
 		default:
 			return verdict{class: classC, metaStatus: metaStatus, xmlPresent: xml, reason: "meta-status-" + metaStatus}
 		}
@@ -377,6 +388,50 @@ func classify(stateDir string, nzbs *usenet.NZBStorage, e *storage.Entry) verdic
 		return verdict{class: classB, metaStatus: metaStatus, xmlPresent: xml}
 	}
 	return verdict{class: classC, metaStatus: metaStatus, xmlPresent: false, reason: "no-meta-no-xml"}
+}
+
+// classifyFailedMetaOffline decides whether a durably failed meta with no
+// surviving XML source can be un-flipped in place (class A2) or stays class C
+// with a precise near-miss reason. It mirrors usenet.RestoreCompleted's refusal
+// semantics so a dry-run A2 verdict is exactly the set -apply will restore:
+//
+//   - meta-failed-bad-or-deleted: IsBad or a permanently failed file — a
+//     genuine content verdict, never un-flipped.
+//   - meta-failed-no-xml: Files is empty AND no XML survives — the meta never
+//     got past the parse stage, so there is nothing to restore offline.
+//   - meta-failed-empty-files: Files is populated but not streamable (a file
+//     without segments, or no positive size).
+//
+// The generation adopt-or-match gate (same rule as class A) already ran in
+// classify before the status switch. This is the only classification that
+// needs the full segment map, so it pays for GetNZB instead of GetNZBHeader.
+func classifyFailedMetaOffline(nzbs *usenet.NZBStorage, e *storage.Entry, metaStatus string) verdict {
+	full, err := nzbs.GetNZB(e.InfoHash)
+	if err != nil {
+		return verdict{class: classC, metaStatus: metaStatus, reason: "meta-decode-error"}
+	}
+	if full.IsBad {
+		return verdict{class: classC, metaStatus: metaStatus, reason: "meta-failed-bad-or-deleted"}
+	}
+	for i := range full.Files {
+		if full.Files[i].IsDeleted {
+			return verdict{class: classC, metaStatus: metaStatus, reason: "meta-failed-bad-or-deleted"}
+		}
+	}
+	if len(full.Files) == 0 {
+		return verdict{class: classC, metaStatus: metaStatus, reason: "meta-failed-no-xml"}
+	}
+	var summedSize int64
+	for i := range full.Files {
+		if len(full.Files[i].Segments) == 0 {
+			return verdict{class: classC, metaStatus: metaStatus, reason: "meta-failed-empty-files"}
+		}
+		summedSize += full.Files[i].Size
+	}
+	if full.TotalSize <= 0 && summedSize <= 0 {
+		return verdict{class: classC, metaStatus: metaStatus, reason: "meta-failed-empty-files"}
+	}
+	return verdict{class: classA2, metaStatus: metaStatus, xmlPresent: false}
 }
 
 // xmlSourcePresent reports whether the raw NZB XML survives anywhere
@@ -407,13 +462,16 @@ func fileExists(path string) bool {
 // InfoHash, NZBGeneration, Providers, Files, Magnet, SavePath, Action,
 // CallbackURL, LastError, LastErrorTime, or ErrorCount.
 //
-//   - A-action: the pass-1 ResumeAction triple required by resumeClaimedAction
-//     (State=downloading + Status=downloaded + IsDownloading=true).
+//   - A-action / A2: the pass-1 ResumeAction triple required by
+//     resumeClaimedAction (State=downloading + Status=downloaded +
+//     IsDownloading=true). A2 rows qualify because their durable meta was just
+//     restored to completed, so the post-download action re-runs from the
+//     intact segment map exactly like a mid-action crash recovery.
 //   - A-queued / B: the pass-2 rebuild shape (State=downloading +
 //     Status=queued + IsDownloading=false + Progress=0).
 func resetEntryFields(e *storage.Entry, cls classification, tag string) {
 	e.State = storage.EntryStateDownloading
-	if cls == classAAction {
+	if cls == classAAction || cls == classA2 {
 		e.Status = debridTypes.TorrentStatusDownloaded
 		e.IsDownloading = true
 	} else {
@@ -461,6 +519,44 @@ func revive(store *storage.Storage, hash string, cls classification, opts option
 		return true, false, merr
 	}
 	return true, mainReset, nil
+}
+
+// applyDecision folds a revive() outcome into the census and returns the TSV
+// decision string. A2 rows report "unflipped" (their durable meta was already
+// restored by RestoreCompleted before revive ran); everything else keeps the
+// historical "revived-as-<class>" wording.
+func applyDecision(cens *census, hash string, cls classification, revived, mainReset bool, rerr error, stderr io.Writer) string {
+	verb := "revived-as-" + string(cls)
+	if cls == classA2 {
+		verb = "unflipped"
+	}
+	switch {
+	case rerr != nil && !revived:
+		cens.skipped++
+		fmt.Fprintf(stderr, "warning: %s: queue mutation failed: %v\n", hash, rerr)
+		return "skip-mutate-error"
+	case rerr != nil && revived:
+		// Queue row is reset; only the cosmetic main-store pass failed.
+		cens.revived++
+		fmt.Fprintf(stderr, "warning: %s: main-store reset failed (queue row already revived): %v\n", hash, rerr)
+		return verb
+	case !revived:
+		cens.skipped++
+		if cls == classA2 {
+			// The durable meta is already completed; only the entry changed
+			// between scan and write. Harmless: the row now classifies as
+			// class A on any later run, or boot-restore picks the meta up.
+			fmt.Fprintf(stderr, "warning: %s: entry changed between scan and write; meta already restored to completed\n", hash)
+		}
+		return "skip-stale"
+	default:
+		cens.revived++
+		if mainReset {
+			cens.mainResets++
+			return verb + "+main"
+		}
+		return verb
+	}
 }
 
 // mainRowInError reports (for dry-run output) whether the main store mirrors
