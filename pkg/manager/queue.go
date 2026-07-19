@@ -477,6 +477,18 @@ func (q *Queue) cancelAndWaitAction(infohash string, expected *storage.Entry) {
 	}
 }
 
+// HasActionLease reports whether a live action lease exists for the hash. The
+// orphaned-claim reconciler uses it to distinguish a claimed entry whose
+// action worker is alive (holding a BeginAction lease) from one whose
+// goroutine died without committing a terminal state.
+func (q *Queue) HasActionLease(infohash string) bool {
+	key := strings.ToLower(infohash)
+	q.actionMu.Lock()
+	defer q.actionMu.Unlock()
+	_, ok := q.actionLeases[key]
+	return ok
+}
+
 func (q *Queue) cancelAction(infohash string, expected *storage.Entry) {
 	key := strings.ToLower(infohash)
 	q.actionMu.Lock()

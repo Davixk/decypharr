@@ -399,11 +399,23 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 	}
 	// Check if done or failed
 	if debridTorrent.Status == debridTypes.TorrentStatusDownloaded {
-		go m.processAction(entry)
+		// Hand the detached action its own snapshot: this function still reads
+		// the entry after spawning, and sharing the pointer would race with the
+		// action's snapshot refreshes.
+		actionEntry := *entry
+		go m.processAction(&actionEntry)
 	}
 }
 
 func (m *Manager) processAction(entry *storage.Entry) {
+	if entry == nil {
+		return
+	}
+	if !m.beginActionInflight(entry.InfoHash) {
+		m.logger.Debug().Str("name", entry.Name).Msg("Post-download action already pending in this process")
+		return
+	}
+	defer m.endActionInflight(entry.InfoHash)
 	claimed, err := m.queue.ClaimPostDownload(entry)
 	if err != nil {
 		m.logger.Debug().Err(err).Str("name", entry.Name).Msg("Stopped stale completed-download workflow")
@@ -413,10 +425,23 @@ func (m *Manager) processAction(entry *storage.Entry) {
 		m.logger.Debug().Str("name", entry.Name).Msg("Post-download action already claimed or no longer current")
 		return
 	}
+	// The claim is durable and the worker that observed it has already
+	// released its active-download slot (see waitForDownloadCompletion). Gate
+	// the actual action so a backlog of claims drains progressively instead
+	// of stampeding the mount.
+	if !m.acquireActionSlot() {
+		// Shutdown: the durable claim is resumed by restore on next boot.
+		return
+	}
+	defer m.releaseActionSlot()
 	m.runClaimedAction(entry)
 }
 
 func (m *Manager) runClaimedAction(entry *storage.Entry) {
+	if m.claimedActionTestHook != nil {
+		m.claimedActionTestHook(entry)
+		return
+	}
 	m.logger.Info().
 		Str("name", entry.Name).
 		Str("action", string(entry.Action)).
@@ -460,8 +485,11 @@ func (m *Manager) processNewTorrent(torrent *storage.Entry, debridTorrent *debri
 		return nil
 	}
 
-	// Parse post-download action
-	go m.processAction(torrent)
+	// Parse post-download action. The action goroutine gets its own snapshot:
+	// the calling worker returns into waitForDownloadCompletion with the same
+	// pointer, and the two must not refresh a shared Entry concurrently.
+	actionEntry := *torrent
+	go m.processAction(&actionEntry)
 	return nil
 }
 

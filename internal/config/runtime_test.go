@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+// TestRequiresRestartMaxActiveDownloads pins the restart classification of
+// max_active_downloads: the manager sizes its worker pool and action gate
+// from it once at construction, so a change must route config saves through
+// the restart branch (handleUpdateConfig) instead of the silent live-apply.
+func TestRequiresRestartMaxActiveDownloads(t *testing.T) {
+	current := &Config{}
+	current.setDefaults()
+
+	unchanged := *current
+	if current.RequiresRestart(&unchanged) {
+		t.Fatal("identical configs flagged restart-needed")
+	}
+
+	updated := *current
+	updated.MaxActiveDownloads = current.MaxActiveDownloads + 3
+	if !current.RequiresRestart(&updated) {
+		t.Fatal("MaxActiveDownloads change was not flagged restart-needed")
+	}
+
+	// A hot field alone must still apply live.
+	hotOnly := *current
+	hotOnly.RefreshInterval = "42m"
+	if current.RequiresRestart(&hotOnly) {
+		t.Fatal("hot-only change (RefreshInterval) was flagged restart-needed")
+	}
+}
+
 func TestSnapshotQueueCleanupCopiesRules(t *testing.T) {
 	c := &Config{QueueCleanup: QueueCleanup{
 		Rules: []QueueCleanupRule{{ID: "failed_download", Action: "blacklist"}},

@@ -89,6 +89,22 @@ type Manager struct {
 	nzbSyncMu      sync.Mutex
 	nzbAdmissionMu sync.Mutex
 
+	// actionSem bounds concurrently running post-download actions (mount
+	// waits, local fetches, symlink creation). Sized max(4, MaxActiveDownloads)
+	// so a reboot backlog of claimed actions drains progressively instead of
+	// stampeding a cold mount and the persist mutex, while never dropping
+	// below the worker count so claimed work cannot starve behind imports.
+	actionSem chan struct{}
+	// actionInflight tracks hashes with a pending/running post-download action
+	// in this process (claimed and waiting on the gate, or executing). It
+	// prevents duplicate submissions - and later the orphaned-claim
+	// reconciler - from double-running a claimed action whose goroutine is
+	// still alive.
+	actionInflight *xsync.Map[string, struct{}]
+	// claimedActionTestHook, when set, replaces the real post-download action
+	// body so tests can observe gate concurrency without touching mounts.
+	claimedActionTestHook func(*storage.Entry)
+
 	// Notifications service
 	Notifications *notifications.Service
 }
@@ -237,6 +253,11 @@ func (m *Manager) init() {
 	// Initialize repair service. It registers with the scheduler in StartWorker.
 	m.repair = NewRepair(m)
 
+	// Initialize the post-download action gate before the job queue: restored
+	// ResumeAction jobs are routed through it as soon as workers start.
+	m.actionSem = make(chan struct{}, actionGateSize(cfg.MaxActiveDownloads))
+	m.actionInflight = xsync.NewMap[string, struct{}]()
+
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
 }
@@ -319,7 +340,12 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		return
 	}
 	if job.ResumeAction {
-		m.resumeClaimedAction(job.Entry)
+		// Never run the claimed action on this worker: submit it through the
+		// action gate on a detached goroutine so a restore backlog of claimed
+		// entries cannot occupy every active-download slot. The claim is
+		// already durable, so the slot frees immediately and the action drains
+		// at gate width.
+		m.submitResumeAction(job.Entry)
 		return
 	}
 	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
@@ -377,19 +403,63 @@ func (m *Manager) resumeClaimedAction(entry *storage.Entry) {
 	m.runClaimedAction(entry)
 }
 
+// downloadCompletionSlack pads the worst-case post-download pipeline (mount
+// visibility wait + usenet processing) when computing the defensive park cap
+// for waitForDownloadCompletion.
+const downloadCompletionSlack = 5 * time.Minute
+
+// downloadCompletionParkCap bounds how long a single worker may stay parked on
+// one entry. It covers the longest legitimate pipeline (the mount wait plus
+// the usenet processing timeout) with slack; anything beyond that means the
+// entry's lifecycle has wedged and the slot is worth more than the wait.
+func (m *Manager) downloadCompletionParkCap() time.Duration {
+	return symlinkMountWaitTimeout + m.usenetTimeout + downloadCompletionSlack
+}
+
+// waitForDownloadCompletion parks a worker slot only while the entry still
+// represents in-flight provider/import work. It returns as soon as the entry
+// leaves the downloading state, the job is cancelled, or the post-download
+// action has been durably claimed (Status downloaded + IsDownloading): from
+// that point the detached action goroutine owns the entry lifecycle, and
+// keeping the slot parked would serialize slow mount-visibility waits behind
+// real download work (MaxActiveDownloads workers x mount refresh interval).
 func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.Entry) {
 	if entry == nil {
 		return
 	}
+	// Wait on a private snapshot. Detached post-download action goroutines and
+	// restore paths can retain the original pointer; refreshing a shared
+	// pointer from this loop would race with their own snapshot refreshes.
+	snapshot := *entry
+	maxPark := m.downloadCompletionParkCap()
+	capTimer := time.NewTimer(maxPark)
+	defer capTimer.Stop()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		current, err := m.queue.RefreshSnapshot(entry)
-		if err != nil || !current || entry.State != storage.EntryStateDownloading {
+		current, err := m.queue.RefreshSnapshot(&snapshot)
+		if err != nil || !current || snapshot.State != storage.EntryStateDownloading {
+			return
+		}
+		if snapshot.Status == debridTypes.TorrentStatusDownloaded && snapshot.IsDownloading {
+			// The post-download action is durably claimed; the action owns the
+			// entry from here on and the worker slot must free.
 			return
 		}
 		select {
 		case <-ctx.Done():
+			return
+		case <-capTimer.C:
+			// Defensive: never let one wedged entry pin a worker forever. The
+			// slot frees; whatever state remains is picked up by the periodic
+			// scheduler or the orphaned-claim reconciler.
+			m.logger.Error().
+				Str("infohash", snapshot.InfoHash).
+				Str("name", snapshot.Name).
+				Str("state", string(snapshot.State)).
+				Str("status", string(snapshot.Status)).
+				Dur("waited", maxPark).
+				Msg("Download completion wait exceeded its cap; releasing the worker slot")
 			return
 		case <-ticker.C:
 		}
