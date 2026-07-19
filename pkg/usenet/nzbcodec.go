@@ -377,16 +377,23 @@ func splitRegions(data []byte) (hc, sc, mc []byte, err error) {
 // decodeNZBV2Header decodes only the NZB scalars and per-file metadata. The
 // returned files have nil Segments. It never decompresses the segment regions.
 func decodeNZBV2Header(data []byte) (*storage.NZB, error) {
+	nzb, _, err := decodeNZBV2HeaderCounts(data)
+	return nzb, err
+}
+
+// decodeNZBV2HeaderCounts is decodeNZBV2Header plus the per-file segment
+// counts stored in the header's file table, still without touching the
+// compressed segment regions. counts[i] belongs to nzb.Files[i].
+func decodeNZBV2HeaderCounts(data []byte) (*storage.NZB, []int, error) {
 	hc, _, _, err := splitRegions(data)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	header, err := zstdDec.DecodeAll(hc, nil)
 	if err != nil {
-		return nil, fmt.Errorf("nzbcodec: decompress header: %w", err)
+		return nil, nil, fmt.Errorf("nzbcodec: decompress header: %w", err)
 	}
-	nzb, _, err := decodeHeader(header)
-	return nzb, err
+	return decodeHeader(header)
 }
 
 // decodeNZBV2 fully decodes an NZB including its segment map.
