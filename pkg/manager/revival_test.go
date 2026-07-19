@@ -66,6 +66,14 @@ func TestIsRevivableErrorEntryEligibility(t *testing.T) {
 		{"mount timeout signature eligible", func(e *storage.Entry) {
 			e.LastError = "timeout waiting for mount files: 2 files still pending"
 		}, false, true},
+		{"archive processing signature eligible", func(e *storage.Entry) {
+			// The exact string stamped on 1,891 entries during the 2026-07-19
+			// incident (Process phase, swallowed substrate collapse).
+			e.LastError = "failed to process nzb: failed to process NZB archives: no valid files found in NZB"
+		}, false, true},
+		{"gated archive infra signature eligible", func(e *storage.Entry) {
+			e.LastError = "failed to process nzb: failed to process NZB archives: availability probe failed: provider connectivity problem: no valid files found in NZB after 3 file group failure(s)"
+		}, false, true},
 		{"error count at retries cap", func(e *storage.Entry) { e.ErrorCount = 3 }, false, false},
 		{"error count above retries cap", func(e *storage.Entry) { e.ErrorCount = 7 }, false, false},
 		{"bad entry", func(e *storage.Entry) { e.Bad = true }, false, false},
@@ -107,6 +115,30 @@ func TestReviveErrorEntryAvailabilityFailureBecomesQueued(t *testing.T) {
 		t.Fatalf("revived entry = state %q status %q downloading=%v, want downloading/queued/false", updated.State, updated.Status, updated.IsDownloading)
 	}
 	if updated.ErrorCount != 2 || updated.LastError == "" {
+		t.Fatalf("revival must not touch error bookkeeping: count=%d lastError=%q", updated.ErrorCount, updated.LastError)
+	}
+}
+
+// The archive-processing incident cohort (the exact production LastError of
+// the 1,891 mass-failed entries) re-enters the queued path, never the
+// claimed-action path.
+func TestReviveErrorEntryArchiveProcessingFailureBecomesQueued(t *testing.T) {
+	server := newVerdictFakeNNTPServer(t, true)
+	host, port := server.hostPort(t)
+	m, _ := newVerdictTestManager(t, host, port)
+
+	addErrorNZBEntry(t, m, "revive-archive", "failed to process nzb: failed to process NZB archives: no valid files found in NZB", 1, false)
+	updated, resumeAction, applied, err := m.reviveErrorEntry("revive-archive", false)
+	if err != nil || !applied {
+		t.Fatalf("reviveErrorEntry: applied=%v err=%v", applied, err)
+	}
+	if resumeAction {
+		t.Fatal("archive-processing failure must not resume a claimed action")
+	}
+	if updated.State != storage.EntryStateDownloading || updated.Status != debridTypes.TorrentStatusQueued || updated.IsDownloading {
+		t.Fatalf("revived entry = state %q status %q downloading=%v, want downloading/queued/false", updated.State, updated.Status, updated.IsDownloading)
+	}
+	if updated.ErrorCount != 1 || updated.LastError == "" {
 		t.Fatalf("revival must not touch error bookkeeping: count=%d lastError=%q", updated.ErrorCount, updated.LastError)
 	}
 }

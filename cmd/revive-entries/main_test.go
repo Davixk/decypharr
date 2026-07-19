@@ -16,24 +16,32 @@ import (
 )
 
 const (
-	idAAction    = "revive-a-action"
-	idAQueued    = "revive-a-queued"
-	idB          = "revive-b-xml"
-	idC          = "revive-c-nothing"
-	idOutOfWin   = "revive-out-of-window"
-	idBad        = "revive-bad-true"
-	idGenuine430 = "revive-430-outside"
+	idAAction        = "revive-a-action"
+	idAQueued        = "revive-a-queued"
+	idArchAQueued    = "revive-arch-a-queued"
+	idArchFailedMeta = "revive-arch-failed-meta"
+	idB              = "revive-b-xml"
+	idC              = "revive-c-nothing"
+	idOutOfWin       = "revive-out-of-window"
+	idBad            = "revive-bad-true"
+	idGenuine430     = "revive-430-outside"
 
 	genAAction = "gen-a-action"
 	seedTag    = "pre-existing-tag"
 	testTag    = "revived-test"
+
+	// The exact LastError stamped on the 1,891 Process-phase incident entries.
+	archiveProductionError = "failed to process nzb: failed to process NZB archives: no valid files found in NZB"
 )
 
 var (
-	pdt       = time.FixedZone("PDT", -7*60*60)
-	inWindow  = time.Date(2026, 7, 19, 5, 40, 0, 0, pdt)
-	outWindow = time.Date(2026, 7, 19, 3, 0, 0, 0, pdt)
-	addedOn   = time.Date(2026, 7, 18, 12, 0, 0, 0, pdt)
+	pdt      = time.FixedZone("PDT", -7*60*60)
+	inWindow = time.Date(2026, 7, 19, 5, 40, 0, 0, pdt)
+	// archWindow is the census timestamp of the 1,891 cohort (05:47:00); it
+	// must be covered inclusively by the default window.
+	archWindow = time.Date(2026, 7, 19, 5, 47, 0, 0, pdt)
+	outWindow  = time.Date(2026, 7, 19, 3, 0, 0, 0, pdt)
+	addedOn    = time.Date(2026, 7, 18, 12, 0, 0, 0, pdt)
 )
 
 func testOptions(stateDir string, apply bool) options {
@@ -131,6 +139,31 @@ func seedIncidentState(t *testing.T) string {
 		t.Fatalf("AddQueue b: %v", err)
 	}
 
+	// A-queued (archive cohort): the exact Process-phase production string at
+	// the 05:47:00 census timestamp with completed metadata — the
+	// downloaded-cohort shape inside the 1,891.
+	archAQueued := erroredNZBEntry(idArchAQueued, archiveProductionError, archWindow, 1, false)
+	if err := nzbs.AddNZB(&storage.NZB{ID: idArchAQueued, Name: "arch-a-queued.nzb", Status: usenet.NZBStatusCompleted}); err != nil {
+		t.Fatalf("AddNZB arch-a-queued: %v", err)
+	}
+	if err := store.AddQueue(archAQueued); err != nil {
+		t.Fatalf("AddQueue arch-a-queued: %v", err)
+	}
+
+	// Class B (archive cohort): metadata durably marked failed by
+	// markAsFailed during the incident, but the XML source artifact survives
+	// so boot pass-2 can re-parse it.
+	archFailed := erroredNZBEntry(idArchFailedMeta, archiveProductionError, archWindow, 2, false)
+	if err := nzbs.AddNZB(&storage.NZB{ID: idArchFailedMeta, Name: "arch-failed.nzb", Status: usenet.NZBStatusFailed, FailMessage: "no valid files found in NZB"}); err != nil {
+		t.Fatalf("AddNZB arch-failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(nzbDir, idArchFailedMeta+".cafecafecafecafecafecafe.source"), []byte("<nzb/>"), 0o644); err != nil {
+		t.Fatalf("write arch-failed source: %v", err)
+	}
+	if err := store.AddQueue(archFailed); err != nil {
+		t.Fatalf("AddQueue arch-failed: %v", err)
+	}
+
 	// Class C: matches the selector but has neither meta nor XML.
 	c := erroredNZBEntry(idC, "articles missing on provider: failed to stat segment 1 of gone.mkv", inWindow, 1, false)
 	if err := store.AddQueue(c); err != nil {
@@ -213,10 +246,12 @@ func TestReviveEntriesSelectionClassificationAndApply(t *testing.T) {
 	dry := out.String()
 
 	for id, want := range map[string]string{
-		idAAction: "would-revive-as-A-action+main",
-		idAQueued: "would-revive-as-A-queued",
-		idB:       "would-revive-as-B",
-		idC:       "skip-no-meta-no-xml",
+		idAAction:        "would-revive-as-A-action+main",
+		idAQueued:        "would-revive-as-A-queued",
+		idArchAQueued:    "would-revive-as-A-queued",
+		idArchFailedMeta: "would-revive-as-B",
+		idB:              "would-revive-as-B",
+		idC:              "skip-no-meta-no-xml",
 	} {
 		line := tsvLine(t, dry, id)
 		if !strings.HasSuffix(line, "\t"+want) {
@@ -228,12 +263,12 @@ func TestReviveEntriesSelectionClassificationAndApply(t *testing.T) {
 			t.Errorf("%s must not be selected, but appears in output:\n%s", id, dry)
 		}
 	}
-	if !strings.Contains(dry, "# census: candidates=4 A-action=1 A-queued=1 B=1 C=1") {
+	if !strings.Contains(dry, "# census: candidates=6 A-action=1 A-queued=2 B=2 C=1") {
 		t.Errorf("dry-run census missing or wrong:\n%s", dry)
 	}
 
 	store := openStore(t, stateDir)
-	for _, id := range []string{idAAction, idAQueued, idB, idC, idOutOfWin, idBad, idGenuine430} {
+	for _, id := range []string{idAAction, idAQueued, idArchAQueued, idArchFailedMeta, idB, idC, idOutOfWin, idBad, idGenuine430} {
 		assertUntouchedError(t, mustQueued(t, store, id), id)
 	}
 	mainBefore, err := store.Get(idAAction)
@@ -254,10 +289,12 @@ func TestReviveEntriesSelectionClassificationAndApply(t *testing.T) {
 	}
 	applied := out.String()
 	for id, want := range map[string]string{
-		idAAction: "revived-as-A-action+main",
-		idAQueued: "revived-as-A-queued",
-		idB:       "revived-as-B",
-		idC:       "skip-no-meta-no-xml",
+		idAAction:        "revived-as-A-action+main",
+		idAQueued:        "revived-as-A-queued",
+		idArchAQueued:    "revived-as-A-queued",
+		idArchFailedMeta: "revived-as-B",
+		idB:              "revived-as-B",
+		idC:              "skip-no-meta-no-xml",
 	} {
 		line := tsvLine(t, applied, id)
 		if !strings.HasSuffix(line, "\t"+want) {
@@ -283,6 +320,8 @@ func TestReviveEntriesSelectionClassificationAndApply(t *testing.T) {
 		e  *storage.Entry
 	}{
 		{idAQueued, mustQueued(t, store, idAQueued)},
+		{idArchAQueued, mustQueued(t, store, idArchAQueued)},
+		{idArchFailedMeta, mustQueued(t, store, idArchFailedMeta)},
 		{idB, mustQueued(t, store, idB)},
 	} {
 		if tc.e.State != storage.EntryStateDownloading ||
@@ -294,12 +333,19 @@ func TestReviveEntriesSelectionClassificationAndApply(t *testing.T) {
 	}
 
 	// Audit trail and forbidden fields are preserved on every revived row.
-	for _, id := range []string{idAAction, idAQueued, idB} {
+	seededErrorTimes := map[string]time.Time{
+		idAAction:        inWindow,
+		idAQueued:        inWindow,
+		idArchAQueued:    archWindow,
+		idArchFailedMeta: archWindow,
+		idB:              inWindow,
+	}
+	for _, id := range []string{idAAction, idAQueued, idArchAQueued, idArchFailedMeta, idB} {
 		e := mustQueued(t, store, id)
 		if e.LastError == "" || e.LastErrorTime == nil || e.ErrorCount == 0 {
 			t.Errorf("%s: audit trail was cleared: lastError=%q time=%v count=%d", id, e.LastError, e.LastErrorTime, e.ErrorCount)
 		}
-		if e.LastErrorTime != nil && e.LastErrorTime.Unix() != inWindow.Unix() {
+		if e.LastErrorTime != nil && e.LastErrorTime.Unix() != seededErrorTimes[id].Unix() {
 			t.Errorf("%s: LastErrorTime changed: %v", id, e.LastErrorTime)
 		}
 		if e.SavePath != "/downloads/"+id || e.CallbackURL != "http://callback.local/"+id {
@@ -349,7 +395,7 @@ func TestReviveEntriesSelectionClassificationAndApply(t *testing.T) {
 	if !strings.Contains(out.String(), "# census: candidates=1 A-action=0 A-queued=0 B=0 C=1") {
 		t.Fatalf("second-run census should contain only the class-C row:\n%s", out.String())
 	}
-	for _, id := range []string{idAAction, idAQueued, idB} {
+	for _, id := range []string{idAAction, idAQueued, idArchAQueued, idArchFailedMeta, idB} {
 		if strings.Contains(out.String(), id+"\t") {
 			t.Errorf("revived row %s matched the selector again:\n%s", id, out.String())
 		}
@@ -459,5 +505,16 @@ func TestSelectorWindowAndPatterns(t *testing.T) {
 	boundary := erroredNZBEntry("x", patternNoGroups+" 2 retries", from, 1, false)
 	if !matchesSelector(boundary, from, to, 3) {
 		t.Error("window boundaries are inclusive")
+	}
+
+	// The dominant incident cohort: the exact Process-phase production string
+	// at the census timestamp (05:47:00, inside the default window).
+	production := erroredNZBEntry("x", archiveProductionError, archWindow, 1, false)
+	if !matchesSelector(production, from, to, 3) {
+		t.Error("the archive-processing production string at 05:47:00 must match")
+	}
+	gated := erroredNZBEntry("x", "failed to process nzb: failed to process NZB archives: availability probe failed: provider connectivity problem: no valid files found in NZB after 3 file group failure(s)", archWindow, 1, false)
+	if !matchesSelector(gated, from, to, 3) {
+		t.Error("the gated archive-processing infrastructure string must match")
 	}
 }

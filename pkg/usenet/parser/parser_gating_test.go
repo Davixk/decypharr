@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // gatingTestNZB is a structurally valid single-file, single-segment NZB whose
@@ -217,6 +219,124 @@ func TestParseStatProbeUnknownErrorDefaultsToInfrastructure(t *testing.T) {
 	}
 	if errors.Is(err, ErrArticlesUnavailable) {
 		t.Fatalf("Parse error = %v, must not classify as missing articles", err)
+	}
+}
+
+// parseGatingGroups drives a successful Parse against a healthy STAT server
+// and returns the parsed metadata plus file groups for Process-phase tests.
+func parseGatingGroups(t *testing.T, parser *NZBParser) (*storage.NZB, map[string]*FileGroup) {
+	t.Helper()
+	nzb, groups, err := parser.Parse(context.Background(), "movie.nzb", []byte(gatingTestNZB))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(groups) == 0 {
+		t.Fatal("Parse returned no file groups")
+	}
+	return nzb, groups
+}
+
+// Cancellation during archive processing must surface as the context error,
+// never as the terminal "no valid files found in NZB" content verdict — that
+// bare verdict error-parked 1,891 entries during the 2026-07-19 incident.
+func TestProcessCtxCancelBypassesNoValidFilesVerdict(t *testing.T) {
+	server := newFakeStatServer(t, "223 0 %s")
+	host, port := server.hostPort(t)
+	parser := newGatingParser(t, host, port)
+	nzb, groups := parseGatingGroups(t, parser)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := parser.Process(ctx, nzb, groups)
+	if err == nil {
+		t.Fatal("expected Process to fail under a cancelled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Process error = %v, want context.Canceled to pass through", err)
+	}
+	if strings.Contains(err.Error(), "no valid files") {
+		t.Fatalf("Process error = %v, must not carry the generic no-valid-files verdict", err)
+	}
+}
+
+// A collapsed substrate during archive processing (every header fetch fails
+// on the network) carries no verdict about the content: Process must classify
+// the failure as ErrProbeInfrastructure, never as missing articles and never
+// as the bare "no valid files" content verdict.
+func TestProcessInfraFailureClassifiesProbeInfrastructure(t *testing.T) {
+	server := newFakeStatServer(t, "223 0 %s")
+	host, port := server.hostPort(t)
+	parser := newGatingParser(t, host, port)
+	nzb, groups := parseGatingGroups(t, parser)
+
+	server.Close() // dead substrate: every subsequent fetch fails
+
+	_, err := parser.Process(context.Background(), nzb, groups)
+	if err == nil {
+		t.Fatal("expected Process to fail against a dead provider")
+	}
+	if !errors.Is(err, ErrProbeInfrastructure) {
+		t.Fatalf("Process error = %v, want ErrProbeInfrastructure", err)
+	}
+	if errors.Is(err, ErrArticlesUnavailable) {
+		t.Fatalf("Process error = %v, must not classify as missing articles", err)
+	}
+}
+
+// A genuinely empty NZB (no usable file groups, no network probe failures)
+// must keep producing the terminal "no valid files" verdict.
+func TestProcessGenuinelyEmptyKeepsNoValidFilesVerdict(t *testing.T) {
+	server := newFakeStatServer(t, "223 0 %s")
+	host, port := server.hostPort(t)
+	parser := newGatingParser(t, host, port)
+	nzb, _ := parseGatingGroups(t, parser)
+
+	for _, groups := range []map[string]*FileGroup{
+		nil,
+		{"empty": {BaseName: "empty", Type: storage.NZBFileTypeMedia}},
+	} {
+		_, err := parser.Process(context.Background(), nzb, groups)
+		if err == nil {
+			t.Fatal("expected Process to fail for an empty NZB")
+		}
+		if !strings.Contains(err.Error(), "no valid files found in NZB") {
+			t.Fatalf("Process error = %v, want the no-valid-files verdict", err)
+		}
+		if errors.Is(err, ErrProbeInfrastructure) || errors.Is(err, ErrArticlesUnavailable) {
+			t.Fatalf("Process error = %v, must not carry a probe sentinel", err)
+		}
+	}
+}
+
+// countGroupFailure decides which group failures may soften the "no valid
+// files" verdict; pin its table.
+func TestCountGroupFailure(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantInfra int
+		wantMiss  int
+	}{
+		{"nil", nil, 0, 0},
+		{"430 article not found", &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Code: 430}, 0, 1},
+		{"articles unavailable sentinel", ErrArticlesUnavailable, 0, 1},
+		{"infrastructure sentinel", ErrProbeInfrastructure, 1, 0},
+		{"connection", nntp.NewConnectionError(errors.New("refused")), 1, 0},
+		{"authentication", &nntp.Error{Type: nntp.ErrorTypeAuthentication, Code: 481}, 1, 0},
+		{"context canceled", context.Canceled, 1, 0},
+		{"deadline exceeded", context.DeadlineExceeded, 1, 0},
+		{"wrapped connection", fmt.Errorf("failed to fetch first segment header: %w", nntp.NewConnectionError(errors.New("reset"))), 1, 0},
+		{"unknown content failure", errors.New("unsupported file type"), 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var counts probeFailureCounts
+			countGroupFailure(&counts, tc.err)
+			if counts.infrastructure != tc.wantInfra || counts.articlesMissing != tc.wantMiss {
+				t.Fatalf("countGroupFailure(%v) = infra %d, missing %d; want %d, %d",
+					tc.err, counts.infrastructure, counts.articlesMissing, tc.wantInfra, tc.wantMiss)
+			}
+		})
 	}
 }
 
