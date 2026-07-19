@@ -550,12 +550,20 @@ func (m *Manager) streamHTTP(ctx context.Context, torrent *storage.Entry, filena
 	if err != nil {
 		return fmt.Errorf("failed to get download link: %w", err)
 	}
-	return m.streamHTTPURL(ctx, downloadLink.DownloadLink, file, filename, start, end, rangeRequested, writer, onReady)
+	return m.streamHTTPURL(ctx, downloadLink.DownloadLink, torrent.ActiveProvider, file, filename, start, end, rangeRequested, writer, onReady)
 }
+
+// streamRangeIgnoredMaxDiscard bounds how many upstream bytes may be discarded
+// to reach the requested offset when an upstream answers a Range request with
+// 200 OK (full body). Small offsets are served by skipping the prefix so CDNs
+// that ignore Range headers keep working; beyond this bound the request is
+// retried once and only then failed, because discarding gigabytes to honor a
+// mid-file seek would stall playback anyway. Overridable in tests.
+var streamRangeIgnoredMaxDiscard = int64(8 << 20)
 
 // streamHTTPURL keeps link resolution separate from the byte-accurate HTTP
 // transfer. Tests exercise this layer with a real HTTP server.
-func (m *Manager) streamHTTPURL(ctx context.Context, url string, file *storage.File, filename string, start, end int64, rangeRequested bool, writer io.Writer, onReady StreamReadyFunc) error {
+func (m *Manager) streamHTTPURL(ctx context.Context, url, provider string, file *storage.File, filename string, start, end int64, rangeRequested bool, writer io.Writer, onReady StreamReadyFunc) error {
 	plan, err := newHTTPStreamPlan(file, start, end, rangeRequested)
 	if err != nil {
 		return retry.Unrecoverable(StreamError{Err: err, Retryable: false})
@@ -566,10 +574,33 @@ func (m *Manager) streamHTTPURL(ctx context.Context, url string, file *storage.F
 	if reqErr != nil {
 		return reqErr
 	}
+	if plan.upstreamRequested && resp.StatusCode == http.StatusOK && plan.upstreamStart > streamRangeIgnoredMaxDiscard {
+		// The upstream ignored the Range request and the offset is too large
+		// to reach by discarding. Give it exactly one more chance to honor the
+		// range before giving up.
+		resp.Body.Close()
+		m.logger.Warn().
+			Str("provider", provider).
+			Str("file", filename).
+			Int64("offset", plan.upstreamStart).
+			Msg("Upstream ignored Range request with a large offset; retrying once")
+		resp, reqErr = m.doRequest(ctx, url, plan.upstreamStart, plan.upstreamEnd, plan.upstreamRequested)
+		if reqErr != nil {
+			return reqErr
+		}
+	}
 	defer resp.Body.Close()
 
-	if responseErr := validateHTTPStreamResponse(resp, plan, expectedLen); responseErr != nil {
+	discardPrefix, responseErr := m.resolveHTTPStreamResponse(resp, plan, expectedLen, provider, filename)
+	if responseErr != nil {
 		return retry.Unrecoverable(StreamError{Err: responseErr, Retryable: false})
+	}
+	if discardPrefix > 0 {
+		// Skip the prefix before committing headers so a failure here can
+		// still surface as a proper error response.
+		if _, discardErr := io.CopyN(io.Discard, resp.Body, discardPrefix); discardErr != nil {
+			return classifyStreamTransferError(ctx, discardErr)
+		}
 	}
 
 	if onReady != nil {
@@ -605,40 +636,84 @@ func (m *Manager) streamHTTPURL(ctx context.Context, url string, file *storage.F
 	if copyErr == nil || copyErr == io.EOF {
 		return nil
 	}
+	return classifyStreamTransferError(ctx, copyErr)
+}
+
+// classifyStreamTransferError mirrors the historical copy-error handling:
+// caller cancellation is unrecoverable, network/timeout errors are retryable,
+// anything else is unrecoverable to avoid infinite retry loops.
+func classifyStreamTransferError(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return retry.Unrecoverable(ctx.Err())
 	}
-	if isConnectionError(copyErr) || strings.Contains(copyErr.Error(), "timeout") {
-		return copyErr
+	if isConnectionError(err) || strings.Contains(err.Error(), "timeout") {
+		return err
 	}
-	return retry.Unrecoverable(copyErr)
+	return retry.Unrecoverable(err)
 }
 
-func validateHTTPStreamResponse(resp *http.Response, plan httpStreamPlan, expectedLen int64) error {
+// resolveHTTPStreamResponse restores the tolerance the pre-validation streamer
+// had for imperfect debrid CDNs while still rejecting responses it would also
+// have choked on. It returns how many leading upstream bytes must be discarded
+// before the requested offset begins.
+//
+//   - 200 for a ranged request: the upstream ignored the Range header and sent
+//     the full body. Serve the requested window from it by skipping the offset
+//     prefix (bounded by streamRangeIgnoredMaxDiscard; the copy loop stops at
+//     the range length).
+//   - Inexact or unparseable Content-Range/Content-Length: WARN and proceed as
+//     the pre-validation code did; the copy loop still enforces the exact
+//     logical length.
+//   - Any other status: hard failure, exactly as before.
+func (m *Manager) resolveHTTPStreamResponse(resp *http.Response, plan httpStreamPlan, expectedLen int64, provider, filename string) (int64, error) {
 	if resp == nil {
-		return fmt.Errorf("upstream HTTP response is nil")
+		return 0, fmt.Errorf("upstream HTTP response is nil")
 	}
-	if plan.upstreamRequested {
-		if resp.StatusCode == http.StatusOK {
-			return fmt.Errorf("upstream ignored requested byte range %d-%d", plan.upstreamStart, plan.upstreamEnd)
-		}
-		if resp.StatusCode != http.StatusPartialContent {
-			return fmt.Errorf("unexpected HTTP status %d for ranged request", resp.StatusCode)
-		}
-		start, end, err := parseContentRange(resp.Header.Get("Content-Range"))
+	discardPrefix := int64(0)
+	switch {
+	case plan.upstreamRequested && resp.StatusCode == http.StatusPartialContent:
+		contentRange := resp.Header.Get("Content-Range")
+		start, end, err := parseContentRange(contentRange)
 		if err != nil {
-			return fmt.Errorf("invalid upstream Content-Range: %w", err)
+			m.logger.Warn().Err(err).
+				Str("provider", provider).
+				Str("file", filename).
+				Str("content_range", contentRange).
+				Msg("Upstream returned an unparseable Content-Range; proceeding with the requested range")
+		} else if start != plan.upstreamStart || end != plan.upstreamEnd {
+			m.logger.Warn().
+				Str("provider", provider).
+				Str("file", filename).
+				Str("content_range", contentRange).
+				Int64("requested_start", plan.upstreamStart).
+				Int64("requested_end", plan.upstreamEnd).
+				Msg("Upstream Content-Range does not match the requested range; proceeding")
 		}
-		if start != plan.upstreamStart || end != plan.upstreamEnd {
-			return fmt.Errorf("upstream returned byte range %d-%d, requested %d-%d", start, end, plan.upstreamStart, plan.upstreamEnd)
+	case plan.upstreamRequested && resp.StatusCode == http.StatusOK:
+		if plan.upstreamStart > streamRangeIgnoredMaxDiscard {
+			return 0, fmt.Errorf("upstream ignored requested byte range %d-%d and offset %d exceeds the %d byte discard bound",
+				plan.upstreamStart, plan.upstreamEnd, plan.upstreamStart, streamRangeIgnoredMaxDiscard)
 		}
-	} else if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected HTTP status %d for full request", resp.StatusCode)
+		discardPrefix = plan.upstreamStart
+		m.logger.Warn().
+			Str("provider", provider).
+			Str("file", filename).
+			Int64("discard", discardPrefix).
+			Msg("Upstream ignored Range request; serving the requested window from the full response")
+	case plan.upstreamRequested:
+		return 0, fmt.Errorf("unexpected HTTP status %d for ranged request", resp.StatusCode)
+	case resp.StatusCode != http.StatusOK:
+		return 0, fmt.Errorf("unexpected HTTP status %d for full request", resp.StatusCode)
 	}
-	if resp.ContentLength >= 0 && resp.ContentLength != expectedLen {
-		return fmt.Errorf("upstream content length %d does not match requested length %d", resp.ContentLength, expectedLen)
+	if discardPrefix == 0 && resp.ContentLength >= 0 && resp.ContentLength != expectedLen {
+		m.logger.Warn().
+			Str("provider", provider).
+			Str("file", filename).
+			Int64("content_length", resp.ContentLength).
+			Int64("expected", expectedLen).
+			Msg("Upstream content length does not match the requested length; proceeding")
 	}
-	return nil
+	return discardPrefix, nil
 }
 
 func parseContentRange(value string) (int64, int64, error) {
