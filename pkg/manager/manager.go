@@ -89,6 +89,22 @@ type Manager struct {
 	nzbSyncMu      sync.Mutex
 	nzbAdmissionMu sync.Mutex
 
+	// actionSem bounds concurrently running post-download actions (mount
+	// waits, local fetches, symlink creation). Sized max(4, MaxActiveDownloads)
+	// so a reboot backlog of claimed actions drains progressively instead of
+	// stampeding a cold mount and the persist mutex, while never dropping
+	// below the worker count so claimed work cannot starve behind imports.
+	actionSem chan struct{}
+	// actionInflight tracks hashes with a pending/running post-download action
+	// in this process (claimed and waiting on the gate, or executing). It
+	// prevents duplicate submissions - and later the orphaned-claim
+	// reconciler - from double-running a claimed action whose goroutine is
+	// still alive.
+	actionInflight *xsync.Map[string, struct{}]
+	// claimedActionTestHook, when set, replaces the real post-download action
+	// body so tests can observe gate concurrency without touching mounts.
+	claimedActionTestHook func(*storage.Entry)
+
 	// Notifications service
 	Notifications *notifications.Service
 }
@@ -237,6 +253,11 @@ func (m *Manager) init() {
 	// Initialize repair service. It registers with the scheduler in StartWorker.
 	m.repair = NewRepair(m)
 
+	// Initialize the post-download action gate before the job queue: restored
+	// ResumeAction jobs are routed through it as soon as workers start.
+	m.actionSem = make(chan struct{}, actionGateSize(cfg.MaxActiveDownloads))
+	m.actionInflight = xsync.NewMap[string, struct{}]()
+
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
 }
@@ -319,7 +340,12 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		return
 	}
 	if job.ResumeAction {
-		m.resumeClaimedAction(job.Entry)
+		// Never run the claimed action on this worker: submit it through the
+		// action gate on a detached goroutine so a restore backlog of claimed
+		// entries cannot occupy every active-download slot. The claim is
+		// already durable, so the slot frees immediately and the action drains
+		// at gate width.
+		m.submitResumeAction(job.Entry)
 		return
 	}
 	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
