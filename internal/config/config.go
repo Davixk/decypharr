@@ -322,6 +322,12 @@ func (c *Config) loadConfig() error {
 	// Apply environment variable overrides
 	c.applyEnvOverrides()
 
+	// Guardrail only — warn (never fail) when the parallel-import connection
+	// demand can exhaust the configured NNTP providers.
+	if warning := c.UsenetConnectionBudgetWarning(); warning != "" {
+		_, _ = fmt.Fprintf(os.Stderr, "WARNING: %s\n", warning)
+	}
+
 	return nil
 }
 

@@ -275,6 +275,11 @@ func (m *Manager) initUsenet() {
 		return
 	}
 	m.usenet = usenetClient
+	// Guardrail only — warn (never fail) when parallel imports can exhaust
+	// the configured provider connection budget and wedge the substrate.
+	if warning := m.config.UsenetConnectionBudgetWarning(); warning != "" {
+		m.logger.Warn().Msg(warning)
+	}
 }
 
 // initLinkService initializes the link service

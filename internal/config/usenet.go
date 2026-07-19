@@ -157,6 +157,41 @@ func (c *Config) updateUsenetProvider(index int, u UsenetProvider) UsenetProvide
 	return u
 }
 
+// UsenetConnectionBudgetWarning reports a configuration whose worst-case
+// parallel-import connection demand (max_active_downloads imports, each
+// allowed usenet.processing_max_connections concurrent connections) exceeds
+// twice the total connection budget across all configured providers. Such a
+// configuration can exhaust every provider slot under load and wedge the NNTP
+// substrate — the failure mode behind the boot-restore incident. Returns ""
+// when the configuration is within budget; callers log the returned message
+// as a warning (this is a guardrail, never a hard failure).
+func (c *Config) UsenetConnectionBudgetWarning() string {
+	if len(c.Usenet.Providers) == 0 {
+		return ""
+	}
+	totalProviderConns := 0
+	for _, provider := range c.Usenet.Providers {
+		totalProviderConns += provider.MaxConnections
+	}
+	if totalProviderConns <= 0 || c.MaxActiveDownloads <= 0 || c.Usenet.ProcessingMaxConnections <= 0 {
+		return ""
+	}
+	demand := c.MaxActiveDownloads * c.Usenet.ProcessingMaxConnections
+	budget := 2 * totalProviderConns
+	if demand <= budget {
+		return ""
+	}
+	recommendedActive := budget / c.Usenet.ProcessingMaxConnections
+	if recommendedActive < 1 {
+		recommendedActive = 1
+	}
+	return fmt.Sprintf(
+		"max_active_downloads (%d) x usenet.processing_max_connections (%d) = %d demanded connections exceeds 2x the total provider connection budget (2 x %d = %d); parallel imports can exhaust provider connections and wedge the NNTP substrate. Keep max_active_downloads x processing_max_connections <= %d (e.g. max_active_downloads <= %d)",
+		c.MaxActiveDownloads, c.Usenet.ProcessingMaxConnections, demand,
+		totalProviderConns, budget, budget, recommendedActive,
+	)
+}
+
 func validateUsenet(providers []UsenetProvider) error {
 	if len(providers) == 0 {
 		return nil
