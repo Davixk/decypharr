@@ -110,9 +110,15 @@ One TSV line per candidate on stdout
 decision is `would-revive-as-<class>` / `would-unflip` (dry-run),
 `revived-as-<class>` / `unflipped` (apply; `+main` when the main-store row
 was reset too), or `skip-<reason>`. A `# census:` summary line (including
-`A2-unflip=N`) closes the report. The storage
-layer prints its own startup log lines to stdout as well; TSV consumers
-should keep only lines starting with a hash or drop `#`/log lines.
+`A2-unflip=N`) closes the report.
+
+stdout carries **only** the `# hash...` header, TSV rows, and trailing `#`
+census/comment lines — safe to redirect straight into a file or pipe.
+Every banner, warning, and dependency log line (config loading, storage
+init) goes to stderr: the tool points the process-global `os.Stdout` at
+stderr while the stores are open, so writers that grab `os.Stdout` at
+construction time (zerolog console writers, `fmt.Printf` in config
+loading) can never leak into the TSV stream.
 
 Exit codes: `0` success, `1` the state dir looks wrong (no `db/`) or an
 operational failure, `2` zero candidates matched (distinct so operator

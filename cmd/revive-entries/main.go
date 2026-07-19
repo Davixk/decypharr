@@ -154,6 +154,21 @@ func main() {
 }
 
 func run(opts options, stdout, stderr io.Writer) int {
+	// stdout is a machine-readable TSV stream: the '# hash...' header, one row
+	// per candidate, and trailing '#' census/comment lines — nothing else.
+	// Two dependencies print to the process-global os.Stdout on first use:
+	// internal/config.Get logs "Loading config from ..." via fmt.Printf, and
+	// internal/logger.New builds its zerolog console writer on os.Stdout (the
+	// storage layers log INFO lines through it at init). Both resolve
+	// os.Stdout at call/construction time, so pointing the global at the
+	// stderr file for the lifetime of the run routes every stray diagnostic
+	// to stderr. The TSV keeps flowing to the stdout writer handed in by
+	// main, which captured the real stdout before this swap. Registered
+	// before the store-open defers so Close-time logging is still covered.
+	savedStdout := os.Stdout
+	os.Stdout = os.Stderr
+	defer func() { os.Stdout = savedStdout }()
+
 	mode := "DRY-RUN (no changes will be written; pass -apply to reset)"
 	if opts.apply {
 		mode = "APPLY (queue and main rows WILL be mutated)"
