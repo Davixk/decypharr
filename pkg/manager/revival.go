@@ -2,13 +2,17 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
 
 // revivableErrorSignatures identify LastError values recorded for
@@ -143,12 +147,82 @@ func (m *Manager) resubmitRevivedEntry(entry *storage.Entry, resumeAction bool) 
 	}
 }
 
+// isDoomedQueuedRebuild reports whether reviving entry into the queued path
+// would only churn a rebuild that is GUARANTEED to fail:
+// rebuildQueuedNZBJob needs either completed metadata to resume or a readable
+// NZB source to re-parse. When the durable meta is not completed and carries
+// no parsed segments (empty or segmentless Files — the on-disk shape the
+// 2026-07-19 quick-parse persist left behind before markAsFailed cemented it)
+// and no source survives (entry.Magnet, meta.Path — the two paths
+// rebuildQueuedNZBJob actually resolves — or a staged
+// usenet/nzbs/<id>.*.source/.queued artifact), the rebuild can only fail
+// again: ErrorCount would grow and the forensic LastError the offline
+// recovery tool selects on would be overwritten.
+//
+// Mount-timeout revivals resume the post-download action instead of
+// rebuilding, so callers must not apply this check to them. Any uncertainty
+// (usenet not configured, undecodable meta, stat errors) keeps the entry
+// eligible exactly as before.
+func (m *Manager) isDoomedQueuedRebuild(entry *storage.Entry) bool {
+	if m.usenet == nil || entry == nil {
+		return false
+	}
+	meta, err := m.usenet.GetNZBHeader(entry.InfoHash)
+	if err != nil && !errors.Is(err, usenet.ErrNZBNotFound) {
+		return false
+	}
+	if meta != nil {
+		if meta.Status == usenet.NZBStatusCompleted {
+			// Completed metadata resumes without any source; eligible as today.
+			return false
+		}
+		hasSegments, segErr := m.usenet.NZBStorage().HasSegmentedFiles(entry.InfoHash)
+		if segErr != nil || hasSegments {
+			// Populated segment maps stay eligible (conservative: only the
+			// empty/segmentless shape is provably unrebuildable offline).
+			return false
+		}
+	}
+	// Mirror rebuildQueuedNZBJob's source resolution (entry.Magnet, overridden
+	// by meta.Path), plus the staged .source/.queued artifacts a claim scan
+	// could re-import. Any surviving file keeps the entry eligible.
+	if usableNZBSourceFile(entry.Magnet) {
+		return false
+	}
+	if meta != nil && usableNZBSourceFile(meta.Path) {
+		return false
+	}
+	nzbDir := filepath.Join(config.GetMainPath(), "usenet", "nzbs")
+	for _, suffix := range []string{".source", ".queued"} {
+		matches, globErr := filepath.Glob(filepath.Join(nzbDir, entry.InfoHash+".*"+suffix))
+		if globErr == nil && len(matches) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func usableNZBSourceFile(path string) bool {
+	if path == "" {
+		return false
+	}
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
+
 // reviveErrorEntries scans terminal-error NZB entries and revives every one
 // whose failure signature is infrastructure/availability class and whose
 // ErrorCount is still below the configured retries. limit == 0 means
 // unlimited (boot restore, explicit retry_all); the periodic sweep passes
 // reviveSweepLimit. When resubmit is false the caller owns pickup (boot
 // restore's passes run right after).
+//
+// Entries whose queued rebuild is guaranteed to fail (see
+// isDoomedQueuedRebuild) are skipped — reviving them cannot succeed and each
+// doomed cycle would increment ErrorCount and overwrite the forensic
+// LastError. The skip WARNs once per entry per boot (deduped via
+// revivalDoomWarned) and names the recourse. Explicit single-entry retries
+// (ReviveErrorEntry, SABnzbd mode=retry) still bypass this via force.
 func (m *Manager) reviveErrorEntries(ctx context.Context, limit int, resubmit bool) int {
 	if m.queue == nil {
 		return 0
@@ -163,6 +237,17 @@ func (m *Manager) reviveErrorEntries(ctx context.Context, limit int, resubmit bo
 			break
 		}
 		if !m.isRevivableErrorEntry(entry, false) {
+			continue
+		}
+		if !strings.Contains(entry.LastError, mountTimeoutSignature) && m.isDoomedQueuedRebuild(entry) {
+			if _, warned := m.revivalDoomWarned.LoadOrStore(entry.InfoHash, struct{}{}); !warned {
+				m.logger.Warn().
+					Str("infohash", entry.InfoHash).
+					Str("name", entry.Name).
+					Str("last_error", entry.LastError).
+					Int("error_count", entry.ErrorCount).
+					Msg("Skipping revival: rebuild is guaranteed to fail (metadata has no parsed segments and no NZB source survives on disk); unrecoverable offline; requires re-grab")
+			}
 			continue
 		}
 		updated, resumeAction, applied, err := m.reviveErrorEntry(entry.InfoHash, false)

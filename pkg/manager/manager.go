@@ -91,6 +91,11 @@ type Manager struct {
 	nzbSyncMu      sync.Mutex
 	nzbAdmissionMu sync.Mutex
 
+	// revivalDoomWarned dedups the once-per-entry-per-boot WARN emitted when
+	// the revival sweep skips an entry whose queued rebuild is guaranteed to
+	// fail (no parsed segments in metadata and no NZB source on disk).
+	revivalDoomWarned sync.Map
+
 	// actionSem bounds concurrently running post-download actions (mount
 	// waits, local fetches, symlink creation). Sized max(4, MaxActiveDownloads)
 	// so a reboot backlog of claimed actions drains progressively instead of

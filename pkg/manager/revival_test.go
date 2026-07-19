@@ -9,6 +9,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/config"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
 )
 
 func addErrorNZBEntry(t *testing.T, m *Manager, infohash, lastError string, errorCount int, bad bool) *storage.Entry {
@@ -198,6 +199,25 @@ func TestRevivalSweepHonorsRateLimit(t *testing.T) {
 
 	for _, hash := range []string{"limited-1", "limited-2", "limited-3"} {
 		addErrorNZBEntry(t, m, hash, "articles missing on provider: failed to stat segment", 1, false)
+		// Production shape of the stat-segment cohort: the parse-time failure
+		// never persisted, so the previously completed metadata survives (and
+		// keeps the entry rebuild-viable for the sweep).
+		if err := m.usenet.NZBStorage().AddNZB(&storage.NZB{
+			ID:     hash,
+			Name:   hash + ".nzb",
+			Status: usenet.NZBStatusCompleted,
+			Files: []storage.NZBFile{{
+				Name: "movie.mkv",
+				Size: 4096,
+				Segments: []storage.NZBSegment{{
+					Number:    1,
+					MessageID: hash + "-seg",
+					Bytes:     4096,
+				}},
+			}},
+		}); err != nil {
+			t.Fatalf("AddNZB(%s): %v", hash, err)
+		}
 	}
 	if revived := m.reviveErrorEntries(context.Background(), 2, false); revived != 2 {
 		t.Fatalf("sweep revived %d entries, want the limit of 2", revived)
