@@ -1,9 +1,10 @@
 name: Release
 
+# Fork note: this is upstream's release pipeline (publishes to sirrobot01/cy01
+# registries the fork has no credentials for). Manual-only here so fork image
+# tags (v*-fork.*) never trigger it; fork images ship via custom-image.yml.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
