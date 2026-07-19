@@ -288,6 +288,129 @@ func TestRestorePass2Genuine430StillMarksError(t *testing.T) {
 	}
 }
 
+// parseVerdictNZBJob parses the test NZB through the real usenet client and
+// returns a ready-to-process job for the given queued entry.
+func parseVerdictNZBJob(t *testing.T, m *Manager, entry *storage.Entry) *Job {
+	t.Helper()
+	meta, groups, err := m.usenet.ParseWithGeneration(context.Background(), entry.InfoHash, usenet.NewNZBGeneration(), "movie.nzb", []byte(verdictTestNZB), "")
+	if err != nil {
+		t.Fatalf("ParseWithGeneration: %v", err)
+	}
+	return &Job{ID: entry.InfoHash, Type: JobTypeNZB, Entry: entry, NZBMeta: meta, NZBGroups: groups}
+}
+
+// An archive-processing (Process-phase) failure caused by a collapsed NNTP
+// substrate must NOT terminally error the entry with the generic "no valid
+// files" verdict — the exact mechanism that parked 1,891 entries on
+// 2026-07-19. The entry stays queued and a rebuild retry is scheduled.
+func TestProcessJobArchiveInfraFailureKeepsEntryQueued(t *testing.T) {
+	server := newVerdictFakeNNTPServer(t, true)
+	host, port := server.hostPort(t)
+	m, jobCh := newVerdictTestManager(t, host, port)
+	m.usenetTimeout = 30 * time.Second
+
+	prevBase := nzbInfraRetryBaseDelay
+	nzbInfraRetryBaseDelay = 5 * time.Millisecond
+	t.Cleanup(func() { nzbInfraRetryBaseDelay = prevBase })
+
+	entry := newQueuedNZBEntry(t, m, "archive-infra-entry")
+	job := parseVerdictNZBJob(t, m, entry)
+
+	server.Close() // substrate collapses between parse and archive processing
+	m.processJob(context.Background(), job)
+
+	persisted, err := m.storage.GetQueued(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("GetQueued: %v", err)
+	}
+	if persisted.State == storage.EntryStateError {
+		t.Fatalf("entry was marked terminal error (LastError=%q); archive-phase infrastructure failures must stay retryable", persisted.LastError)
+	}
+	if persisted.Status != debridTypes.TorrentStatusQueued {
+		t.Fatalf("entry status = %q, want %q", persisted.Status, debridTypes.TorrentStatusQueued)
+	}
+	if persisted.LastError != "" {
+		t.Fatalf("entry LastError = %q, want empty", persisted.LastError)
+	}
+
+	select {
+	case retry := <-jobCh:
+		if retry.ID != entry.InfoHash || !retry.RebuildQueued {
+			t.Fatalf("retry job = %+v, want RebuildQueued job for %s", retry, entry.InfoHash)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no retry job was scheduled for the archive-phase infrastructure failure")
+	}
+}
+
+// An expired per-job processing deadline is an infrastructure-class outcome,
+// not a content verdict: the entry stays queued and retries with backoff.
+func TestProcessJobArchiveDeadlineKeepsEntryQueued(t *testing.T) {
+	server := newVerdictFakeNNTPServer(t, true) // BODY blocks: processing wedges
+	host, port := server.hostPort(t)
+	m, jobCh := newVerdictTestManager(t, host, port)
+	m.usenetTimeout = 100 * time.Millisecond
+
+	prevBase := nzbInfraRetryBaseDelay
+	nzbInfraRetryBaseDelay = 5 * time.Millisecond
+	t.Cleanup(func() { nzbInfraRetryBaseDelay = prevBase })
+
+	entry := newQueuedNZBEntry(t, m, "archive-deadline-entry")
+	job := parseVerdictNZBJob(t, m, entry)
+	m.processJob(context.Background(), job)
+
+	persisted, err := m.storage.GetQueued(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("GetQueued: %v", err)
+	}
+	if persisted.State == storage.EntryStateError {
+		t.Fatalf("entry was marked terminal error (LastError=%q); processing deadlines must stay retryable", persisted.LastError)
+	}
+	if persisted.Status != debridTypes.TorrentStatusQueued {
+		t.Fatalf("entry status = %q, want %q", persisted.Status, debridTypes.TorrentStatusQueued)
+	}
+
+	select {
+	case retry := <-jobCh:
+		if retry.ID != entry.InfoHash || !retry.RebuildQueued {
+			t.Fatalf("retry job = %+v, want RebuildQueued job for %s", retry, entry.InfoHash)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no retry job was scheduled for the expired processing deadline")
+	}
+}
+
+// Shutdown (job-context cancellation) during archive processing must leave
+// the entry exactly as it was: no error marking, no retry scheduling. Boot
+// restore owns the pickup after a restart.
+func TestProcessJobShutdownCancelLeavesEntryUntouched(t *testing.T) {
+	server := newVerdictFakeNNTPServer(t, true)
+	host, port := server.hostPort(t)
+	m, jobCh := newVerdictTestManager(t, host, port)
+	m.usenetTimeout = 30 * time.Second
+
+	entry := newQueuedNZBEntry(t, m, "shutdown-cancel-entry")
+	job := parseVerdictNZBJob(t, m, entry)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // shutdown before/while the worker runs the job
+	m.processJob(ctx, job)
+
+	persisted, err := m.storage.GetQueued(entry.InfoHash)
+	if err != nil {
+		t.Fatalf("GetQueued: %v", err)
+	}
+	if persisted.State == storage.EntryStateError {
+		t.Fatalf("entry was marked terminal error (LastError=%q) during shutdown", persisted.LastError)
+	}
+	if persisted.LastError != "" {
+		t.Fatalf("entry LastError = %q, want empty", persisted.LastError)
+	}
+	if len(jobCh) != 0 {
+		t.Fatalf("%d jobs were scheduled during shutdown, want 0", len(jobCh))
+	}
+}
+
 // nzbInfraRetryDelay grows exponentially from the base and caps at the max.
 func TestNZBInfraRetryDelayBackoff(t *testing.T) {
 	prevBase, prevMax := nzbInfraRetryBaseDelay, nzbInfraRetryMaxDelay

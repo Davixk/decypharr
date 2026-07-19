@@ -342,8 +342,20 @@ func (m *Manager) processNewNzb(parentCtx context.Context, entry *storage.Entry,
 
 	updatedNZB, err := m.usenet.Process(ctx, metadata, groups)
 	if err != nil {
+		if parentErr := parentCtx.Err(); parentErr != nil {
+			// Shutdown or job cancellation: there is no verdict about the
+			// content. Return the bare context error so processJob's ctx guard
+			// leaves the entry in its prior state instead of terminally
+			// error-marking it.
+			return parentErr
+		}
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return fmt.Errorf("usenet processing timed out after %s: %w", m.usenetTimeout, err)
+			// Only the per-job processing deadline elapsed: the substrate was
+			// too slow to answer, which is an infrastructure-class outcome
+			// with no content verdict. Carry the sentinel so processJob keeps
+			// the entry queued and retries with backoff instead of parking it
+			// in a terminal error.
+			return fmt.Errorf("%w: usenet processing timed out after %s: %w", parser.ErrProbeInfrastructure, m.usenetTimeout, err)
 		}
 		return fmt.Errorf("failed to process nzb: %w", err)
 	}
