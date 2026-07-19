@@ -30,6 +30,27 @@ var ErrMoreRarDataNeeded = fmt.Errorf("rar: need more data")
 // release natively instead of reporting a download-client failure.
 var ErrArticlesUnavailable = errors.New("articles missing on provider")
 
+// ErrProbeInfrastructure classifies parse-time probe failures where the NNTP
+// substrate itself failed (connection refused/reset, timeouts, auth failures,
+// no acquirable provider connection) so no verdict about the articles exists.
+// Callers must NOT treat this as "content is missing": marking such an entry
+// failed blocklists a release that may be perfectly available once the
+// substrate recovers. Unknown/ambiguous errors deliberately classify here —
+// a wrong "infrastructure" verdict merely retries later, while a wrong
+// "missing" verdict permanently blocklists a good release.
+var ErrProbeInfrastructure = errors.New("availability probe failed: provider connectivity problem")
+
+// classifyProbeError wraps a segment-probe failure in the sentinel matching
+// its verdict: a genuine provider article-not-found answer (430/423) becomes
+// ErrArticlesUnavailable, everything else (infrastructure and unknown errors)
+// becomes ErrProbeInfrastructure.
+func classifyProbeError(err error) error {
+	if nntp.IsArticleNotFoundError(err) {
+		return ErrArticlesUnavailable
+	}
+	return ErrProbeInfrastructure
+}
+
 var (
 	// defaultMaxSnippetSize is used for content-type detection via magic bytes.
 	// TS sync-byte check at offset 188 is the deepest we go, so 512 bytes is ample.
@@ -155,11 +176,17 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 	fileGroups, probeFailures := p.groupFiles(ctx, raw.Files)
 
 	if len(fileGroups) == 0 {
-		if probeFailures > 0 && ctx.Err() == nil {
+		if probeFailures.total() > 0 && ctx.Err() == nil {
 			// Every candidate group was dropped and at least one segment header
 			// probe failed on the network: this is an availability problem, not a
-			// malformed NZB.
-			return nil, nil, fmt.Errorf("%w: no valid file groups found in NZB after %d segment header probe failure(s)", ErrArticlesUnavailable, probeFailures)
+			// malformed NZB. Only an all-genuine-430 failure set may carry the
+			// "articles missing" verdict; any infrastructure-class failure makes
+			// the availability of the content unknowable, so fail safe.
+			verdict := error(ErrArticlesUnavailable)
+			if probeFailures.infrastructure > 0 {
+				verdict = ErrProbeInfrastructure
+			}
+			return nil, nil, fmt.Errorf("%w: no valid file groups found in NZB after %d segment header probe failure(s)", verdict, probeFailures.total())
 		}
 		return nil, nil, fmt.Errorf("no valid file groups found in NZB")
 	}
@@ -177,10 +204,13 @@ func (p *NZBParser) Parse(ctx context.Context, filename string, content []byte) 
 		})
 		if err != nil {
 			if ctx.Err() == nil {
-				// Structurally valid NZB whose first article cannot be confirmed on
-				// any provider (430/connection/auth). Classify so callers can accept
-				// the add and record a failed history entry.
-				return nil, nil, fmt.Errorf("%w: failed to stat segment %s <%s>: %w", ErrArticlesUnavailable, group.ActualFilename, segment.Id, err)
+				// Structurally valid NZB whose first article could not be
+				// confirmed. A genuine provider 430/423 answer is the "articles
+				// missing" verdict (callers accept the add and record a failed
+				// history entry so the arr blocklists the release); every other
+				// failure is an infrastructure problem with no verdict at all,
+				// and callers must keep the entry retryable instead.
+				return nil, nil, fmt.Errorf("%w: failed to stat segment %s <%s>: %w", classifyProbeError(err), group.ActualFilename, segment.Id, err)
 			}
 			return nil, nil, fmt.Errorf("failed to stat segment %s <%s>: %w", group.ActualFilename, segment.Id, err)
 		}
@@ -250,11 +280,13 @@ func (p *NZBParser) Process(ctx context.Context, nzb *storage.NZB, groups map[st
 	return nzb, nil
 }
 
-// groupFiles groups NZB files by base name/type. The second return value is
-// the number of segment header probes that failed on the network while
-// detecting content types; callers use it to distinguish an NZB that is
-// structurally empty from one whose articles are unavailable.
-func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) (map[string]*FileGroup, int) {
+// groupFiles groups NZB files by base name/type. The second return value
+// counts the segment header probes that failed on the network while detecting
+// content types, split by verdict class; callers use it to distinguish an NZB
+// that is structurally empty from one whose articles are unavailable — and,
+// among the latter, a genuine missing-articles verdict from a substrate
+// failure that carries no verdict.
+func (p *NZBParser) groupFiles(ctx context.Context, files nzbparser.NzbFiles) (map[string]*FileGroup, probeFailureCounts) {
 	// Assign XML document order as Number for files with uniform Number values.
 	// This preserves upload order for obfuscated archives where the subject
 	// line doesn't contain file number patterns like [X/Y].
@@ -384,12 +416,25 @@ func (p *NZBParser) mergeObfuscatedRarGroups(groups map[string]*FileGroup) map[s
 	return groups
 }
 
+// probeFailureCounts tallies segment-header probe failures by verdict class.
+type probeFailureCounts struct {
+	// articlesMissing counts probes a provider genuinely answered 430/423 for.
+	articlesMissing int
+	// infrastructure counts probes that failed without any article verdict
+	// (connection/timeout/auth/acquire failures and unknown errors).
+	infrastructure int
+}
+
+func (c probeFailureCounts) total() int {
+	return c.articlesMissing + c.infrastructure
+}
+
 // Batch process unknown files in parallel. The second return value counts
 // files whose segment header probe failed on the network (as opposed to files
-// that were merely unrecognized).
-func (p *NZBParser) batchDetectContentTypes(ctx context.Context, unknownFiles []nzbparser.NzbFile) ([]contentResult, int) {
+// that were merely unrecognized), split by verdict class.
+func (p *NZBParser) batchDetectContentTypes(ctx context.Context, unknownFiles []nzbparser.NzbFile) ([]contentResult, probeFailureCounts) {
 	if len(unknownFiles) == 0 {
-		return nil, 0
+		return nil, probeFailureCounts{}
 	}
 
 	// Use up to maxConcurrent workers — same budget as the rest of the parser.
@@ -417,11 +462,13 @@ func (p *NZBParser) batchDetectContentTypes(ctx context.Context, unknownFiles []
 		}
 	})
 
-	probeFailures := 0
+	var probeFailures probeFailureCounts
 	processed := make([]contentResult, 0, len(mapped))
 	for _, r := range mapped {
 		if errors.Is(r.err, ErrArticlesUnavailable) {
-			probeFailures++
+			probeFailures.articlesMissing++
+		} else if errors.Is(r.err, ErrProbeInfrastructure) {
+			probeFailures.infrastructure++
 		}
 		if r.fileType != storage.NZBFileTypeUnknown {
 			processed = append(processed, r)
@@ -859,7 +906,10 @@ func (p *NZBParser) detectFileTypeByContent(ctx context.Context, file nzbparser.
 	})
 	if err != nil {
 		if ctx.Err() == nil {
-			return storage.NZBFileTypeUnknown, "", fmt.Errorf("%w: failed to fetch segment header for file %s: %w", ErrArticlesUnavailable, file.Filename, err)
+			// Same verdict gating as the parse-time STAT probe: only a genuine
+			// 430/423 becomes ErrArticlesUnavailable; infrastructure and unknown
+			// failures become ErrProbeInfrastructure.
+			return storage.NZBFileTypeUnknown, "", fmt.Errorf("%w: failed to fetch segment header for file %s: %w", classifyProbeError(err), file.Filename, err)
 		}
 		return storage.NZBFileTypeUnknown, "", fmt.Errorf("failed to fetch segment header for file %s: %w", file.Filename, err)
 	}
