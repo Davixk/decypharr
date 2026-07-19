@@ -86,12 +86,15 @@ func (m *Manager) submitResumeAction(entry *storage.Entry) {
 			Msg("Post-download action already pending in this process")
 		return
 	}
+	// Copy before detaching: restore loops keep refreshing their own Entry
+	// pointers, and the resumed action must not share one with them.
+	snapshot := *entry
 	go func() {
-		defer m.endActionInflight(entry.InfoHash)
+		defer m.endActionInflight(snapshot.InfoHash)
 		if !m.acquireActionSlot() {
 			return
 		}
 		defer m.releaseActionSlot()
-		m.resumeClaimedAction(entry)
+		m.resumeClaimedAction(&snapshot)
 	}()
 }
