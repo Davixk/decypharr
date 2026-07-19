@@ -737,7 +737,11 @@ func clearHotFields(c *Config) {
 	c.CallbackURL = ""
 	c.DownloadFolder = ""
 	c.RefreshInterval = ""
-	c.MaxActiveDownloads = 0
+	// MaxActiveDownloads is deliberately NOT cleared here (i.e. it is a cold,
+	// restart-required field): the manager sizes its active-download worker
+	// pool and the post-download action gate from it once at construction, and
+	// nothing rebuilds them on a live config apply. Treating it as hot made
+	// changes silently require a restart without telling the user.
 	c.SkipPreCache = false
 	c.SkipMultiSeason = false
 	c.AlwaysRmTrackerUrls = false
