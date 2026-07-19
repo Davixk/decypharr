@@ -33,14 +33,14 @@ boot-restore picks them up again on the next daemon start.
 | `-apply` | `false` | actually write the resets; default is dry-run |
 | `-from <RFC3339>` | `2026-07-19T05:35:00-07:00` | incident window start |
 | `-to <RFC3339>` | `2026-07-19T05:50:00-07:00` | incident window end |
-| `-max-errors N` | `3` | skip entries with `ErrorCount > N` |
+| `-max-errors N` | `3` | retry budget for **class B only**: skip B rows with `ErrorCount > N`. No-network classes (A, A-action, A2) are exempt |
 | `-tag <string>` | `revived-20260719` | tag appended to revived entries' Tags |
 
 ## What it selects
 
 Queue-store entries with protocol `nzb`, `State=error`, `Bad=false`,
-`ErrorCount <= max-errors`, `LastErrorTime` inside `[from, to]`, and a
-`LastError` containing one of the incident signatures:
+`LastErrorTime` inside `[from, to]`, and a `LastError` containing one of the
+incident signatures:
 
 - `articles missing on provider: failed to stat segment`
 - `no valid file groups found in NZB after`
@@ -55,6 +55,19 @@ dropped every file group and the parser swallowed the real cause.
 
 `Bad=true` rows and genuine `NNTP ARTICLE_NOT_FOUND (code 430)` verdicts
 outside the window are never touched.
+
+### The ErrorCount cap is class-scoped
+
+`ErrorCount` is **not** part of the base selector. The `-max-errors` budget
+is applied after classification, and only to **class B**, whose revival
+re-parses the NZB over the network — the one case where a prior-failure
+budget still means something. Classes A, A-action and A2 resume from
+completed metadata or un-flip a failed meta in place with **zero network
+work**, so a retry budget is meaningless for them; worse, every premature
+fork.1 boot re-failed the same parked rows and inflated their `ErrorCount`,
+so a global cap would silently exclude exactly the entries this tool exists
+to save. Capped B rows are listed with decision `skip-max-errors` (counted
+under `skipped=` in the census) instead of being silently dropped.
 
 ## Classification and reset
 
@@ -85,8 +98,16 @@ outside the window are never touched.
   Near-misses stay class C with a precise reason:
   `skip-meta-failed-bad-or-deleted` (genuine content verdict),
   `skip-meta-failed-empty-files` (files present but segmentless or
-  zero-size), `skip-meta-failed-no-xml` (nothing parsed AND no XML — the
-  meta never got past the parse stage).
+  zero-size), `skip-meta-failed-no-xml` (truly empty `Files` AND no XML).
+  Note on `skip-meta-failed-no-xml`: the 2026-07-19 cohort lands here
+  because the incident's rebuild re-parse persisted the quick-parse NZB —
+  which always carries an **empty** file table — over the durable meta
+  *before* `markAsFailed` ran, and then deleted the re-staged source on
+  failure. The verdict is faithful to the disk: for those rows nothing
+  survives to un-flip offline, and the recourse is an arr-side re-grab.
+  (The engine no longer re-parses over completed metadata —
+  `rebuildQueuedNZBJob` resumes pre-fence completed metas — so this shape
+  cannot be produced again.)
 - **Class C** — none of the above (also: generation mismatch or
   undecodable meta). Reported only, never mutated. Recourse: re-grab from
   the arr side.
