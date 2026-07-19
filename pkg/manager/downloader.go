@@ -30,10 +30,17 @@ type Downloader struct {
 	mountPath string
 	dest      string
 	logger    zerolog.Logger
+
+	// readDir is os.ReadDir in production; injectable so tests can simulate a
+	// hung FUSE mount.
+	readDir func(string) ([]os.DirEntry, error)
+	// scanTimeout bounds a single mount scan (see scanMountForFilesBounded).
+	scanTimeout time.Duration
 }
 
 const (
 	symlinkMountWaitTimeout     = 30 * time.Minute
+	symlinkMountScanTimeout     = 30 * time.Second
 	symlinkScanInitialInterval  = 100 * time.Millisecond
 	symlinkScanMaxInterval      = 2 * time.Second
 	symlinkReadyTimeout         = 2 * time.Minute
@@ -42,6 +49,11 @@ const (
 	symlinkLogEveryAttempts     = 10
 	symlinkLogSampleSize        = 8
 )
+
+// errMountScanTimeout marks a single scan that exceeded scanTimeout on a hung
+// mount; the poll loop treats it as "files not visible yet" and retries until
+// the overall symlinkMountWaitTimeout deadline.
+var errMountScanTimeout = errors.New("mount scan timed out")
 
 type downloadLogMeta struct {
 	requestHost     string
@@ -68,11 +80,13 @@ func NewDownloadManager(manager *Manager) *Downloader {
 		strmURL = fmt.Sprintf("http://%s:%s", bindAddress, cfg.Port)
 	}
 	return &Downloader{
-		manager:   manager,
-		strmURL:   strmURL,
-		mountPath: cfg.Mount.MountPath,
-		logger:    manager.logger.With().Str("component", "downloader").Logger(),
-		dest:      cfg.DownloadFolder,
+		manager:     manager,
+		strmURL:     strmURL,
+		mountPath:   cfg.Mount.MountPath,
+		logger:      manager.logger.With().Str("component", "downloader").Logger(),
+		dest:        cfg.DownloadFolder,
+		readDir:     os.ReadDir,
+		scanTimeout: symlinkMountScanTimeout,
 	}
 }
 
@@ -317,6 +331,99 @@ func (d *Downloader) processSymlink(ctx context.Context, entry *storage.Entry, m
 	return d.completeEntry(ctx, entry)
 }
 
+// mountScanResult carries the outcome of one bounded mount scan. found maps a
+// wanted file name to its full path on the mount; err records the first
+// ReadDir failure (or errMountScanTimeout) for diagnostics only.
+type mountScanResult struct {
+	found map[string]string
+	err   error
+}
+
+// scanMountForFiles walks the mount looking for the wanted names. It only
+// touches its own arguments and result, so an abandoned (timed out) scan
+// cannot mutate the caller's state afterwards.
+func (d *Downloader) scanMountForFiles(mountPath string, names map[string]struct{}) mountScanResult {
+	readDir := d.readDir
+	if readDir == nil {
+		readDir = os.ReadDir
+	}
+	result := mountScanResult{found: make(map[string]string, len(names))}
+	var walk func(string)
+	walk = func(dirPath string) {
+		entries, err := readDir(dirPath)
+		if err != nil {
+			if result.err == nil {
+				result.err = err
+			}
+			return
+		}
+		for _, item := range entries {
+			entryName := item.Name()
+			fullPath := filepath.Join(dirPath, entryName)
+			if _, wanted := names[entryName]; wanted {
+				if _, dup := result.found[entryName]; !dup {
+					result.found[entryName] = fullPath
+				}
+				continue
+			}
+			if item.IsDir() {
+				walk(fullPath)
+			}
+		}
+	}
+	walk(mountPath)
+	return result
+}
+
+// scanMountForFilesBounded runs one mount scan on its own goroutine with a
+// per-scan timeout so a hung FUSE mount (ReadDir never returning) cannot pin
+// the caller past the overall symlinkMountWaitTimeout deadline. On timeout the
+// scan is abandoned (it owns only private state) and the result reads as
+// "nothing visible yet". A cancelled ctx aborts the wait entirely.
+func (d *Downloader) scanMountForFilesBounded(ctx context.Context, mountPath string, remaining map[string]*storage.File) (mountScanResult, error) {
+	names := make(map[string]struct{}, len(remaining))
+	for name := range remaining {
+		names[name] = struct{}{}
+	}
+	timeout := d.scanTimeout
+	if timeout <= 0 {
+		timeout = symlinkMountScanTimeout
+	}
+	resultCh := make(chan mountScanResult, 1)
+	go func() {
+		resultCh <- d.scanMountForFiles(mountPath, names)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case result := <-resultCh:
+		return result, nil
+	case <-ctx.Done():
+		return mountScanResult{}, ctx.Err()
+	case <-timer.C:
+		return mountScanResult{err: errMountScanTimeout}, nil
+	}
+}
+
+// triggerMountRefresh asks the configured mount (e.g. external rclone rc
+// vfs/forget + vfs/refresh) to refresh its directory listings. It is a no-op
+// without a mount manager, runs detached so the poll loop is never blocked on
+// the rc endpoint, and is deduplicated through singleflight so hundreds of
+// concurrent mount waits collapse into one in-flight refresh.
+func (d *Downloader) triggerMountRefresh(entry *storage.Entry) {
+	m := d.manager
+	if m == nil || m.mountManager == nil {
+		return
+	}
+	go func() {
+		if _, err, _ := m.refreshSG.Do("symlink-mount-refresh", func() (any, error) {
+			return nil, m.RefreshMount()
+		}); err != nil {
+			d.logger.Debug().Err(err).Str("entry", entry.Name).Msg("Mount refresh after empty first scan failed")
+		}
+	}()
+}
+
 func (d *Downloader) createSymlinksWhenMountFilesAppear(ctx context.Context, entry *storage.Entry, files []*storage.File, mountPath string, symlinkDir string) ([]string, error) {
 	remainingFiles := make(map[string]*storage.File, len(files))
 	for _, file := range files {
@@ -328,55 +435,36 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(ctx context.Context, ent
 	delay := symlinkScanInitialInterval
 	attempt := 0
 	var lastScanErr error
-	var scanErr error
-
-	var checkDirectory func(string) error
-	checkDirectory = func(dirPath string) error {
-		entries, err := os.ReadDir(dirPath)
-		if err != nil {
-			if scanErr == nil {
-				scanErr = err
-			}
-			return nil
-		}
-
-		for _, item := range entries {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			entryName := item.Name()
-			fullPath := filepath.Join(dirPath, entryName)
-
-			if file, exists := remainingFiles[entryName]; exists {
-				fileSymlinkPath := filepath.Join(symlinkDir, file.Name)
-				if err := os.Symlink(fullPath, fileSymlinkPath); err != nil && !os.IsExist(err) {
-					return fmt.Errorf("failed to create symlink %s -> %s: %w", fileSymlinkPath, fullPath, err)
-				}
-				filePaths = append(filePaths, fileSymlinkPath)
-				delete(remainingFiles, entryName)
-				d.logger.Info().Msgf("File is ready: %s/%s", entry.GetFolder(), file.Name)
-				continue
-			}
-
-			if item.IsDir() {
-				if err := checkDirectory(fullPath); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
 
 	for len(remainingFiles) > 0 {
 		if err := d.checkAction(ctx, entry); err != nil {
 			return nil, err
 		}
 		attempt++
-		scanErr = nil
-		if err := checkDirectory(mountPath); err != nil {
+		result, err := d.scanMountForFilesBounded(ctx, mountPath, remainingFiles)
+		if err != nil {
 			return nil, err
 		}
-		lastScanErr = scanErr
+		lastScanErr = result.err
+		for name, fullPath := range result.found {
+			file, wanted := remainingFiles[name]
+			if !wanted {
+				continue
+			}
+			fileSymlinkPath := filepath.Join(symlinkDir, file.Name)
+			if err := os.Symlink(fullPath, fileSymlinkPath); err != nil && !os.IsExist(err) {
+				return nil, fmt.Errorf("failed to create symlink %s -> %s: %w", fileSymlinkPath, fullPath, err)
+			}
+			filePaths = append(filePaths, fileSymlinkPath)
+			delete(remainingFiles, name)
+			d.logger.Info().Msgf("File is ready: %s/%s", entry.GetFolder(), file.Name)
+		}
+		if attempt == 1 && len(result.found) == 0 {
+			// Nothing visible on the first scan (directory absent, empty, or the
+			// scan timed out): nudge the mount to refresh its listing instead of
+			// waiting out its natural cache interval.
+			d.triggerMountRefresh(entry)
+		}
 		if len(remainingFiles) == 0 {
 			break
 		}
