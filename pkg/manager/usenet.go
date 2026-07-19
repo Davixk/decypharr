@@ -103,6 +103,34 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 		return nil
 	}()
 	if err != nil {
+		if errors.Is(err, parser.ErrProbeInfrastructure) && ctx.Err() == nil {
+			// The NZB parsed structurally but its availability probe failed on
+			// the NNTP substrate itself (connection/timeout/auth/no acquirable
+			// provider connection) — there is no verdict about the articles.
+			// Recording this as a failure would surface a Failed history entry
+			// and the arr would blocklist a release that may be perfectly
+			// healthy. Keep the reserved entry queued, accept the add (200 +
+			// nzo_id), and let the job queue re-parse it with backoff once the
+			// substrate recovers.
+			entry.Status = debridTypes.TorrentStatusQueued
+			entry.UpdatedAt = time.Now()
+			if updateErr := m.queue.Update(entry); updateErr == nil {
+				m.logger.Warn().
+					Err(err).
+					Str("nzo_id", entry.InfoHash).
+					Str("name", req.Name).
+					Msg("NZB availability probe hit an infrastructure failure; keeping entry queued for retry")
+				m.scheduleQueuedNZBRetry(entry, 0)
+				return entry.InfoHash, nil
+			} else {
+				// The deferral could not be persisted; fall through to the
+				// delete path so the reservation is not leaked.
+				m.logger.Error().
+					Err(updateErr).
+					Str("nzo_id", entry.InfoHash).
+					Msg("Failed to keep infrastructure-deferred NZB queued; falling back to rejecting the add")
+			}
+		}
 		if errors.Is(err, parser.ErrArticlesUnavailable) && ctx.Err() == nil {
 			// The NZB parsed structurally but its articles failed the parse-time
 			// availability probe. Rejecting the add here surfaces as a raw HTTP
@@ -154,6 +182,45 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 	return meta.ID, nil
 }
 
+// nzbInfraRetryBaseDelay/nzbInfraRetryMaxDelay bound the backoff used when an
+// NZB's availability probe fails on the NNTP substrate (no article verdict).
+// Vars for tests.
+var (
+	nzbInfraRetryBaseDelay = 30 * time.Second
+	nzbInfraRetryMaxDelay  = 5 * time.Minute
+)
+
+func nzbInfraRetryDelay(attempt int) time.Duration {
+	delay := nzbInfraRetryBaseDelay
+	for i := 0; i < attempt && delay < nzbInfraRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > nzbInfraRetryMaxDelay {
+		delay = nzbInfraRetryMaxDelay
+	}
+	return delay
+}
+
+// scheduleQueuedNZBRetry routes a queued NZB entry whose availability probe
+// hit an infrastructure failure back through the job queue with backoff.
+// Queued NZB entries have no other runtime pickup path (the periodic queue
+// processor skips Status=queued rows and boot restore pass-2 only runs once),
+// so without this the entry would strand until the next reboot.
+func (m *Manager) scheduleQueuedNZBRetry(entry *storage.Entry, attempt int) {
+	if m.jobQueue == nil || entry == nil {
+		return
+	}
+	job := &Job{
+		ID:            entry.InfoHash,
+		Type:          JobTypeNZB,
+		Entry:         entry,
+		RebuildQueued: true,
+		RetryCount:    attempt,
+		CreatedAt:     time.Now(),
+	}
+	m.jobQueue.Retry(job, nzbInfraRetryDelay(attempt))
+}
+
 func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 	if job == nil || job.Entry == nil {
 		return fmt.Errorf("invalid NZB job")
@@ -164,6 +231,23 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 	}
 	if !current {
 		return nil
+	}
+	if job.RebuildQueued {
+		// The parse for this queued NZB was deferred (admission- or
+		// restore-time infrastructure failure) or must be redone. Rebuild
+		// re-parses from the staged source, or resumes completed metadata
+		// without any network work.
+		rebuilt, rebuildErr := m.rebuildQueuedNZBJob(job.Entry)
+		if rebuildErr != nil {
+			return rebuildErr
+		}
+		job.RebuildQueued = false
+		job.NZBMeta = rebuilt.NZBMeta
+		job.NZBGroups = rebuilt.NZBGroups
+		job.ResumeExisting = rebuilt.ResumeExisting
+		if job.Request == nil {
+			job.Request = rebuilt.Request
+		}
 	}
 	generation, err := m.ensureNZBGeneration(job.Entry)
 	if err != nil {

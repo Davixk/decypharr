@@ -34,6 +34,8 @@ type Job struct {
 	Entry          *storage.Entry               // Entry created during processing
 	ResumeExisting bool                         // Continue an already persisted provider placement
 	ResumeAction   bool                         // Resume a durably claimed post-download action after restart
+	RebuildQueued  bool                         // Re-parse a queued NZB from its staged source (or resume completed metadata) before processing
+	RetryCount     int                          // Infrastructure-retry attempts already made for this job (drives backoff)
 	CreatedAt      time.Time
 }
 
@@ -143,6 +145,12 @@ func (q *JobQueue) Retry(job *Job, delay time.Duration) {
 			}
 		}
 	}()
+}
+
+// Context returns the queue's lifecycle context. It is cancelled by Close, so
+// long-running restore/retry loops can observe shutdown.
+func (q *JobQueue) Context() context.Context {
+	return q.ctx
 }
 
 // Close signals all workers to stop and waits for them to finish

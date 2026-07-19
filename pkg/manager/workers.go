@@ -90,6 +90,22 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		}
 	}
 
+	// Failed-entry revival sweep. Entries that failed with an
+	// infrastructure/availability signature (and are still below the
+	// configured retries) are reset and resubmitted, rate-limited per sweep,
+	// so a future substrate incident self-heals at runtime without a reboot.
+	if jd, err := utils.ConvertToJobDef(reviveSweepInterval); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to convert revival sweep interval to job definition")
+	} else {
+		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
+			m.reviveErrorEntries(ctx, reviveSweepLimit, true)
+		}), gocron.WithContext(ctx), gocron.WithName("error-entry-revival")); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to create failed-entry revival job")
+		} else {
+			m.logger.Debug().Msgf("Failed-entry revival job scheduled for every %s", reviveSweepInterval)
+		}
+	}
+
 	// NZB refresh job for pending archives (every 5 minutes)
 	if m.usenet != nil {
 		if jd, err := utils.ConvertToJobDef("10m"); err != nil {

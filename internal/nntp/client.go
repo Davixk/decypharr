@@ -458,7 +458,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 	if lastErr != nil {
 		return lastErr
 	}
-	return errors.New("all providers failed")
+	return NewNoAvailableConnectionError("all providers failed", nil)
 }
 
 // returnOrReleaseConn returns a connection to the pool or releases it if closed
@@ -576,7 +576,7 @@ func (c *Client) getAnyAvailableConnection(ctx context.Context, exclusions provi
 	}
 
 	if eligibleCount == 0 {
-		return nil, config.UsenetProvider{}, errors.New("no eligible providers available")
+		return nil, config.UsenetProvider{}, NewNoAvailableConnectionError("no eligible providers available", nil)
 	}
 
 	// Phase 2: All providers in this tier busy - race for first available
@@ -688,7 +688,7 @@ func (c *Client) raceForConnection(ctx context.Context, eligible []config.Usenet
 				if lastErr != nil {
 					return nil, lastErrProvider, lastErr
 				}
-				return nil, config.UsenetProvider{}, errors.New("failed to get connection from any provider")
+				return nil, config.UsenetProvider{}, NewNoAvailableConnectionError("failed to get connection from any provider", nil)
 			}
 			if r.err == nil && r.conn != nil {
 				cancel() // Tell losing goroutines to stop ASAP.

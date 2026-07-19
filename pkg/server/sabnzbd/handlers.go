@@ -43,6 +43,10 @@ func (s *SABnzbd) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.handleGetScripts(w, r)
 	case ModeGetFiles:
 		s.handleGetFiles(w, r)
+	case ModeRetry:
+		s.handleRetry(w, r)
+	case ModeRetryAll:
+		s.handleRetryAll(w, r)
 	default:
 		// Default to queue if no mode specified
 		s.logger.Warn().Str("mode", mode).Msg("Unknown API mode, returning 404")
@@ -456,6 +460,45 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 		response.Error = fmt.Sprintf("Partial success: %s", strings.Join(errors, "; "))
 	}
 
+	utils.JSONResponse(w, response, http.StatusOK)
+}
+
+// handleRetry revives failed downloads (SABnzbd mode=retry). value=<nzo_id>
+// retries that item; without a value every eligible failed item is retried.
+// A revived item leaves the error state, so it disappears from the Failed
+// history — the same observable behavior as real SABnzbd's retry.
+func (s *SABnzbd) handleRetry(w http.ResponseWriter, r *http.Request) {
+	value := strings.TrimSpace(r.URL.Query().Get("value"))
+	if value == "" {
+		s.handleRetryAll(w, r)
+		return
+	}
+
+	var errors []string
+	for nzoID := range strings.SplitSeq(value, ",") {
+		nzoID = strings.TrimSpace(nzoID)
+		if nzoID == "" {
+			continue
+		}
+		if err := s.manager.ReviveErrorEntry(nzoID); err != nil {
+			s.logger.Warn().Err(err).Str("nzo_id", nzoID).Msg("Failed to retry NZB")
+			errors = append(errors, fmt.Sprintf("%s: %v", nzoID, err))
+		}
+	}
+	if len(errors) > 0 {
+		s.writeError(w, strings.Join(errors, "; "), http.StatusNotFound)
+		return
+	}
+	response := StatusResponse{Status: true}
+	utils.JSONResponse(w, response, http.StatusOK)
+}
+
+// handleRetryAll revives every eligible failed download (SABnzbd
+// mode=retry_all).
+func (s *SABnzbd) handleRetryAll(w http.ResponseWriter, r *http.Request) {
+	revived := s.manager.ReviveEligibleErrorEntries()
+	s.logger.Info().Int("revived", revived).Msg("Retry-all revived failed NZBs")
+	response := StatusResponse{Status: true}
 	utils.JSONResponse(w, response, http.StatusOK)
 }
 
