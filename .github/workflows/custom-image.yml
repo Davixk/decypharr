@@ -6,11 +6,12 @@ on:
       tag:
         description: Additional image tag
         required: true
-        default: improved
+        default: manual
         type: string
   push:
     tags:
       - custom-image-*
+      - v*-fork.*
 
 permissions:
   contents: read
@@ -96,7 +97,6 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=${{ env.RELEASE_TAG }}
-            type=raw,value=improved
             type=raw,value=latest
             type=sha,prefix=sha-
           labels: |
