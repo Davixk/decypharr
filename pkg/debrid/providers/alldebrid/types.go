@@ -1,5 +1,12 @@
 package alldebrid
 
+import (
+	"bytes"
+	"fmt"
+
+	json "github.com/bytedance/sonic"
+)
+
 type errorResponse struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
@@ -37,10 +44,59 @@ type magnetInfo struct {
 	Files          []MagnetFile `json:"files"`
 }
 
+// Magnets tolerates the shapes AllDebrid uses for data.magnets: a JSON array
+// (list and v4.1 per-id responses), a single JSON object (v4-style per-id
+// responses), or a map keyed by magnet ID.
+type Magnets []magnetInfo
+
+// UnmarshalJSON implements custom unmarshaling for the Magnets type.
+// If the input is an array, it is unmarshaled directly into the slice.
+// If the input is a single magnet object, it is wrapped as a one-element slice.
+// If the input is a map keyed by magnet ID, its values are collected.
+// If the input is none of these, it returns an error.
+func (m *Magnets) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		*m = nil
+		return nil
+	}
+
+	if data[0] == '[' {
+		var arr []magnetInfo
+		if err := json.Unmarshal(data, &arr); err != nil {
+			return fmt.Errorf("magnets: decoding array: %w", err)
+		}
+		*m = arr
+		return nil
+	}
+
+	// A single magnet object (v4-style per-id responses). A map keyed by
+	// magnet ID also decodes into magnetInfo (unknown keys are ignored), so
+	// require a non-zero ID before accepting the single-object shape.
+	var single magnetInfo
+	if err := json.Unmarshal(data, &single); err == nil && single.Id != 0 {
+		*m = Magnets{single}
+		return nil
+	}
+
+	// A map keyed by magnet ID.
+	var byID map[string]magnetInfo
+	if err := json.Unmarshal(data, &byID); err == nil {
+		magnets := make(Magnets, 0, len(byID))
+		for _, v := range byID {
+			magnets = append(magnets, v)
+		}
+		*m = magnets
+		return nil
+	}
+
+	return fmt.Errorf("magnets: unsupported JSON format")
+}
+
 type MagnetStatusResponse struct {
 	Status string `json:"status"`
 	Data   struct {
-		Magnets []magnetInfo `json:"magnets"`
+		Magnets Magnets `json:"magnets"`
 	} `json:"data"`
 	Error *errorResponse `json:"error"`
 }

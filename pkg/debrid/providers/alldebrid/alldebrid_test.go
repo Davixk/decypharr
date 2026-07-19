@@ -79,14 +79,14 @@ func TestAllDebridEndpointVersions(t *testing.T) {
 		endpoint string
 		want     string
 	}{
-		{name: "magnet upload", endpoint: allDebridMagnetUploadEndpoint, want: "/v4/magnet/upload"},
-		{name: "torrent upload", endpoint: allDebridMagnetUploadFileEndpoint, want: "/v4/magnet/upload/file"},
+		{name: "magnet upload", endpoint: allDebridMagnetUploadEndpoint, want: "/v4.1/magnet/upload"},
+		{name: "torrent upload", endpoint: allDebridMagnetUploadFileEndpoint, want: "/v4.1/magnet/upload/file"},
 		{name: "magnet status", endpoint: allDebridMagnetStatusEndpoint, want: "/v4.1/magnet/status"},
-		{name: "magnet delete", endpoint: allDebridMagnetDeleteEndpoint, want: "/v4/magnet/delete"},
-		{name: "link unlock", endpoint: allDebridLinkUnlockEndpoint, want: "/v4/link/unlock"},
-		{name: "link infos", endpoint: allDebridLinkInfosEndpoint, want: "/v4/link/infos"},
-		{name: "user", endpoint: allDebridUserEndpoint, want: "/v4/user"},
-		{name: "user link delete", endpoint: allDebridUserLinksDeleteEndpoint, want: "/v4/user/links/delete"},
+		{name: "magnet delete", endpoint: allDebridMagnetDeleteEndpoint, want: "/v4.1/magnet/delete"},
+		{name: "link unlock", endpoint: allDebridLinkUnlockEndpoint, want: "/v4.1/link/unlock"},
+		{name: "link infos", endpoint: allDebridLinkInfosEndpoint, want: "/v4.1/link/infos"},
+		{name: "user", endpoint: allDebridUserEndpoint, want: "/v4.1/user"},
+		{name: "user link delete", endpoint: allDebridUserLinksDeleteEndpoint, want: "/v4.1/user/links/delete"},
 	}
 
 	for _, test := range tests {
@@ -307,6 +307,158 @@ func TestGetTorrentValidatesExactlyOneMatchingID(t *testing.T) {
 	}
 }
 
+func TestGetTorrentAcceptsObjectShapedMagnets(t *testing.T) {
+	ad := newTestAllDebrid(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("id"); got != "123456" {
+			t.Errorf("id query = %q, want 123456", got)
+		}
+		writeTestJSON(t, w, `{
+			"status": "success",
+			"data": {
+				"magnets": {
+					"id": 123456,
+					"filename": "example-release",
+					"hash": "1234567890abcdef1234567890abcdef12345678",
+					"size": 1000,
+					"status": "Ready",
+					"statusCode": 4,
+					"completionDate": 1700000000
+				}
+			}
+		}`)
+	})
+
+	torrent, err := ad.GetTorrent("123456")
+	if err != nil {
+		t.Fatalf("GetTorrent() error = %v", err)
+	}
+	if torrent.Id != "123456" {
+		t.Errorf("ID = %q, want 123456", torrent.Id)
+	}
+	if torrent.Status != types.TorrentStatusDownloaded {
+		t.Errorf("status = %q, want downloaded", torrent.Status)
+	}
+	if torrent.InfoHash != "1234567890abcdef1234567890abcdef12345678" {
+		t.Errorf("hash = %q", torrent.InfoHash)
+	}
+}
+
+func TestGetTorrentAcceptsMapShapedMagnets(t *testing.T) {
+	ad := newTestAllDebrid(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("id"); got != "123456" {
+			t.Errorf("id query = %q, want 123456", got)
+		}
+		writeTestJSON(t, w, `{
+			"status": "success",
+			"data": {
+				"magnets": {
+					"123456": {
+						"id": 123456,
+						"filename": "example-release",
+						"hash": "1234567890abcdef1234567890abcdef12345678",
+						"size": 1000,
+						"status": "Ready",
+						"statusCode": 4,
+						"completionDate": 1700000000
+					}
+				}
+			}
+		}`)
+	})
+
+	torrent, err := ad.GetTorrent("123456")
+	if err != nil {
+		t.Fatalf("GetTorrent() error = %v", err)
+	}
+	if torrent.Id != "123456" {
+		t.Errorf("ID = %q, want 123456", torrent.Id)
+	}
+	if torrent.Status != types.TorrentStatusDownloaded {
+		t.Errorf("status = %q, want downloaded", torrent.Status)
+	}
+}
+
+func TestDecodeErrorsIncludeHTTPStatus(t *testing.T) {
+	t.Run("non-JSON 502 body", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		rec.WriteHeader(http.StatusBadGateway)
+		if _, err := io.WriteString(rec, "<html><body>502 Bad Gateway</body></html>"); err != nil {
+			t.Fatalf("write body: %v", err)
+		}
+
+		err := decodeAllDebridResponse(rec.Result(), nil)
+		if err == nil {
+			t.Fatal("decodeAllDebridResponse() error = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "502") {
+			t.Fatalf("error = %q, want HTTP status 502 mentioned", err)
+		}
+	})
+
+	t.Run("non-JSON 200 body", func(t *testing.T) {
+		ad := newTestAllDebrid(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			if _, err := io.WriteString(w, "<html><body>maintenance</body></html>"); err != nil {
+				t.Errorf("write body: %v", err)
+			}
+		})
+
+		_, err := ad.GetTorrents()
+		if err == nil {
+			t.Fatal("GetTorrents() error = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "200") {
+			t.Fatalf("error = %q, want HTTP status 200 mentioned", err)
+		}
+	})
+}
+
+func TestEmptyBodyOn2xx(t *testing.T) {
+	t.Run("delete torrent succeeds", func(t *testing.T) {
+		ad := newTestAllDebrid(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != allDebridMagnetDeleteEndpoint {
+				t.Errorf("path = %q, want %q", r.URL.Path, allDebridMagnetDeleteEndpoint)
+			}
+			w.WriteHeader(http.StatusOK)
+		})
+
+		if err := ad.DeleteTorrent("41"); err != nil {
+			t.Fatalf("DeleteTorrent() error = %v", err)
+		}
+	})
+
+	t.Run("delete link succeeds", func(t *testing.T) {
+		ad := newTestAllDebrid(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != allDebridUserLinksDeleteEndpoint {
+				t.Errorf("path = %q, want %q", r.URL.Path, allDebridUserLinksDeleteEndpoint)
+			}
+			w.WriteHeader(http.StatusOK)
+		})
+
+		currentAccount := ad.accountsManager.Current()
+		if currentAccount == nil {
+			t.Fatal("test download account is nil")
+		}
+		if err := ad.deleteLink(currentAccount, types.DownloadLink{Link: "https://alldebrid.com/f/movie"}); err != nil {
+			t.Fatalf("deleteLink() error = %v", err)
+		}
+	})
+
+	t.Run("caller expecting data errors with status", func(t *testing.T) {
+		ad := newTestAllDebrid(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+
+		_, err := ad.GetTorrents()
+		if err == nil {
+			t.Fatal("GetTorrents() error = nil, want error")
+		}
+		if !strings.Contains(err.Error(), "empty response") || !strings.Contains(err.Error(), "200") {
+			t.Fatalf("error = %q, want empty response with HTTP status 200", err)
+		}
+	})
+}
+
 func TestHTTP200TopLevelAPIErrors(t *testing.T) {
 	t.Run("status discontinued", func(t *testing.T) {
 		ad := newTestAllDebrid(t, func(w http.ResponseWriter, r *http.Request) {
@@ -357,7 +509,7 @@ func TestHTTP200TopLevelAPIErrors(t *testing.T) {
 	})
 }
 
-func TestNonStatusOperationsUseV4Routes(t *testing.T) {
+func TestNonStatusOperationsUseV41Routes(t *testing.T) {
 	var mu sync.Mutex
 	seen := make(map[string]int)
 
@@ -468,8 +620,8 @@ func TestNonStatusOperationsUseV4Routes(t *testing.T) {
 		if seen[endpoint] != 1 {
 			t.Errorf("requests to %s = %d, want 1", endpoint, seen[endpoint])
 		}
-		if strings.HasPrefix(endpoint, "/v4.1/") {
-			t.Errorf("non-status endpoint unexpectedly uses v4.1: %s", endpoint)
+		if !strings.HasPrefix(endpoint, "/v4.1/") {
+			t.Errorf("endpoint does not use v4.1: %s", endpoint)
 		}
 	}
 }
