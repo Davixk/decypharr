@@ -220,6 +220,62 @@ func TestDecoder_NNTPTerminator(t *testing.T) {
 	}
 }
 
+func TestDecoder_StrayControlLinesAfterYendDoNotMutateMeta(t *testing.T) {
+	// The pure-Go decoder owns the =yend drain-skip ordering under test.
+	oldPureGo := UsePureGo
+	UsePureGo = true
+	defer func() { UsePureGo = oldPureGo }()
+
+	original := []byte("payload before stray control lines")
+	const nextResponse = "222 next response\r\n"
+	// Stray control-looking lines injected between =yend and the NNTP dot
+	// terminator: they must be drained without interpretation. Before the fix
+	// the "=ybegin" clobbered FileSize/PartSize (and "=ypart" the Offset).
+	stray := "=ybegin part=9 line=128 size=999999 name=evil.bin\r\n" +
+		"=ypart begin=4097 end=8192\r\n" +
+		"=yend size=1\r\n"
+	source := &oneByteReader{reader: strings.NewReader(
+		yencEncode(original, "clean.bin", 1, 1, int64(len(original))) + stray + ".\r\n" + nextResponse,
+	)}
+
+	dec := AcquireDecoder(source)
+	defer ReleaseDecoder(dec)
+
+	decoded, err := io.ReadAll(dec)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if !bytes.Equal(decoded, original) {
+		t.Errorf("Decoded data mismatch\n  got:  %q\n  want: %q", decoded, original)
+	}
+
+	if dec.Meta.FileName != "clean.bin" {
+		t.Errorf("FileName = %q, want %q", dec.Meta.FileName, "clean.bin")
+	}
+	if dec.Meta.FileSize != int64(len(original)) {
+		t.Errorf("FileSize = %d, want %d (stray =ybegin mutated Meta)", dec.Meta.FileSize, len(original))
+	}
+	if dec.Meta.PartNumber != 1 {
+		t.Errorf("PartNumber = %d, want 1 (stray =ybegin mutated Meta)", dec.Meta.PartNumber)
+	}
+	if dec.Meta.Offset != 0 {
+		t.Errorf("Offset = %d, want 0 (stray =ypart mutated Meta)", dec.Meta.Offset)
+	}
+	if dec.Meta.PartSize != int64(len(original)) {
+		t.Errorf("PartSize = %d, want %d (stray control line mutated Meta)", dec.Meta.PartSize, len(original))
+	}
+
+	// Terminator consumption must be intact: the dot line is consumed, the
+	// next response is not.
+	remainder, err := io.ReadAll(source)
+	if err != nil {
+		t.Fatalf("read source remainder: %v", err)
+	}
+	if string(remainder) != nextResponse {
+		t.Fatalf("source remainder = %q, want %q", remainder, nextResponse)
+	}
+}
+
 type oneByteReader struct {
 	reader io.Reader
 }
