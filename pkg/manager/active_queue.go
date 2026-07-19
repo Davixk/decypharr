@@ -283,7 +283,22 @@ func (m *Manager) rebuildQueuedNZBJob(entry *storage.Entry) (*Job, error) {
 		if existingMeta.Generation != "" && existingMeta.Generation != entry.NZBGeneration {
 			return nil, fmt.Errorf("%w: queued generation %q, metadata generation %q", usenet.ErrStaleNZBGeneration, entry.NZBGeneration, existingMeta.Generation)
 		}
-		if existingMeta.Generation == entry.NZBGeneration && existingMeta.Status == usenet.NZBStatusCompleted {
+		if existingMeta.Status == usenet.NZBStatusCompleted &&
+			(existingMeta.Generation == entry.NZBGeneration || existingMeta.Generation == "") {
+			if existingMeta.Generation == "" {
+				// Pre-lifecycle-fence metadata (written before the generation
+				// trailer existed). Adopt the queue's token with a guarded write
+				// and resume. Falling through to the re-parse path here is the
+				// 2026-07-19 data-loss mechanism: ParseWithGeneration's
+				// quick-parse persist REPLACES a completed meta with an
+				// empty-file parsing shape (parser.Parse builds
+				// `Files: []storage.NZBFile{}`), destroying the parsed segment
+				// map on disk before Process/markAsFailed ever run.
+				if err := m.usenet.NZBStorage().AssertGeneration(entry.InfoHash, entry.NZBGeneration); err != nil {
+					return nil, fmt.Errorf("adopt queue generation into completed NZB metadata: %w", err)
+				}
+				existingMeta.Generation = entry.NZBGeneration
+			}
 			if err := m.commitRestoredNZBMetadata(entry, existingMeta); err != nil {
 				return nil, err
 			}
