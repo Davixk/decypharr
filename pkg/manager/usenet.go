@@ -103,6 +103,31 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 		return nil
 	}()
 	if err != nil {
+		if errors.Is(err, parser.ErrArticlesUnavailable) && ctx.Err() == nil {
+			// The NZB parsed structurally but its articles failed the parse-time
+			// availability probe. Rejecting the add here surfaces as a raw HTTP
+			// error to Sonarr/Radarr ("Failed to connect to SABnzbd") and the
+			// release is never blocklisted. Accept the add instead and record the
+			// failure on the reserved queue entry so the SABnzbd history reports
+			// it as Failed with a clear fail_message — the same UX the async
+			// processing pipeline provides for post-admission failures.
+			entry.MarkAsError(err)
+			updateErr := m.queue.Update(entry)
+			if updateErr == nil {
+				m.logger.Warn().
+					Err(err).
+					Str("nzo_id", entry.InfoHash).
+					Str("name", req.Name).
+					Msg("NZB accepted but failed parse-time availability probe; recorded as failed")
+				return entry.InfoHash, nil
+			}
+			// The failure could not be persisted; fall through to the delete path
+			// so the reservation is not leaked.
+			m.logger.Error().
+				Err(updateErr).
+				Str("nzo_id", entry.InfoHash).
+				Msg("Failed to persist parse-time NZB failure; falling back to rejecting the add")
+		}
 		deleted, deleteErr := m.queue.DeleteCurrent(entry, func(*storage.Entry) error {
 			return m.usenet.DeleteForGeneration(req.Id, generation)
 		})
