@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/logger"
 
 	"github.com/sirrobot01/decypharr/cmd/decypharr"
 )
@@ -33,8 +34,14 @@ func main() {
 	flag.StringVar(&pprofAddr, "pprof", ":6060", "pprof server address (set to empty to disable)")
 	flag.Parse()
 
-	// get enable pprof flag from environment variable if not set via flag
-	enablePprof := os.Getenv("ENABLE_PPROF") != ""
+	// pprof is OFF by default. Enable it with the legacy ENABLE_PPROF or the
+	// documented DECYPHARR_DEBUG_PPROF (=1/true/yes). Optionally override the
+	// listen address with DECYPHARR_DEBUG_PPROF_ADDR (e.g. 127.0.0.1:6060 to
+	// keep it localhost-only and never publicly exposed).
+	enablePprof := os.Getenv("ENABLE_PPROF") != "" || isTruthy(os.Getenv("DECYPHARR_DEBUG_PPROF"))
+	if addr := os.Getenv("DECYPHARR_DEBUG_PPROF_ADDR"); addr != "" {
+		pprofAddr = addr
+	}
 
 	if configPath == "" {
 		defaultDir, err := os.UserHomeDir()
@@ -66,6 +73,12 @@ func main() {
 	// Create a context canceled on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Install the on-demand, non-fatal goroutine-dump handler (SIGUSR1 on Unix).
+	// This is separate from the SIGINT/SIGTERM graceful-shutdown context above:
+	// SIGUSR1 only snapshots goroutine stacks to a file/log and NEVER shuts the
+	// process down. See debug.go for operator usage.
+	startDebugDumpHandler(ctx, logger.GetLogPath(), logger.Default())
 
 	if err := decypharr.Start(ctx); err != nil {
 		log.Fatal(err)
