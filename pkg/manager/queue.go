@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -145,7 +146,23 @@ func (q *Queue) deleteEntryFiles(entry *storage.Entry) error {
 		}
 	}
 	downloadedPath := entry.DownloadPath()
-	if downloadedPath == "" {
+	cleanDL := filepath.Clean(downloadedPath)
+	cleanSave := filepath.Clean(entry.SavePath)
+	if downloadedPath == "" || cleanDL == cleanSave ||
+		cleanDL == "." || cleanDL == string(os.PathSeparator) ||
+		!strings.HasPrefix(cleanDL+string(os.PathSeparator), cleanSave+string(os.PathSeparator)) {
+		// An empty or collapsed Name makes DownloadPath() resolve to the category
+		// SavePath itself (or a parent of it): filepath.Join(SavePath, "") and
+		// Join(SavePath, ".") both clean back to SavePath. RemoveAll on that would
+		// destroy every sibling entry's symlinks in the same category directory —
+		// the confirmed downloads/radarr + downloads/sonarr data-loss incident.
+		// Refuse and log loudly instead of deleting a shared directory.
+		q.logger.Error().
+			Str("path", downloadedPath).
+			Str("save_path", entry.SavePath).
+			Str("infohash", entry.InfoHash).
+			Str("name", entry.Name).
+			Msg("Refusing to delete download path at or above SavePath; removing it would destroy sibling entries")
 		return errors.Join(errs...)
 	}
 	if err := os.RemoveAll(downloadedPath); err != nil {
