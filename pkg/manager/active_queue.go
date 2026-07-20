@@ -31,6 +31,14 @@ func (m *Manager) restoreActiveDownloadJobs() {
 	// queued rebuild path or the claimed-action resume path.
 	m.reviveErrorEntries(ctx, 0, false)
 
+	// Boot-time recovery: completed entries whose download folder disappeared
+	// (the category-directory data-loss incident) are reset to the claimed shape
+	// BEFORE the passes list the queue, so the claimed-action resume path below
+	// re-creates their symlinks from still-intact content. resubmit is false —
+	// the reset rows now read as EntryStateDownloading and are picked up by the
+	// pass below exactly like a mount-timeout revival.
+	m.reconcileMissingDownloads(ctx, missingDownloadSweepLimit, false)
+
 	entries := m.queue.ListFilter("", config.ProtocolAll, storage.EntryStateDownloading, nil, "", false)
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].AddedOn.Before(entries[j].AddedOn)

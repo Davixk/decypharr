@@ -106,6 +106,23 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		}
 	}
 
+	// Missing-download recovery sweep. Completed entries whose download folder
+	// vanished (e.g. the category-directory data-loss incident) are reset to the
+	// claimed shape and resubmitted through the action gate, which rebuilds their
+	// symlinks from intact content — rate-limited per sweep so a mass wipe drains
+	// progressively instead of stampeding the mount.
+	if jd, err := utils.ConvertToJobDef(reviveSweepInterval); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to convert missing-download recovery interval to job definition")
+	} else {
+		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
+			m.reconcileMissingDownloads(ctx, missingDownloadSweepLimit, true)
+		}), gocron.WithContext(ctx), gocron.WithName("missing-download-recovery")); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to create missing-download recovery job")
+		} else {
+			m.logger.Debug().Msgf("Missing-download recovery job scheduled for every %s", reviveSweepInterval)
+		}
+	}
+
 	// NZB refresh job for pending archives (every 5 minutes)
 	if m.usenet != nil {
 		if jd, err := utils.ConvertToJobDef("10m"); err != nil {
