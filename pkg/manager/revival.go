@@ -276,6 +276,81 @@ func (m *Manager) reviveErrorEntries(ctx context.Context, limit int, resubmit bo
 	return revived
 }
 
+// isParkedInfraNZB reports whether entry is an NZB parked by deferInfraRetry:
+// it exhausted its fast infrastructure-retry budget (durable ErrorCount past the
+// cap) and rests in the queued/downloading shape rather than a terminal error,
+// so it is invisible to both the fast job-queue loop and the EntryStateError
+// revival scan. Such entries are re-fed only by resweepParkedInfraNZBs.
+func (m *Manager) isParkedInfraNZB(entry *storage.Entry) bool {
+	return entry != nil && entry.IsNZB() &&
+		entry.State == storage.EntryStateDownloading &&
+		entry.Status == debridTypes.TorrentStatusQueued &&
+		entry.ErrorCount > nzbInfraFastRetryCap
+}
+
+// resweepParkedInfraNZBs re-feeds NZB entries parked by deferInfraRetry back
+// into processing at a globally bounded rate (<= limit per sweep). This is the
+// slow cadence that replaces the uncapped fast loop for infrastructure-parked
+// entries: a permanent Process-infrastructure failure re-parses at most
+// limit/interval per period across the whole backlog, never pinning the worker
+// pool.
+//
+// Feeding atomically claims the entry out of the parked set (queued ->
+// downloading) BEFORE submitting, mirroring reviveErrorEntry's state
+// transition: this removes it from the scan set for the duration of its
+// in-flight job, so a later sweep cannot double-feed the same entry (a
+// double-feed could race two rebuilds into a stale-write that MarkAsError would
+// then surface as a false Failed/blocklist). When the re-fed Process fails
+// infrastructure again, deferInfraRetry returns it to the parked set for a
+// future sweep; when it succeeds, the entry completes and drains.
+func (m *Manager) resweepParkedInfraNZBs(ctx context.Context, limit int) int {
+	if m.queue == nil {
+		return 0
+	}
+	entries := m.queue.ListFilter("", config.ProtocolNZB, storage.EntryStateDownloading, nil, "added_on", false)
+	fed := 0
+	for _, entry := range entries {
+		if ctx != nil && ctx.Err() != nil {
+			break
+		}
+		if limit > 0 && fed >= limit {
+			break
+		}
+		if !m.isParkedInfraNZB(entry) {
+			continue
+		}
+		claimed := false
+		updated, err := m.queue.Mutate(entry.InfoHash, func(current *storage.Entry) bool {
+			if !m.isParkedInfraNZB(current) {
+				return false
+			}
+			current.Status = debridTypes.TorrentStatusDownloading
+			current.UpdatedAt = time.Now()
+			claimed = true
+			return true
+		})
+		if err != nil || !claimed || updated == nil {
+			continue
+		}
+		job := &Job{
+			ID:            updated.InfoHash,
+			Type:          JobTypeNZB,
+			Entry:         updated,
+			RebuildQueued: true,
+			CreatedAt:     time.Now(),
+		}
+		if err := m.SubmitJob(job); err != nil {
+			m.logger.Warn().Err(err).Str("infohash", updated.InfoHash).Msg("Failed to submit parked NZB entry for slow retry")
+			continue
+		}
+		fed++
+	}
+	if fed > 0 {
+		m.logger.Info().Int("fed", fed).Msg("Parked-NZB slow retry sweep re-fed entries")
+	}
+	return fed
+}
+
 // ReviveErrorEntry revives one failed NZB entry on explicit user intent
 // (SABnzbd mode=retry with a value). It bypasses the ErrorCount/signature
 // eligibility gates but never revives Bad entries or non-error entries.

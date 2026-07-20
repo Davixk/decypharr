@@ -390,7 +390,14 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		m.submitResumeAction(job.Entry)
 		return
 	}
-	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
+	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting && !job.RebuildQueued {
+		// A bare Entry job with no rebuild request only waits for an in-flight
+		// download to finish. A RebuildQueued job must NOT land here: it carries
+		// no NZBMeta yet precisely because it needs to re-parse from its staged
+		// source, so it has to reach processNZBJob. Without this guard the
+		// infra-retry and revival/park-sweep re-feeds (which submit
+		// RebuildQueued jobs with a nil NZBMeta) would silently park a worker in
+		// waitForDownloadCompletion instead of rebuilding.
 		m.waitForDownloadCompletion(ctx, job.Entry)
 		return
 	}
@@ -420,17 +427,19 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		if errors.Is(err, parser.ErrProbeInfrastructure) {
 			// The availability probe failed on the NNTP substrate, not on the
 			// content — there is no verdict about the articles. Keep the entry
-			// queued and retry through the job queue with backoff instead of
-			// surfacing a Failed history entry for a possibly healthy release.
+			// queued and retry (capped) instead of surfacing a Failed history
+			// entry for a possibly healthy release. deferInfraRetry bounds the
+			// fast retry loop: after nzbInfraFastRetryCap cumulative attempts the
+			// entry is parked for the slow revival sweep so it cannot pin the
+			// worker pool with unbounded re-parses.
 			m.logger.Warn().
 				Err(err).
 				Str("job_id", job.ID).
-				Int("retry", job.RetryCount+1).
-				Msg("NZB availability probe hit an infrastructure failure; retrying with backoff")
+				Msg("NZB availability probe hit an infrastructure failure; deferring retry")
 			if job.Entry != nil {
-				job.Entry.Status = debridTypes.TorrentStatusQueued
-				_ = m.queue.Update(job.Entry)
-				m.scheduleQueuedNZBRetry(job.Entry, job.RetryCount+1)
+				if deferErr := m.deferInfraRetry(job.Entry); deferErr != nil {
+					m.logger.Debug().Err(deferErr).Str("job_id", job.ID).Msg("Failed to record NZB infrastructure retry")
+				}
 			}
 			return
 		}

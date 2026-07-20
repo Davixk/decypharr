@@ -112,21 +112,18 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 			// healthy. Keep the reserved entry queued, accept the add (200 +
 			// nzo_id), and let the job queue re-parse it with backoff once the
 			// substrate recovers.
-			entry.Status = debridTypes.TorrentStatusQueued
-			entry.UpdatedAt = time.Now()
-			if updateErr := m.queue.Update(entry); updateErr == nil {
+			if deferErr := m.deferInfraRetry(entry); deferErr == nil {
 				m.logger.Warn().
 					Err(err).
 					Str("nzo_id", entry.InfoHash).
 					Str("name", req.Name).
 					Msg("NZB availability probe hit an infrastructure failure; keeping entry queued for retry")
-				m.scheduleQueuedNZBRetry(entry, 0)
 				return entry.InfoHash, nil
 			} else {
 				// The deferral could not be persisted; fall through to the
 				// delete path so the reservation is not leaked.
 				m.logger.Error().
-					Err(updateErr).
+					Err(deferErr).
 					Str("nzo_id", entry.InfoHash).
 					Msg("Failed to keep infrastructure-deferred NZB queued; falling back to rejecting the add")
 			}
@@ -190,6 +187,18 @@ var (
 	nzbInfraRetryMaxDelay  = 5 * time.Minute
 )
 
+// nzbInfraFastRetryCap bounds how many cumulative infrastructure-class attempts
+// an NZB entry may take on the FAST job-queue retry loop before it is parked for
+// the slow, globally-bounded revival sweep (resweepParkedInfraNZBs). Without
+// this cap an entry whose Process keeps failing on the substrate re-parses
+// forever, pinning every job-queue worker so completions never get enqueued —
+// the livelock. The count is tracked on the durable ErrorCount, so it survives
+// process restarts and revival/sweep re-feeds: a parked entry that is
+// re-submitted gets at most one more processing attempt per slow sweep instead
+// of a fresh fast burst, bounding the aggregate re-processing rate to the
+// sweep's budget rather than the fast loop's. Var for tests.
+var nzbInfraFastRetryCap = 5
+
 func nzbInfraRetryDelay(attempt int) time.Duration {
 	delay := nzbInfraRetryBaseDelay
 	for i := 0; i < attempt && delay < nzbInfraRetryMaxDelay; i++ {
@@ -219,6 +228,71 @@ func (m *Manager) scheduleQueuedNZBRetry(entry *storage.Entry, attempt int) {
 		CreatedAt:     time.Now(),
 	}
 	m.jobQueue.Retry(job, nzbInfraRetryDelay(attempt))
+}
+
+// deferInfraRetry records one infrastructure-class retry for a queued NZB entry
+// and decides whether it may take another FAST job-queue retry or must be parked
+// for the slow revival sweep. Every infrastructure-class deferral (admission,
+// worker loop, restore rebuild) funnels through here so the cap is enforced
+// uniformly.
+//
+// The cumulative attempt count lives on the durable ErrorCount, so it survives
+// restarts and revival/sweep re-feeds: once it exceeds nzbInfraFastRetryCap the
+// entry stops fast-requeuing and rests parked in the queued state, where
+// resweepParkedInfraNZBs re-feeds it at a globally bounded rate. The entry is
+// always kept OUT of the terminal-error state (State stays downloading, Status
+// stays queued, LastError cleared): an infrastructure failure carries no verdict
+// about the articles, so surfacing it as Failed would make the arr blocklist a
+// possibly healthy release.
+//
+// Returns an error only when the durable state could not be persisted, so the
+// admission path can fall back to rejecting the add rather than leaking a
+// half-updated reservation.
+func (m *Manager) deferInfraRetry(entry *storage.Entry) error {
+	if entry == nil {
+		return fmt.Errorf("nil entry")
+	}
+	if m.queue == nil {
+		return fmt.Errorf("queue not initialized")
+	}
+	infraCount := 0
+	updated, err := m.queue.Mutate(entry.InfoHash, func(current *storage.Entry) bool {
+		// ErrorCount is the durable cumulative infra-attempt counter. Reused
+		// (rather than a new field) so the cap survives restarts without a
+		// storage-schema change; revival deliberately never resets it.
+		current.ErrorCount++
+		current.State = storage.EntryStateDownloading
+		current.Status = debridTypes.TorrentStatusQueued
+		current.IsDownloading = false
+		// No article verdict: keep it out of the Failed history projection.
+		current.LastError = ""
+		current.UpdatedAt = time.Now()
+		infraCount = current.ErrorCount
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if updated != nil {
+		*entry = *updated
+	}
+	if infraCount > nzbInfraFastRetryCap {
+		// Fast-loop budget exhausted: park the entry. It stays queued (out of the
+		// Failed history) and the bounded revival sweep re-feeds it, so a
+		// permanent Process-infrastructure failure can no longer pin the worker
+		// pool with unbounded re-parses.
+		m.logger.Warn().
+			Str("infohash", entry.InfoHash).
+			Str("name", entry.Name).
+			Int("infra_attempts", infraCount).
+			Int("cap", nzbInfraFastRetryCap).
+			Msg("NZB availability probe kept failing on the NNTP substrate; parking entry for the slow revival sweep instead of fast-requeuing")
+		return nil
+	}
+	// Base the backoff on the durable count so a re-fed entry does not restart
+	// from the base delay.
+	m.scheduleQueuedNZBRetry(entry, infraCount-1)
+	return nil
 }
 
 func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {

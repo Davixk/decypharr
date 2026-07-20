@@ -112,14 +112,17 @@ func (m *Manager) restoreActiveDownloadJobs() {
 				// there is no verdict about the articles, so the entry must NOT
 				// become a terminal error (a Failed history entry would make the
 				// arr blocklist a possibly healthy release). Leave it queued and
-				// eligible, and schedule a job-queue retry with backoff so a
-				// later pass reparses it once the substrate recovers.
+				// eligible, and schedule a capped job-queue retry so a later pass
+				// reparses it once the substrate recovers (parking it for the slow
+				// sweep once the fast-retry budget is exhausted).
 				m.logger.Warn().
 					Err(err).
 					Str("infohash", entry.InfoHash).
 					Str("name", entry.Name).
 					Msg("Restore rebuild hit an NNTP infrastructure failure; leaving entry eligible for retry")
-				m.scheduleQueuedNZBRetry(entry, 0)
+				if deferErr := m.deferInfraRetry(entry); deferErr != nil {
+					m.logger.Debug().Err(deferErr).Str("infohash", entry.InfoHash).Msg("Failed to record restore infrastructure retry")
+				}
 				breaker.recordFailure()
 				continue
 			}
