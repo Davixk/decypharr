@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/utils"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet"
@@ -83,6 +84,16 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 		entry.InfoHash = meta.ID
 		entry.Name = meta.Name
 		entry.OriginalFilename = meta.Name
+		if !utils.IsUsableName(entry.Name) {
+			// The parser normally substitutes the NZB ID for an unusable name, but
+			// guard the persisted queue entry too (legacy metadata may predate that
+			// fix) so DownloadPath() can never collapse onto the category directory.
+			m.logger.Warn().
+				Str("nzo_id", entry.InfoHash).
+				Msg("Parsed NZB name is unusable; substituting the NZB ID for the entry name")
+			entry.Name = entry.InfoHash
+			entry.OriginalFilename = entry.InfoHash
+		}
 		entry.Size = meta.TotalSize
 		entry.Bytes = meta.TotalSize
 		entry.Status = debridTypes.TorrentStatusDownloading
