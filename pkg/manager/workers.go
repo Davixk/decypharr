@@ -94,11 +94,18 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 	// infrastructure/availability signature (and are still below the
 	// configured retries) are reset and resubmitted, rate-limited per sweep,
 	// so a future substrate incident self-heals at runtime without a reboot.
+	// The same bounded budget then re-feeds NZBs parked by the infra-retry cap
+	// (resweepParkedInfraNZBs): parked entries retry ONLY on this slow cadence,
+	// never on the fast job-queue loop, so a permanent Process-infrastructure
+	// failure cannot pin the worker pool.
 	if jd, err := utils.ConvertToJobDef(reviveSweepInterval); err != nil {
 		m.logger.Error().Err(err).Msg("Failed to convert revival sweep interval to job definition")
 	} else {
 		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
-			m.reviveErrorEntries(ctx, reviveSweepLimit, true)
+			revived := m.reviveErrorEntries(ctx, reviveSweepLimit, true)
+			if revived < reviveSweepLimit {
+				m.resweepParkedInfraNZBs(ctx, reviveSweepLimit-revived)
+			}
 		}), gocron.WithContext(ctx), gocron.WithName("error-entry-revival")); err != nil {
 			m.logger.Error().Err(err).Msg("Failed to create failed-entry revival job")
 		} else {
