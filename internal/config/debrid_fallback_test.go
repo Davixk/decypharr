@@ -61,7 +61,7 @@ func TestDebridFallbackConfigurationJSONRoundTrip(t *testing.T) {
 			Provider:         "alldebrid",
 			Name:             "primary",
 			APIKey:           "secret",
-			DownloadUncached: true,
+			DownloadUncached: &downloadUncached,
 			Priority:         7,
 			ConfigOrder:      42,
 		}},

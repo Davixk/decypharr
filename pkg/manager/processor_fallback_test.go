@@ -210,14 +210,14 @@ func TestFilterDebridUsesPriorityThenConfigOrder(t *testing.T) {
 func TestSendToDebridKeepsSelectedProviderPinnedByDefault(t *testing.T) {
 	recorder := &fallbackCallRecorder{}
 	primary := &fakeDebridClient{
-		cfg:      config.Debrid{Name: "primary", DownloadUncached: true, Priority: 2},
+		cfg:      config.Debrid{Name: "primary", DownloadUncached: boolPointer(true), Priority: 2},
 		recorder: recorder,
 		submitFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			return nil, errors.New("primary rejected")
 		},
 	}
 	backup := &fakeDebridClient{
-		cfg:      config.Debrid{Name: "backup", DownloadUncached: true, Priority: 1},
+		cfg:      config.Debrid{Name: "backup", DownloadUncached: boolPointer(true), Priority: 1},
 		recorder: recorder,
 	}
 
@@ -236,11 +236,11 @@ func TestSendToDebridKeepsSelectedProviderPinnedByDefault(t *testing.T) {
 func TestSendToDebridSelectedProviderRemainsFirstAndSuccessStops(t *testing.T) {
 	recorder := &fallbackCallRecorder{}
 	primary := &fakeDebridClient{
-		cfg:      config.Debrid{Name: "primary", DownloadUncached: true, Priority: 50},
+		cfg:      config.Debrid{Name: "primary", DownloadUncached: boolPointer(true), Priority: 50},
 		recorder: recorder,
 	}
 	backup := &fakeDebridClient{
-		cfg:      config.Debrid{Name: "backup", DownloadUncached: true, Priority: 1},
+		cfg:      config.Debrid{Name: "backup", DownloadUncached: boolPointer(true), Priority: 1},
 		recorder: recorder,
 	}
 
@@ -259,14 +259,14 @@ func TestSendToDebridSelectedProviderRemainsFirstAndSuccessStops(t *testing.T) {
 func TestSendToDebridFallsBackAfterSubmitFailure(t *testing.T) {
 	recorder := &fallbackCallRecorder{}
 	primary := &fakeDebridClient{
-		cfg:      config.Debrid{Name: "primary", DownloadUncached: true, Priority: 2},
+		cfg:      config.Debrid{Name: "primary", DownloadUncached: boolPointer(true), Priority: 2},
 		recorder: recorder,
 		submitFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			return nil, errors.New("MAGNET_TOO_MANY_ACTIVE")
 		},
 	}
 	backup := &fakeDebridClient{
-		cfg:      config.Debrid{Name: "backup", DownloadUncached: true, Priority: 1},
+		cfg:      config.Debrid{Name: "backup", DownloadUncached: boolPointer(true), Priority: 1},
 		recorder: recorder,
 	}
 
@@ -284,12 +284,12 @@ func TestSendToDebridFallsBackAfterSubmitFailure(t *testing.T) {
 
 func TestSendToDebridCleansStatusFailureWithReturnedID(t *testing.T) {
 	primary := &fakeDebridClient{
-		cfg: config.Debrid{Name: "primary", DownloadUncached: true, Priority: 1},
+		cfg: config.Debrid{Name: "primary", DownloadUncached: boolPointer(true), Priority: 1},
 		checkFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			return &debridTypes.Torrent{Id: "status-id"}, errors.New("status failed")
 		},
 	}
-	backup := &fakeDebridClient{cfg: config.Debrid{Name: "backup", DownloadUncached: true, Priority: 2}}
+	backup := &fakeDebridClient{cfg: config.Debrid{Name: "backup", DownloadUncached: boolPointer(true), Priority: 2}}
 
 	torrent, err := fallbackTestManager(primary, backup).SendToDebrid(context.Background(), fallbackTestRequest("", false, boolPointer(true)))
 	if err != nil {
@@ -306,13 +306,13 @@ func TestSendToDebridCleansStatusFailureWithReturnedID(t *testing.T) {
 
 func TestSendToDebridFallbackProbesCacheOnlyProviderBySubmitting(t *testing.T) {
 	primary := &fakeDebridClient{
-		cfg: config.Debrid{Name: "primary", DownloadUncached: true, Priority: 1},
+		cfg: config.Debrid{Name: "primary", DownloadUncached: boolPointer(true), Priority: 1},
 		submitFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			return nil, errors.New("primary rejected")
 		},
 	}
 	backup := &fakeDebridClient{
-		cfg: config.Debrid{Name: "backup", DownloadUncached: false, Priority: 2},
+		cfg: config.Debrid{Name: "backup", DownloadUncached: boolPointer(false), Priority: 2},
 		checkFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			torrent.Status = debridTypes.TorrentStatusDownloading
 			return torrent, nil
@@ -341,13 +341,13 @@ func TestSendToDebridFallbackProbesCacheOnlyProviderBySubmitting(t *testing.T) {
 
 func TestSendToDebridCachedBackupKeepsUncachedDisabled(t *testing.T) {
 	primary := &fakeDebridClient{
-		cfg: config.Debrid{Name: "primary", DownloadUncached: true, Priority: 1},
+		cfg: config.Debrid{Name: "primary", DownloadUncached: boolPointer(true), Priority: 1},
 		submitFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			return nil, errors.New("primary rejected")
 		},
 	}
 	backup := &fakeDebridClient{
-		cfg: config.Debrid{Name: "backup", DownloadUncached: false, Priority: 2},
+		cfg: config.Debrid{Name: "backup", DownloadUncached: boolPointer(false), Priority: 2},
 	}
 
 	torrent, err := fallbackTestManager(primary, backup).SendToDebrid(context.Background(), fallbackTestRequest("", true, boolPointer(true)))
@@ -365,7 +365,7 @@ func TestSendToDebridCachedBackupKeepsUncachedDisabled(t *testing.T) {
 
 func TestSendToDebridDefaultPathRequestUncachedOverridesProvider(t *testing.T) {
 	primary := &fakeDebridClient{
-		cfg: config.Debrid{Name: "primary", DownloadUncached: false},
+		cfg: config.Debrid{Name: "primary", DownloadUncached: boolPointer(false)},
 		checkFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			torrent.Status = debridTypes.TorrentStatusDownloading
 			return torrent, nil
@@ -394,7 +394,7 @@ func TestSendToDebridDefaultPathRequestUncachedOverridesProvider(t *testing.T) {
 
 func TestSendToDebridUsesFreshTorrentForEachAttempt(t *testing.T) {
 	primary := &fakeDebridClient{
-		cfg: config.Debrid{Name: "primary", DownloadUncached: true, Priority: 1},
+		cfg: config.Debrid{Name: "primary", DownloadUncached: boolPointer(true), Priority: 1},
 		submitFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			torrent.Id = "primary-id"
 			torrent.Name = "mutated-name"
@@ -404,7 +404,7 @@ func TestSendToDebridUsesFreshTorrentForEachAttempt(t *testing.T) {
 			return torrent, errors.New("primary rejected")
 		},
 	}
-	backup := &fakeDebridClient{cfg: config.Debrid{Name: "backup", DownloadUncached: true, Priority: 2}}
+	backup := &fakeDebridClient{cfg: config.Debrid{Name: "backup", DownloadUncached: boolPointer(true), Priority: 2}}
 
 	_, err := fallbackTestManager(primary, backup).SendToDebrid(context.Background(), fallbackTestRequest("", false, boolPointer(true)))
 	if err != nil {
@@ -425,7 +425,7 @@ func TestSendToDebridUsesFreshTorrentForEachAttempt(t *testing.T) {
 
 func TestSendToDebridAllFailuresAreNonNilAndProviderLabelled(t *testing.T) {
 	emptyID := &fakeDebridClient{
-		cfg: config.Debrid{Name: "empty-id", DownloadUncached: true},
+		cfg: config.Debrid{Name: "empty-id", DownloadUncached: boolPointer(true)},
 		submitFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			return torrent, nil
 		},
@@ -442,13 +442,13 @@ func TestSendToDebridAllFailuresAreNonNilAndProviderLabelled(t *testing.T) {
 
 func TestSendToDebridJoinsErrorsFromEveryAttempt(t *testing.T) {
 	first := &fakeDebridClient{
-		cfg: config.Debrid{Name: "first", DownloadUncached: true, Priority: 1},
+		cfg: config.Debrid{Name: "first", DownloadUncached: boolPointer(true), Priority: 1},
 		submitFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			return nil, errors.New("first rejection")
 		},
 	}
 	second := &fakeDebridClient{
-		cfg: config.Debrid{Name: "second", DownloadUncached: true, Priority: 2},
+		cfg: config.Debrid{Name: "second", DownloadUncached: boolPointer(true), Priority: 2},
 		submitFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			return nil, errors.New("second rejection")
 		},
@@ -499,7 +499,7 @@ func TestSendToDebridCancellationAfterSuccessfulStatusKeepsTorrent(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client := &fakeDebridClient{
-		cfg: config.Debrid{Name: "primary", DownloadUncached: true},
+		cfg: config.Debrid{Name: "primary", DownloadUncached: boolPointer(true)},
 		checkFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
 			cancel()
 			torrent.Status = debridTypes.TorrentStatusDownloaded
@@ -517,7 +517,7 @@ func TestSendToDebridCancellationAfterSuccessfulStatusKeepsTorrent(t *testing.T)
 }
 
 func TestSendToDebridHonorsCanceledContextBeforeProviderCall(t *testing.T) {
-	client := &fakeDebridClient{cfg: config.Debrid{Name: "primary", DownloadUncached: true}}
+	client := &fakeDebridClient{cfg: config.Debrid{Name: "primary", DownloadUncached: boolPointer(true)}}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
