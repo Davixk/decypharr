@@ -157,6 +157,45 @@ func (c *Config) updateUsenetProvider(index int, u UsenetProvider) UsenetProvide
 	return u
 }
 
+// UsenetProviderConnectionTotal sums the configured max connections across every
+// provider. This is the effective NNTP pool size the client builds: NewClient
+// creates one slot semaphore per provider with capacity = provider
+// max_connections, so the total acquirable connections is their sum.
+func (c *Config) UsenetProviderConnectionTotal() int {
+	total := 0
+	for _, provider := range c.Usenet.Providers {
+		total += provider.MaxConnections
+	}
+	return total
+}
+
+// UsenetProcessConcurrency returns the maximum number of heavy NZB
+// Process/availability passes that may run concurrently without oversubscribing
+// the provider connection pool. Each pass may open up to
+// processing_max_connections connections for its archive-fetch/availability
+// work, so the safe ceiling is floor(poolSize / processing_max_connections),
+// clamped to at least 1. This decouples heavy-Process concurrency from
+// max_active_downloads (which stays the worker/action count): even when
+// max_active_downloads x processing_max_connections exceeds the pool, at most
+// this many passes touch the substrate at once, so each gets enough connections
+// to finish within processing_timeout instead of timing out on a starved pool.
+//
+// A configuration with no providers or no processing budget returns 1 (fully
+// serialized) as a safe default; in practice the usenet client — and therefore
+// this gate — is only constructed when providers exist.
+func (c *Config) UsenetProcessConcurrency() int {
+	total := c.UsenetProviderConnectionTotal()
+	pmc := c.Usenet.ProcessingMaxConnections
+	if total <= 0 || pmc <= 0 {
+		return 1
+	}
+	gate := total / pmc
+	if gate < 1 {
+		gate = 1
+	}
+	return gate
+}
+
 // UsenetConnectionBudgetWarning reports a configuration whose worst-case
 // parallel-import connection demand (max_active_downloads imports, each
 // allowed usenet.processing_max_connections concurrent connections) exceeds
@@ -165,14 +204,16 @@ func (c *Config) updateUsenetProvider(index int, u UsenetProvider) UsenetProvide
 // substrate — the failure mode behind the boot-restore incident. Returns ""
 // when the configuration is within budget; callers log the returned message
 // as a warning (this is a guardrail, never a hard failure).
+//
+// Note: with the UsenetProcessConcurrency gate in place, heavy Process passes
+// are already fitted to the pool regardless of max_active_downloads, so this
+// oversubscription is no longer able to wedge the substrate — the warning is
+// retained purely as configuration advice.
 func (c *Config) UsenetConnectionBudgetWarning() string {
 	if len(c.Usenet.Providers) == 0 {
 		return ""
 	}
-	totalProviderConns := 0
-	for _, provider := range c.Usenet.Providers {
-		totalProviderConns += provider.MaxConnections
-	}
+	totalProviderConns := c.UsenetProviderConnectionTotal()
 	if totalProviderConns <= 0 || c.MaxActiveDownloads <= 0 || c.Usenet.ProcessingMaxConnections <= 0 {
 		return ""
 	}

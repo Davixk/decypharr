@@ -336,6 +336,25 @@ func rebuildNZBCompletionFiles(entry *storage.Entry, metadata *storage.NZB) {
 
 // processNewNzb processes a new NZB entry after it has been added to the usenet client
 func (m *Manager) processNewNzb(parentCtx context.Context, entry *storage.Entry, metadata *storage.NZB, groups map[string]*parser.FileGroup) error {
+	// Bound heavy Process/availability concurrency to the provider pool. The
+	// gate is acquired BEFORE the processing-timeout clock starts, so time spent
+	// waiting for a slot never counts against the per-job deadline. This is the
+	// root cure for the livelock: with the pool fitted, each admitted Process
+	// call gets enough connections to answer within processing_timeout and
+	// succeed, instead of a starved pool timing out and re-parsing forever.
+	if m.processSem != nil {
+		select {
+		case m.processSem <- struct{}{}:
+			defer func() { <-m.processSem }()
+		case <-parentCtx.Done():
+			return parentCtx.Err()
+		}
+		if m.processGateObserver != nil {
+			m.processGateObserver(1)
+			defer m.processGateObserver(-1)
+		}
+	}
+
 	// Create context with timeout for processing
 	ctx, cancel := context.WithTimeout(parentCtx, m.usenetTimeout)
 	defer cancel()

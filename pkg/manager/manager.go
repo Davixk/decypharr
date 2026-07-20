@@ -91,6 +91,20 @@ type Manager struct {
 	nzbSyncMu      sync.Mutex
 	nzbAdmissionMu sync.Mutex
 
+	// processSem bounds concurrent heavy NZB Process/availability passes so
+	// their combined connection demand never oversubscribes the provider pool.
+	// Sized max(1, floor(providerPoolSize / processing_max_connections)) so
+	// concurrentProcess x processing_max_connections <= poolSize. This decouples
+	// Process concurrency from MaxActiveDownloads: a Process call therefore
+	// always gets enough connections to finish within processing_timeout instead
+	// of timing out on a starved pool and re-parsing forever. nil when usenet is
+	// not configured (no Process calls happen).
+	processSem chan struct{}
+	// processGateObserver, when set, is invoked with +1 immediately after a
+	// Process call is admitted past processSem and -1 when it releases, so tests
+	// can assert the gate never admits more than its configured width.
+	processGateObserver func(delta int)
+
 	// revivalDoomWarned dedups the once-per-entry-per-boot WARN emitted when
 	// the revival sweep skips an entry whose queued rebuild is guaranteed to
 	// fail (no parsed segments in metadata and no NZB source on disk).
@@ -277,11 +291,24 @@ func (m *Manager) initUsenet() {
 	if err != nil {
 		m.logger.Warn().Msg("Usenet client not configured")
 		m.usenet = nil
+		m.processSem = nil
 		return
 	}
 	m.usenet = usenetClient
+	// Fit concurrent heavy Process/availability passes to the provider pool so
+	// they cannot oversubscribe it and time out en masse (the substrate-wedge
+	// mechanism behind the livelock). Sized from the pool, NOT from
+	// MaxActiveDownloads, so the worker/action count stays independent.
+	gate := m.config.UsenetProcessConcurrency()
+	m.processSem = make(chan struct{}, gate)
+	m.logger.Info().
+		Int("process_concurrency", gate).
+		Int("provider_pool", m.config.UsenetProviderConnectionTotal()).
+		Int("processing_max_connections", m.config.Usenet.ProcessingMaxConnections).
+		Msg("Bounded concurrent NZB processing to the provider connection pool")
 	// Guardrail only — warn (never fail) when parallel imports can exhaust
-	// the configured provider connection budget and wedge the substrate.
+	// the configured provider connection budget. With the Process gate above
+	// this can no longer wedge the substrate; the warning remains as advice.
 	if warning := m.config.UsenetConnectionBudgetWarning(); warning != "" {
 		m.logger.Warn().Msg(warning)
 	}
