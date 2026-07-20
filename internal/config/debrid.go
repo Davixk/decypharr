@@ -12,7 +12,7 @@ type Debrid struct {
 	Name                         string   `json:"name,omitempty"`
 	APIKey                       string   `json:"api_key,omitempty"`
 	DownloadAPIKeys              []string `json:"download_api_keys,omitempty"`
-	DownloadUncached             bool     `json:"download_uncached,omitempty"`
+	DownloadUncached             *bool    `json:"download_uncached,omitempty"`
 	RateLimit                    string   `json:"rate_limit,omitempty"` // 200/minute or 10/second
 	RepairRateLimit              string   `json:"repair_rate_limit,omitempty"`
 	DownloadRateLimit            string   `json:"download_rate_limit,omitempty"`
@@ -38,6 +38,15 @@ type Debrid struct {
 
 	// Directories
 	Directories map[string]WebdavDirectories `json:"directories,omitempty"` // Deprecated. Use global setting instead.
+}
+
+// DownloadsUncached resolves the tri-state download_uncached setting. A nil
+// value means the key is absent from config.json and keeps the historical
+// default: false (only cached torrents may be imported). Explicit true/false
+// values are persisted as-is; the field is *bool so an explicit false survives
+// a save round-trip instead of being stripped by omitempty.
+func (d *Debrid) DownloadsUncached() bool {
+	return d.DownloadUncached != nil && *d.DownloadUncached
 }
 
 func (c *Config) updateDebrid(index int, d Debrid) Debrid {

@@ -596,7 +596,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		if providerName == "" {
 			providerName = dbConfig.Provider
 		}
-		downloadUncached := resolveDownloadUncached(dbConfig.DownloadUncached, importRequest.DownloadUncached, fallbackChain)
+		downloadUncached := resolveDownloadUncached(dbConfig.DownloadsUncached(), importRequest.DownloadUncached, fallbackChain)
 		debridTorrent := newDebridAttempt(importRequest, downloadUncached)
 
 		_logger := db.Logger()
