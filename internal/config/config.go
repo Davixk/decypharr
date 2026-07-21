@@ -208,6 +208,37 @@ type RepairConfig struct {
 	AutoRepair            bool         `json:"auto_repair,omitempty"`
 	SkipNZBRepair         bool         `json:"skip_nzb_repair,omitempty"`
 
+	// The repair feature is split into four independent, named components:
+	//
+	//   CHECK    — always runs when Enabled. Enumerates the whole hosted library
+	//              via the managed path and probes each item for liveness. Has no
+	//              arr dependency and is not knob-gated.
+	//   REPAIR   — Repair knob. On a dead item, re-acquire it: re-add to the same
+	//              provider, falling back to other configured debrids in order.
+	//              Non-destructive. Defaults to true when unset (nil).
+	//   PRUNE    — Prune knob. On a dead item (REPAIR off or failed), delete it
+	//              decypharr-side ONLY: provider placements + symlink/download
+	//              folder + db entry. NEVER calls the arr — the arr keeps the item
+	//              monitored so its next disk scan re-searches on its own.
+	//              Destructive; defaults false.
+	//   RE-GRAB  — Regrab knob. On a dead item, go through the arr: delete the
+	//              file record, blocklist the grab, and trigger a search. The only
+	//              arr-coupled component. Independent of PRUNE (not gated behind
+	//              it). Destructive; defaults false.
+	//
+	// AutoRepair is the MASTER ACTION GATE for backward compat: when false the
+	// sweep is CHECK-only (detect + record, no REPAIR/PRUNE/RE-GRAB), exactly the
+	// old safe behavior. When true, the three per-component knobs below apply.
+	//
+	// Repair is a *bool so an unset field (nil, e.g. a config written before this
+	// split) resolves to the safe default of true via RepairEnabled(); Prune and
+	// Regrab default to their false zero value. So a dead item is detected and
+	// re-acquire-attempted by default, but nothing is DELETED until the operator
+	// opts into PRUNE and/or RE-GRAB.
+	Repair *bool `json:"repair,omitempty"`
+	Prune  bool  `json:"prune,omitempty"`
+	Regrab bool  `json:"regrab,omitempty"`
+
 	// MaxDeletionsPerRun caps how many entries a single repair run may
 	// destructively heal — i.e. how many entries can have their Arr file
 	// records deleted and/or their decypharr entry deleted in one sweep/run.
@@ -233,7 +264,18 @@ type RepairConfig struct {
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.MaxDeletionsPerRun == 0
+		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.MaxDeletionsPerRun == 0 &&
+		r.Repair == nil && !r.Prune && !r.Regrab
+}
+
+// RepairEnabled resolves the REPAIR (re-acquire) component knob. It defaults to
+// true when unset (nil) — the safe default is to attempt re-acquisition of a
+// dead item. Only takes effect when the AutoRepair master gate is on.
+func (r RepairConfig) RepairEnabled() bool {
+	if r.Repair == nil {
+		return true
+	}
+	return *r.Repair
 }
 
 type Config struct {

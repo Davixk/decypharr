@@ -99,6 +99,56 @@ func NewRepair(m *Manager) *Repair {
 
 func (r *Repair) cfg() config.RepairConfig { return config.Get().Repair }
 
+// repairActions is the resolved set of per-item components a run may apply to a
+// dead item after CHECK has found it. The four components are independent and
+// individually knob-gated:
+//
+//   - repair (REPAIR)  — re-acquire the item across providers. Non-destructive.
+//   - prune  (PRUNE)   — delete the item decypharr-side only (no arr). Destructive.
+//   - regrab (RE-GRAB) — delete+blocklist+re-search via the arr. Destructive.
+//
+// CHECK itself (enumerate + probe + record) always runs and is not represented
+// here — it is the detection that produces the dead items these actions target.
+type repairActions struct {
+	repair bool
+	prune  bool
+	regrab bool
+}
+
+// destructive reports whether any component that consumes a per-run deletion
+// slot is enabled (PRUNE and RE-GRAB). REPAIR is non-destructive.
+func (a repairActions) destructive() bool { return a.prune || a.regrab }
+
+// any reports whether any action component is enabled. When false the run is
+// CHECK-only: probe and record health, take no further action.
+func (a repairActions) any() bool { return a.repair || a.prune || a.regrab }
+
+// resolveActions maps config + the effective auto-repair master gate to the
+// per-component action set. AutoRepair is preserved as a MASTER ACTION GATE for
+// backward compat: when it is off the run is CHECK-only (no REPAIR/PRUNE/
+// RE-GRAB), exactly the old safe behavior; when it is on the three per-component
+// knobs apply (REPAIR defaults on, PRUNE/RE-GRAB default off).
+func resolveActions(cfg config.RepairConfig, autoRepair bool) repairActions {
+	if !autoRepair {
+		return repairActions{}
+	}
+	return repairActions{
+		repair: cfg.RepairEnabled(),
+		prune:  cfg.Prune,
+		regrab: cfg.Regrab,
+	}
+}
+
+// manualFixActions is the action set for explicit, user-initiated "fix now"
+// endpoints (FixBroken, RecheckEntry/RecheckMedia with fix=true). Unlike the
+// scheduled sweep — which honors the per-component config knobs under the
+// AutoRepair master gate — an explicit fix runs the full pipeline (re-acquire,
+// then prune + re-grab whatever is still dead), preserving the pre-split
+// behavior of those manual actions.
+func manualFixActions() repairActions {
+	return repairActions{repair: true, prune: true, regrab: true}
+}
+
 func normalizeRepairProtocolScope(scope string) string {
 	switch strings.ToLower(strings.TrimSpace(scope)) {
 	case "all", "both":
