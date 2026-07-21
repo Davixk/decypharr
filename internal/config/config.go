@@ -208,6 +208,18 @@ type RepairConfig struct {
 	AutoRepair            bool         `json:"auto_repair,omitempty"`
 	SkipNZBRepair         bool         `json:"skip_nzb_repair,omitempty"`
 
+	// MaxDeletionsPerRun caps how many entries a single repair run may
+	// destructively heal — i.e. how many entries can have their Arr file
+	// records deleted and/or their decypharr entry deleted in one sweep/run.
+	// A provider-wide false "unavailable" (e.g. a debrid outage returning
+	// HosterUnavailable for everything) could otherwise mark the whole due set
+	// broken and mass-delete Arr records + entries in a single run. The cap
+	// makes recovery progressive: entries beyond the cap stay broken in
+	// storage and are re-picked next run, so nothing is lost — just deferred.
+	// 0/unset defaults to 100 (mirrors the missing-download reconciler); a
+	// negative value (e.g. -1) means unlimited.
+	MaxDeletionsPerRun int `json:"max_deletions_per_run,omitempty"`
+
 	// StopSchedule, when set, stops an in-progress repair sweep at this time/interval
 	// (same formats as Schedule: clock time, cron expression, or duration).
 	// A repair sweep still running when StopSchedule fires is cancelled before it
@@ -221,7 +233,7 @@ type RepairConfig struct {
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == ""
+		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.MaxDeletionsPerRun == 0
 }
 
 type Config struct {
