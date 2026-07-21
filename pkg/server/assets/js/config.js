@@ -166,6 +166,12 @@ class ConfigManager {
         if ($('repair.stop_schedule')) $('repair.stop_schedule').value = repair.stop_schedule || '';
         if ($('repair.auto_repair')) $('repair.auto_repair').checked = !!repair.auto_repair;
         if ($('repair.skip_nzb_repair')) $('repair.skip_nzb_repair').checked = !!repair.skip_nzb_repair;
+        // Repair-action component knobs. REPAIR defaults to ON when unset (null/
+        // undefined) — matching the backend's *bool default — so a config from
+        // before the split still re-acquires by default. PRUNE/RE-GRAB default OFF.
+        if ($('repair.repair')) $('repair.repair').checked = (repair.repair === undefined || repair.repair === null) ? true : !!repair.repair;
+        if ($('repair.prune')) $('repair.prune').checked = !!repair.prune;
+        if ($('repair.regrab')) $('repair.regrab').checked = !!repair.regrab;
     }
 
     collectRepairConfig() {
@@ -185,6 +191,12 @@ class ConfigManager {
             stop_schedule: $('repair.stop_schedule')?.value.trim() || '',
             auto_repair: $('repair.auto_repair')?.checked || false,
             skip_nzb_repair: $('repair.skip_nzb_repair')?.checked || false,
+            // Repair-action component knobs (master-gated by auto_repair on the
+            // backend). REPAIR = re-acquire (default on); PRUNE = decypharr-side
+            // delete only (never calls the arr); RE-GRAB = arr delete + search.
+            repair: $('repair.repair') ? !!$('repair.repair').checked : true,
+            prune: $('repair.prune')?.checked || false,
+            regrab: $('repair.regrab')?.checked || false,
             arrs,
         };
     }
