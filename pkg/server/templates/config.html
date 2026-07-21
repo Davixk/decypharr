@@ -1480,6 +1480,34 @@
                                 <span class="label-text font-medium">Skip NZB repair</span>
                             </label>
                         </div>
+
+                        <div class="divider text-sm opacity-70">Repair actions <span class="opacity-60 font-normal">(apply only when "Auto-repair when broken" is on)</span></div>
+                        <div class="alert alert-info alert-soft text-sm mb-2">
+                            <span>
+                                <strong>CHECK</strong> always runs and detects dead items across your whole library (no arr needed).
+                                The actions below decide what happens to a dead item, and each is independent:
+                                <strong>PRUNE</strong> never un-monitors the item in the arr &mdash; it deletes the item decypharr-side only,
+                                so the arr re-searches on its own next disk scan. <strong>RE-GRAB</strong> is the arr-API path (delete + blocklist + search) and is off by default.
+                                When "Auto-repair when broken" is off, the sweep is CHECK-only (detect + record, nothing acted on).
+                            </span>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <label class="label cursor-pointer justify-start gap-3">
+                                <input type="checkbox" class="checkbox checkbox-primary checkbox-sm"
+                                       id="repair.repair" name="repair.repair" checked>
+                                <span class="label-text font-medium">REPAIR <span class="opacity-60 font-normal">re-acquire (non-destructive, default on)</span></span>
+                            </label>
+                            <label class="label cursor-pointer justify-start gap-3">
+                                <input type="checkbox" class="checkbox checkbox-warning checkbox-sm"
+                                       id="repair.prune" name="repair.prune">
+                                <span class="label-text font-medium">PRUNE <span class="opacity-60 font-normal">delete decypharr-side only, arr keeps monitoring</span></span>
+                            </label>
+                            <label class="label cursor-pointer justify-start gap-3">
+                                <input type="checkbox" class="checkbox checkbox-warning checkbox-sm"
+                                       id="repair.regrab" name="repair.regrab">
+                                <span class="label-text font-medium">RE-GRAB <span class="opacity-60 font-normal">arr delete + blocklist + search (arr-coupled)</span></span>
+                            </label>
+                        </div>
                     </div>
                 </div>
 
