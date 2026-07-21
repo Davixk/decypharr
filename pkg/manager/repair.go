@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
@@ -54,6 +55,12 @@ const (
 	repairDefaultWorkers   = 5
 	repairDefaultRecheck   = 7 * 24 * time.Hour
 	repairHistoryRetained  = 100
+	// repairDefaultMaxDeletionsPerRun bounds how many entries a single sweep/run
+	// may destructively heal when config leaves it unset. Mirrors the
+	// missing-download reconciler's missingDownloadSweepLimit so a provider-wide
+	// false "unavailable" recovers progressively instead of mass-deleting the
+	// whole due set in one run.
+	repairDefaultMaxDeletionsPerRun = 100
 	// At most this many files probed concurrently within a single entry. The
 	// outer worker count comes from cfg.Repair.Workers.
 	repairFilesPerEntry    = 2
@@ -145,6 +152,97 @@ func (r *Repair) recheckInterval() time.Duration {
 		return repairDefaultRecheck
 	}
 	return d
+}
+
+// maxDeletionsPerRun resolves the per-run destructive-deletion cap used by
+// newDeletionBudget. 0/unset -> repairDefaultMaxDeletionsPerRun (100); a
+// negative value (e.g. -1) -> 0, which the budget treats as unlimited.
+func (r *Repair) maxDeletionsPerRun() int {
+	switch v := r.cfg().MaxDeletionsPerRun; {
+	case v < 0:
+		return 0 // unlimited
+	case v == 0:
+		return repairDefaultMaxDeletionsPerRun
+	default:
+		return v
+	}
+}
+
+// repairDeletionBudget bounds how many entries a single repair run may
+// destructively heal — an entry-folder whose Arr file records get deleted
+// (a.DeleteFiles) and/or whose decypharr entry gets deleted (DeleteEntry).
+// One slot is reserved per entry that is about to have a real destructive
+// action performed; non-destructive probing and re-inserts that heal never
+// reserve. A provider-wide false "unavailable" could otherwise mark the whole
+// due set broken and mass-delete in one run; capping makes recovery
+// progressive — entries past the cap stay broken in storage and are re-picked
+// next run, so nothing is lost.
+//
+// A nil budget, or one whose limit is <= 0, is unlimited. Single-item /
+// user-scoped paths (RecheckEntry, RecheckMedia) pass nil so a legitimate
+// single action is never blocked by the cap.
+type repairDeletionBudget struct {
+	limit    int
+	used     atomic.Int64
+	skipped  atomic.Int64
+	warnOnce sync.Once
+	logger   zerolog.Logger
+	runID    string
+}
+
+// newDeletionBudget builds a budget for one run using the configured cap.
+func (r *Repair) newDeletionBudget(runID string) *repairDeletionBudget {
+	return &repairDeletionBudget{
+		limit:  r.maxDeletionsPerRun(),
+		logger: r.logger,
+		runID:  runID,
+	}
+}
+
+// reserve claims one destructive-deletion slot for the entry about to be
+// healed-with-deletion. It returns true when the caller may proceed with the
+// Arr file-record delete and/or the entry delete; false when the per-run cap
+// is exhausted, in which case the caller must skip ALL destructive actions for
+// that entry and leave it broken (it is re-picked next run). The first denial
+// logs a single WARN naming the cap. Safe for concurrent callers (the sweep
+// heals entries in parallel).
+func (b *repairDeletionBudget) reserve() bool {
+	if b == nil || b.limit <= 0 {
+		return true
+	}
+	for {
+		cur := b.used.Load()
+		if cur >= int64(b.limit) {
+			b.skipped.Add(1)
+			b.warnOnce.Do(func() {
+				b.logger.Warn().
+					Str("run_id", b.runID).
+					Int("cap", b.limit).
+					Msg("Repair deletion cap reached; further broken entries left un-deleted this run — they stay broken and are retried next run; raise repair.max_deletions_per_run to delete more per run")
+			})
+			return false
+		}
+		if b.used.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// deletions reports how many destructive-heal slots were consumed this run.
+func (b *repairDeletionBudget) deletions() int {
+	if b == nil {
+		return 0
+	}
+	return int(b.used.Load())
+}
+
+// skippedCount reports how many entries were left un-deleted because the cap
+// was already exhausted.
+func (b *repairDeletionBudget) skippedCount() int {
+	if b == nil {
+		return 0
+	}
+	return int(b.skipped.Load())
 }
 
 // Start registers the recurring sweep with the scheduler if repair is

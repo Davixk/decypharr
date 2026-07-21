@@ -96,11 +96,17 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		autoRepair = *opts.AutoRepair
 	}
 
+	// One destructive-deletion budget for the whole sweep. It bounds how many
+	// entries this run may Arr-delete + entry-delete, so a provider-wide false
+	// "unavailable" can't mass-delete the entire due set in one run. Shared by
+	// the inline heal pass and any StopSchedule post-stop repair pass.
+	budget := r.newDeletionBudget(run.ID)
+
 	log.Info().Str("source", string(cfg.Source)).Msg("Sweep: selecting candidates")
 	candidates, err := r.enumerateCandidates(ctx, cfg)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			r.finishCancelledRepairSweep(ctx, run, stopState, autoRepair, "context cancelled during selection", nil)
+			r.finishCancelledRepairSweep(ctx, run, stopState, autoRepair, "context cancelled during selection", nil, budget)
 			return
 		}
 		log.Error().Err(err).Msg("Sweep: enumeration failed")
@@ -108,7 +114,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		return
 	}
 	if ctx.Err() != nil {
-		r.finishCancelledRepairSweep(ctx, run, stopState, autoRepair, "context cancelled after selection", nil)
+		r.finishCancelledRepairSweep(ctx, run, stopState, autoRepair, "context cancelled after selection", nil, budget)
 		return
 	}
 
@@ -137,11 +143,11 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	log.Info().Int("due", len(due)).Int("skipped_fresh", skipped).Str("protocol", protocolScope).Bool("auto_repair", autoRepair).Msg("Sweep: probing")
 
 	heal := newHealCache()
-	err = r.probeAndHealCandidates(ctx, run, due, names, heal, opts, autoRepair)
+	err = r.probeAndHealCandidates(ctx, run, due, names, heal, opts, autoRepair, budget)
 	due = nil
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			r.finishCancelledRepairSweep(ctx, run, stopState, autoRepair, "context cancelled during probing", names)
+			r.finishCancelledRepairSweep(ctx, run, stopState, autoRepair, "context cancelled during probing", names, budget)
 			return
 		}
 		log.Error().Err(err).Msg("Sweep: probing failed")
@@ -149,7 +155,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		return
 	}
 	if ctx.Err() != nil {
-		r.finishCancelledRepairSweep(ctx, run, stopState, autoRepair, "context cancelled after probing", names)
+		r.finishCancelledRepairSweep(ctx, run, stopState, autoRepair, "context cancelled after probing", names, budget)
 		return
 	}
 
@@ -160,6 +166,8 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		Int("healthy", run.Stats.Healthy).
 		Int("repaired", run.Stats.Repaired).
 		Int("repair_failed", run.Stats.RepairFailed).
+		Int("deletions", budget.deletions()).
+		Int("deletion_cap_skipped", budget.skippedCount()).
 		Msg("Sweep: completed")
 }
 
@@ -173,7 +181,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 // A user-initiated StopRun already wrote RepairRunCancelled to storage before
 // calling cancel; finalizeRun preserves that status regardless of what's
 // passed here, so the StopRun path is unaffected.
-func (r *Repair) finishCancelledRepairSweep(ctx context.Context, run *storage.RepairRun, stopState *repairStopState, autoRepair bool, reason string, names []string) {
+func (r *Repair) finishCancelledRepairSweep(ctx context.Context, run *storage.RepairRun, stopState *repairStopState, autoRepair bool, reason string, names []string, budget *repairDeletionBudget) {
 	stopped := stopState != nil && stopState.get()
 	if !stopped {
 		r.finalizeRun(run, storage.RepairRunCancelled, "", reason)
@@ -195,7 +203,7 @@ func (r *Repair) finishCancelledRepairSweep(ctx context.Context, run *storage.Re
 		if healths.Size() > 0 {
 			run.Stage = storage.RepairStageRepairing
 			r.saveRun(run)
-			r.repairBroken(repairCtx, run, healths)
+			r.repairBroken(repairCtx, run, healths, budget)
 		}
 	}
 
@@ -232,7 +240,7 @@ func detachedRepairContext(runCtx, parentCtx context.Context) context.Context {
 // off the Arr delete/blocklist/re-search for that one entry — so there's no
 // separate end-of-run repair pass holding every health in memory. All healing
 // is gated on autoRepair.
-func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.RepairRun, candidates map[string]*candidate, names []string, heal *healCache, opts RepairRunOptions, autoRepair bool) error {
+func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.RepairRun, candidates map[string]*candidate, names []string, heal *healCache, opts RepairRunOptions, autoRepair bool, budget *repairDeletionBudget) error {
 	// run.Stats has plain int fields, so a single mutex guards every mutation
 	// and the saveRun that follows it.
 	var runMu sync.Mutex
@@ -260,9 +268,10 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 			}
 
 			// Still broken after the inline debrid re-insert: escalate to the
-			// Arr delete + re-search for just this entry.
+			// Arr delete + re-search for just this entry, bounded by the
+			// per-run destructive-deletion budget.
 			if autoRepair && h.Status == storage.HealthBroken {
-				r.healBrokenEntry(gctx, run, &runMu, name, h)
+				r.healBrokenEntry(gctx, run, &runMu, name, h, budget)
 			}
 
 			runMu.Lock()
@@ -609,13 +618,13 @@ func firstProtocol(results []fileResult) config.Protocol {
 // broken entries without reprobing. Used by the batch entry-points (FixBroken,
 // media/entry rechecks). The sweep itself heals inline per entry via
 // healBrokenEntry and does not call this.
-func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healths *xsync.Map[string, *storage.EntryHealth]) {
+func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healths *xsync.Map[string, *storage.EntryHealth], budget *repairDeletionBudget) {
 	var statsMu sync.Mutex
 	healths.Range(func(name string, h *storage.EntryHealth) bool {
 		if ctx != nil && ctx.Err() != nil {
 			return false
 		}
-		r.healBrokenEntry(ctx, run, &statsMu, name, h)
+		r.healBrokenEntry(ctx, run, &statsMu, name, h, budget)
 		return true
 	})
 }
@@ -626,7 +635,7 @@ func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healt
 // queue a download in the Arr — the replacement lands minutes-to-hours later,
 // so the next scheduled sweep is where verification happens. statsMu guards
 // run.Stats across concurrent entries.
-func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth) {
+func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, budget *repairDeletionBudget) {
 	if h == nil || h.Status != storage.HealthBroken {
 		return
 	}
@@ -649,6 +658,19 @@ func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, st
 		})
 	}
 	if len(byArr) == 0 {
+		// Nothing destructive to do (no Arr-known broken files): don't consume a
+		// deletion slot, don't touch the entry. Only stamp the repair timestamp.
+		return
+	}
+
+	// Per-run destructive-deletion cap: this entry is about to have its Arr file
+	// records deleted (and, when fully broken, its decypharr entry deleted).
+	// Reserve one slot; if the run's cap is exhausted, skip ALL destructive
+	// actions for this entry and leave it broken so it is re-picked next run.
+	// A nil / unlimited budget (single-item paths) always grants. Reserving only
+	// here — after confirming there is real Arr-delete work — means probes and
+	// re-inserts that heal the file never count against the cap.
+	if !budget.reserve() {
 		return
 	}
 
@@ -1170,6 +1192,12 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 		return nil, fmt.Errorf("failed to persist repair run: %w", err)
 	}
 
+	// FixBroken is a bulk destructive path (it can act on every broken entry at
+	// once), so it is bounded by the same per-run deletion cap as the scheduled
+	// sweep: at most maxDeletionsPerRun entries get deleted per invocation, the
+	// rest stay broken for the next run.
+	budget := r.newDeletionBudget(run.ID)
+
 	r.runWG.Go(func() {
 		defer func() {
 			r.mu.Lock()
@@ -1180,7 +1208,7 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 			r.mu.Unlock()
 			cancel()
 		}()
-		r.repairBroken(runCtx, run, healths)
+		r.repairBroken(runCtx, run, healths, budget)
 		if runCtx.Err() != nil {
 			r.finalizeRun(run, storage.RepairRunCancelled, "", "context cancelled during repair")
 			return
@@ -1191,6 +1219,8 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 			Int("candidates", run.Stats.Candidates).
 			Int("repaired", run.Stats.Repaired).
 			Int("repair_failed", run.Stats.RepairFailed).
+			Int("deletions", budget.deletions()).
+			Int("deletion_cap_skipped", budget.skippedCount()).
 			Msg("FixBroken: completed")
 	})
 	return run, nil
@@ -1349,7 +1379,9 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		}
 		pseudo := &storage.RepairRun{ID: runID, Stats: storage.RepairRunStats{}}
 		var statsMu sync.Mutex
-		r.healBrokenEntry(ctx, pseudo, &statsMu, entryName, final)
+		// Single entry: inherently bounded, so it runs with an unlimited budget
+		// (nil) and is never blocked by the per-run cap.
+		r.healBrokenEntry(ctx, pseudo, &statsMu, entryName, final, nil)
 	})
 
 	// Return an in-memory ack reflecting the freshly-started recheck. The
@@ -1468,7 +1500,9 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 	for name := range candidates {
 		mediaNames = append(mediaNames, name)
 	}
-	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{}, fix)
+	// A media recheck is user-scoped to a single media id (inherently bounded),
+	// so it runs with an unlimited budget (nil) and is never blocked by the cap.
+	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{}, fix, nil)
 	candidates = nil
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
