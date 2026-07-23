@@ -123,6 +123,26 @@ func (a repairActions) destructive() bool { return a.prune || a.regrab }
 // CHECK-only: probe and record health, take no further action.
 func (a repairActions) any() bool { return a.repair || a.prune || a.regrab }
 
+// label renders the enabled components as a compact "+"-joined string for the
+// run's Source field (traceability), e.g. "repair+prune". "check-only" when no
+// component is set.
+func (a repairActions) label() string {
+	parts := make([]string, 0, 3)
+	if a.repair {
+		parts = append(parts, "repair")
+	}
+	if a.prune {
+		parts = append(parts, "prune")
+	}
+	if a.regrab {
+		parts = append(parts, "regrab")
+	}
+	if len(parts) == 0 {
+		return "check-only"
+	}
+	return strings.Join(parts, "+")
+}
+
 // resolveActions maps config + the effective auto-repair master gate to the
 // per-component action set. AutoRepair is preserved as a MASTER ACTION GATE for
 // backward compat: when it is off the run is CHECK-only (no REPAIR/PRUNE/
@@ -139,14 +159,47 @@ func resolveActions(cfg config.RepairConfig, autoRepair bool) repairActions {
 	}
 }
 
-// manualFixActions is the action set for explicit, user-initiated "fix now"
-// endpoints (FixBroken, RecheckEntry/RecheckMedia with fix=true). Unlike the
-// scheduled sweep — which honors the per-component config knobs under the
-// AutoRepair master gate — an explicit fix runs the full pipeline (re-acquire,
-// then prune + re-grab whatever is still dead), preserving the pre-split
-// behavior of those manual actions.
-func manualFixActions() repairActions {
-	return repairActions{repair: true, prune: true, regrab: true}
+// ManualActions is an explicit per-component selection supplied by the manual
+// fix endpoints (FixBroken, RecheckEntry, RecheckMedia). It lets a caller drive
+// a SINGLE component (e.g. PRUNE-only) rather than the old force-all bundle. A
+// nil *ManualActions means "the request specified no components" — the caller
+// then falls back to the configured knobs (see resolveManualActions), never
+// force-all.
+type ManualActions struct {
+	Repair bool `json:"repair"`
+	Prune  bool `json:"prune"`
+	Regrab bool `json:"regrab"`
+}
+
+func (a *ManualActions) any() bool {
+	return a != nil && (a.Repair || a.Prune || a.Regrab)
+}
+
+// resolveManualActions maps an explicit component selection + the legacy fix
+// flag to the per-component action set for a user-initiated fix. Precedence:
+//
+//   - sel names ≥1 component            → exactly those components (single-
+//     component invocation, e.g. PRUNE-only, works here).
+//   - sel is nil/empty but fix == true  → fall back to the CONFIGURED knobs
+//     under the AutoRepair master gate (back-compat with the old fix:true
+//     clients) — NOT force-all, fixing the previous force-all footgun.
+//   - otherwise                         → CHECK-only (no action).
+func (r *Repair) resolveManualActions(sel *ManualActions, fix bool) repairActions {
+	if sel.any() {
+		return repairActions{repair: sel.Repair, prune: sel.Prune, regrab: sel.Regrab}
+	}
+	if fix {
+		cfg := r.cfg()
+		return resolveActions(cfg, cfg.AutoRepair)
+	}
+	return repairActions{}
+}
+
+// recordBudgetStats copies the per-run destructive-deletion budget totals onto
+// the run record so the history UI can surface them (previously logged only).
+func recordBudgetStats(run *storage.RepairRun, budget *repairDeletionBudget) {
+	run.Stats.Deletions = budget.deletions()
+	run.Stats.DeletionCapSkipped = budget.skippedCount()
 }
 
 func normalizeRepairProtocolScope(scope string) string {
@@ -708,10 +761,11 @@ func notificationEventFor(status storage.RepairRunStatus) config.NotificationEve
 func discordContextFor(run *storage.RepairRun) string {
 	const dateFmt = "2006-01-02 15:04:05"
 	return fmt.Sprintf(
-		"\n**Run**: %s\n**Trigger**: %s\n**Source**: %s\n**Status**: %s\n**Started**: %s\n**Completed**: %s\n**Probed**: %d (broken: %d, repaired: %d)\n",
+		"\n**Run**: %s\n**Trigger**: %s\n**Source**: %s\n**Status**: %s\n**Started**: %s\n**Completed**: %s\n**Checked**: %d (broken: %d)\n**Actions**: re-acquired %d · pruned %d · re-grabbed %d\n",
 		run.ID, run.Trigger, run.Source, run.Status,
 		run.StartedAt.Format(dateFmt), run.CompletedAt.Format(dateFmt),
-		run.Stats.Probed, run.Stats.Broken, run.Stats.Repaired,
+		run.Stats.Probed, run.Stats.Broken,
+		run.Stats.Reacquired, run.Stats.Pruned, run.Stats.Regrabbed,
 	)
 }
 

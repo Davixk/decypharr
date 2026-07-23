@@ -172,6 +172,11 @@ class ConfigManager {
         if ($('repair.repair')) $('repair.repair').checked = (repair.repair === undefined || repair.repair === null) ? true : !!repair.repair;
         if ($('repair.prune')) $('repair.prune').checked = !!repair.prune;
         if ($('repair.regrab')) $('repair.regrab').checked = !!repair.regrab;
+        // Deletion cap. Blank shows the default (100); -1 (unlimited) is shown
+        // verbatim so it round-trips. 0/unset → blank so the placeholder reads.
+        if ($('repair.max_deletions_per_run')) {
+            $('repair.max_deletions_per_run').value = repair.max_deletions_per_run ? repair.max_deletions_per_run : '';
+        }
     }
 
     collectRepairConfig() {
@@ -197,8 +202,18 @@ class ConfigManager {
             repair: $('repair.repair') ? !!$('repair.repair').checked : true,
             prune: $('repair.prune')?.checked || false,
             regrab: $('repair.regrab')?.checked || false,
+            // Deletion cap: blank → 0 (backend resolves to the default 100). -1
+            // means unlimited. omitempty drops a 0 on the wire, which is fine.
+            max_deletions_per_run: this.parseMaxDeletions($('repair.max_deletions_per_run')?.value),
             arrs,
         };
+    }
+
+    parseMaxDeletions(raw) {
+        const v = (raw ?? '').toString().trim();
+        if (v === '') return 0;
+        const n = parseInt(v, 10);
+        return Number.isNaN(n) ? 0 : n;
     }
 
     populateGeneralSettings(config) {

@@ -338,8 +338,13 @@ func TestSweepEnforcesDeletionCap(t *testing.T) {
 }
 
 // TestFixBrokenEnforcesDeletionCap pins the same cap on the bulk "Fix broken"
-// path (FixBroken -> repairBroken -> healBrokenEntry): 5 broken, cap 2 => 2
+// path (FixBroken -> repairBroken -> actOnDeadEntry): 5 broken, cap 2 => 2
 // deleted, 3 remain, WARN.
+//
+// Change vs pre-split: FixBroken now takes an explicit component selection
+// instead of forcing all three. This passes {Prune,Regrab} (the destructive
+// pair) so the deletion-cap behavior under test is unchanged; REPAIR is omitted
+// because these entries carry no re-acquirable provider placement.
 func TestFixBrokenEnforcesDeletionCap(t *testing.T) {
 	m, r, arrSrv, buf := newRepairCapFixture(t, 2)
 
@@ -348,7 +353,7 @@ func TestFixBrokenEnforcesDeletionCap(t *testing.T) {
 		seedBrokenEntry(t, m, hash, "FixMovie"+string(rune('A'+i)))
 	}
 
-	run, err := r.FixBroken(context.Background(), nil)
+	run, err := r.FixBroken(context.Background(), nil, &ManualActions{Prune: true, Regrab: true})
 	if err != nil {
 		t.Fatalf("FixBroken: %v", err)
 	}
@@ -372,12 +377,15 @@ func TestFixBrokenEnforcesDeletionCap(t *testing.T) {
 func TestSingleItemHealNotBlockedByCap(t *testing.T) {
 	m, r, arrSrv, _ := newRepairCapFixture(t, 1)
 
-	// Single-item path uses a nil budget: never blocked.
+	// Single-item path uses a nil budget: never blocked. actOnDeadEntry applies
+	// only the destructive components, so pass {Prune,Regrab} directly (was
+	// manualFixActions(); repair is a no-op in actOnDeadEntry).
+	destructive := repairActions{prune: true, regrab: true}
 	seedBrokenEntry(t, m, "single-nil", "SingleNil")
 	hNil, _ := m.storage.GetEntryHealth("SingleNil")
 	run := &storage.RepairRun{ID: uuid.NewString()}
 	var mu sync.Mutex
-	r.actOnDeadEntry(context.Background(), run, &mu, "SingleNil", hNil, manualFixActions(), nil)
+	r.actOnDeadEntry(context.Background(), run, &mu, "SingleNil", hNil, destructive, nil)
 	if entryExists(t, m, "single-nil") {
 		t.Fatal("single-item heal (nil budget) did not delete its entry")
 	}
@@ -386,7 +394,7 @@ func TestSingleItemHealNotBlockedByCap(t *testing.T) {
 	seedBrokenEntry(t, m, "single-cap", "SingleCap")
 	hCap, _ := m.storage.GetEntryHealth("SingleCap")
 	budget := r.newDeletionBudget(run.ID)
-	r.actOnDeadEntry(context.Background(), run, &mu, "SingleCap", hCap, manualFixActions(), budget)
+	r.actOnDeadEntry(context.Background(), run, &mu, "SingleCap", hCap, destructive, budget)
 	if entryExists(t, m, "single-cap") {
 		t.Fatal("cap=1 run wrongly blocked its single legitimate deletion")
 	}
