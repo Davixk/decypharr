@@ -168,15 +168,18 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		return
 	}
 
+	recordBudgetStats(run, budget)
 	r.finalizeRun(run, storage.RepairRunCompleted, "", "")
 	log.Info().
 		Int("probed", run.Stats.Probed).
 		Int("broken", run.Stats.Broken).
 		Int("healthy", run.Stats.Healthy).
-		Int("repaired", run.Stats.Repaired).
-		Int("repair_failed", run.Stats.RepairFailed).
-		Int("deletions", budget.deletions()).
-		Int("deletion_cap_skipped", budget.skippedCount()).
+		Int("reacquired", run.Stats.Reacquired).
+		Int("pruned", run.Stats.Pruned).
+		Int("regrabbed", run.Stats.Regrabbed).
+		Int("regrab_failed", run.Stats.RepairFailed).
+		Int("deletions", run.Stats.Deletions).
+		Int("deletion_cap_skipped", run.Stats.DeletionCapSkipped).
 		Msg("Sweep: completed")
 }
 
@@ -219,6 +222,7 @@ func (r *Repair) finishCancelledRepairSweep(ctx context.Context, run *storage.Re
 	}
 
 	run.CancelReason = ""
+	recordBudgetStats(run, budget)
 	r.finalizeRun(run, storage.RepairRunCompleted, "", "stopped by schedule: "+reason)
 }
 
@@ -273,7 +277,7 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 				return gctx.Err()
 			}
 
-			h := r.probeEntry(gctx, run.ID, c, heal, opts, actions.repair)
+			h, reacquired := r.probeEntry(gctx, run.ID, c, heal, opts, actions.repair)
 			if h == nil {
 				// Entry vanished or had no files between enumeration and probe;
 				// skip without counting. Release any loaded body.
@@ -291,6 +295,7 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 
 			runMu.Lock()
 			run.Stats.Probed++
+			run.Stats.Reacquired += reacquired
 			switch h.Status {
 			case storage.HealthHealthy:
 				run.Stats.Healthy++
@@ -317,7 +322,7 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 // repair is set), then persists final health. When REPAIR heals the item its
 // rolled-up status becomes healthy, which is what stops the downstream
 // PRUNE/RE-GRAB pipeline for it.
-func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, repair bool) *storage.EntryHealth {
+func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, repair bool) (*storage.EntryHealth, int) {
 	s := r.manager.storage
 	// Lazily load the entry body. Enumeration only recorded the name, so the
 	// store isn't fully decoded up front. A vanished or empty entry is a skip
@@ -325,7 +330,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	if c.item == nil {
 		item, err := s.GetEntryItem(c.name)
 		if err != nil || item == nil || len(item.Files) == 0 {
-			return nil
+			return nil, 0
 		}
 		c.item = item
 	}
@@ -345,11 +350,12 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 
 	names := orderedFilenames(c.item)
 	results := r.probeFiles(ctx, c.item, names, opts)
+	reacquired := 0
 	if repair {
 		// REPAIR component: re-acquire dead torrents across providers. On
 		// success the file's result flips to healthy so the entry rolls up
 		// healthy and the destructive pipeline never runs for it.
-		r.autoHealResults(ctx, results, heal)
+		reacquired = r.autoHealResults(ctx, results, heal)
 	}
 
 	broken := r.brokenFiles(c, results)
@@ -379,7 +385,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	}
 
 	r.saveHealth(h)
-	return h
+	return h, reacquired
 }
 
 // probeFiles fans per-file probes inside a single entry, capped at
@@ -530,8 +536,9 @@ func (r *Repair) probeTorrentFileByUnrestrict(entry *storage.Entry, file *storag
 
 // autoHealResults walks broken torrent infohashes and tries one re-insert per
 // infohash (singleflighted). On success, every file in that infohash group is
-// marked healthy.
-func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal *healCache) {
+// marked healthy. Returns the number of infohashes REPAIR successfully
+// re-acquired, for the run's Reacquired outcome counter.
+func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal *healCache) int {
 	byHash := make(map[string][]int)
 	for i, res := range results {
 		if !res.broken || res.protocol != config.ProtocolTorrent || res.infoHash == "" {
@@ -540,8 +547,9 @@ func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal
 		byHash[res.infoHash] = append(byHash[res.infoHash], i)
 	}
 	if len(byHash) == 0 {
-		return
+		return 0
 	}
+	reacquired := 0
 	for infoHash, indices := range byHash {
 		entry, err := r.manager.GetEntry(infoHash)
 		if err != nil || entry == nil {
@@ -553,12 +561,14 @@ func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal
 		if err != nil {
 			continue
 		}
+		reacquired++
 		for _, i := range indices {
 			results[i].broken = false
 			results[i].healthy = true
 			results[i].reason = "repaired"
 		}
 	}
+	return reacquired
 }
 
 // brokenFiles flattens broken results into BrokenFile records, attaching Arr
@@ -634,19 +644,71 @@ func firstProtocol(results []fileResult) config.Protocol {
 	return ""
 }
 
-// repairBroken runs the destructive components (PRUNE and/or RE-GRAB) over a
-// set of already-known dead entries without reprobing. Used by the batch
-// entry-points (FixBroken, media/entry rechecks) and the StopSchedule post-stop
-// pass. The sweep itself acts inline per entry via actOnDeadEntry.
+// repairBroken runs the selected components over a set of already-known dead
+// entries without reprobing. Used by the batch entry-points (FixBroken,
+// media/entry rechecks) and the StopSchedule post-stop pass. Per entry the
+// components apply in the same order the sweep uses:
+//
+//	REPAIR  — re-acquire across providers; on success the item is servable and
+//	          the destructive components are skipped for it.
+//	PRUNE / RE-GRAB — if still dead, the destructive pass via actOnDeadEntry.
+//
+// The scheduled sweep instead applies REPAIR inline during probing (probeEntry)
+// and only reaches actOnDeadEntry for what's still dead.
 func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healths *xsync.Map[string, *storage.EntryHealth], actions repairActions, budget *repairDeletionBudget) {
 	var statsMu sync.Mutex
 	healths.Range(func(name string, h *storage.EntryHealth) bool {
 		if ctx != nil && ctx.Err() != nil {
 			return false
 		}
+		if actions.repair && r.reacquireDeadEntry(ctx, run, &statsMu, name, h) {
+			return true
+		}
 		r.actOnDeadEntry(ctx, run, &statsMu, name, h, actions, budget)
 		return true
 	})
+}
+
+// reacquireDeadEntry is the REPAIR component on the batch (no-reprobe) path used
+// by FixBroken and the stop-schedule post-stop pass: it re-inserts the dead
+// item's broken torrent infohashes across providers. On success (every broken
+// torrent re-acquired) it clears the entry's broken health so the next CHECK
+// confirms it, records the Reacquired outcome, and returns true so the caller
+// skips the destructive components for this item. Non-destructive: it never
+// consumes a deletion slot and makes ZERO arr calls.
+func (r *Repair) reacquireDeadEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth) bool {
+	if h == nil || h.Status != storage.HealthBroken {
+		return false
+	}
+	hashes := make(map[string]struct{})
+	for _, bf := range h.BrokenFiles {
+		if bf.Protocol == config.ProtocolTorrent && bf.InfoHash != "" {
+			hashes[bf.InfoHash] = struct{}{}
+		}
+	}
+	if len(hashes) == 0 {
+		return false
+	}
+	for hash := range hashes {
+		if ctx != nil && ctx.Err() != nil {
+			return false
+		}
+		entry, err := r.manager.GetEntry(hash)
+		if err != nil || entry == nil {
+			return false
+		}
+		if err := r.manager.ReinsertEntry(ctx, entry); err != nil {
+			r.logger.Debug().Err(err).Str("component", "REPAIR").Str("entry", name).Str("infohash", hash).Msg("REPAIR: re-acquire failed; leaving dead for PRUNE/RE-GRAB")
+			return false
+		}
+	}
+	r.logger.Info().Str("component", "REPAIR").Str("entry", name).Msg("REPAIR: re-acquired dead item across providers")
+	statsMu.Lock()
+	run.Stats.Reacquired++
+	r.saveRun(run)
+	statsMu.Unlock()
+	r.markBrokenHealthCleared(h, time.Now())
+	return true
 }
 
 // entryHealthHasArrLink reports whether a dead entry carries the arr
@@ -718,8 +780,11 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 	if wantRegrab {
 		r.regrabDeadEntry(ctx, run, statsMu, name, h)
 	}
-	if wantPrune {
-		r.pruneDeadEntry(name, h)
+	if wantPrune && r.pruneDeadEntry(name, h) {
+		statsMu.Lock()
+		run.Stats.Pruned++
+		r.saveRun(run)
+		statsMu.Unlock()
 	}
 }
 
@@ -773,8 +838,9 @@ func (r *Repair) regrabDeadEntry(ctx context.Context, run *storage.RepairRun, st
 // design the arr keeps the item MONITORED so its own next disk scan sees the
 // file missing and re-searches, with no decypharr->arr coupling. Only
 // fully-broken entries reach here (pruneEligible), so a partially-broken entry
-// keeps its healthy files.
-func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) {
+// keeps its healthy files. Returns true when at least one infohash was deleted
+// decypharr-side, so the caller can record the PRUNE outcome.
+func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) bool {
 	hashes := make(map[string]struct{})
 	for _, bf := range h.BrokenFiles {
 		if bf.InfoHash != "" {
@@ -782,7 +848,7 @@ func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) {
 		}
 	}
 	if len(hashes) == 0 {
-		return
+		return false
 	}
 
 	deleted := false
@@ -795,7 +861,7 @@ func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) {
 		r.logger.Info().Str("component", "PRUNE").Str("entry", name).Str("infohash", hash).Msg("PRUNE: deleted dead entry decypharr-side (no arr call; arr keeps monitoring)")
 	}
 	if !deleted {
-		return
+		return false
 	}
 
 	// The entry is gone decypharr-side. Clear its now-orphan health record so
@@ -807,6 +873,7 @@ func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) {
 		h.LastRepairAt = time.Now()
 		r.saveHealth(h)
 	}
+	return true
 }
 
 // repairArrFiles deletes the broken files in one Arr, blocklists their grabs,
@@ -881,7 +948,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	}
 
 	statsMu.Lock()
-	run.Stats.Repaired += len(files)
+	run.Stats.Regrabbed += len(files)
 	r.saveRun(run)
 	statsMu.Unlock()
 	return true
@@ -1253,32 +1320,34 @@ func (r *Repair) markBrokenHealthCleared(h *storage.EntryHealth, at time.Time) {
 	r.saveHealth(h)
 }
 
-func isAlreadyClearedFileError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "not found") ||
-		strings.Contains(msg, "file does not exist") ||
-		strings.Contains(msg, "file is deleted")
-}
-
-// FixBroken triggers the Arr delete + re-search pass on currently-broken
-// entries without reprobing. When names is empty, every entry with
-// Status=broken in storage is fixed. Returns the new RepairRun record
-// immediately; the actual fix runs in the background.
+// FixBroken acts on currently-broken entries WITHOUT reprobing, applying the
+// selected components: REPAIR (re-acquire across providers), PRUNE (delete
+// decypharr-side only) and/or RE-GRAB (arr delete + blocklist + search). When
+// names is empty every entry with Status=broken is acted on. Returns the new
+// RepairRun record immediately; the work runs in the background.
 //
-// Use this from the UI when a previous sweep already identified broken
-// entries and the user wants to act on them without paying for another
-// probe pass.
-func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.RepairRun, error) {
+// Component precedence (resolveManualActions): an explicit selection runs
+// exactly those components — single-component invocation (e.g. PRUNE-only) is
+// supported; a nil selection falls back to the configured knobs under the
+// AutoRepair master gate — never force-all.
+//
+// Use this from the UI when a previous sweep already identified broken entries
+// and the user wants to act on them without paying for another probe pass.
+func (r *Repair) FixBroken(ctx context.Context, names []string, sel *ManualActions) (*storage.RepairRun, error) {
 	if ctx == nil {
 		ctx = r.parentCtx
 	}
 
-	// Skip entries with no Arr-known broken files — there's nothing the fix
-	// pass can delete and re-search for them.
-	healths, wantedCount := r.collectBrokenHealths(names, true)
+	actions := r.resolveManualActions(sel, true)
+	if !actions.any() {
+		return nil, errors.New("no repair action selected: enable REPAIR, PRUNE, or RE-GRAB")
+	}
+
+	// Require an arr link only when RE-GRAB is the ONLY thing that can act:
+	// PRUNE and REPAIR act on entries with no arr link too, so requiring one
+	// would wrongly exclude prune-/repair-eligible broken entries.
+	requireArr := actions.regrab && !actions.prune && !actions.repair
+	healths, wantedCount := r.collectBrokenHealths(names, requireArr)
 	if healths.Size() == 0 {
 		return nil, errors.New("no fixable broken entries")
 	}
@@ -1290,9 +1359,9 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 		return nil, fmt.Errorf("repair already running (run %s)", id)
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	source := "fix-broken:all"
+	scope := "all"
 	if wantedCount > 0 {
-		source = fmt.Sprintf("fix-broken:%d", wantedCount)
+		scope = fmt.Sprintf("%d", wantedCount)
 	}
 	run := &storage.RepairRun{
 		ID:        uuid.NewString(),
@@ -1300,7 +1369,7 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 		Status:    storage.RepairRunRunning,
 		Stage:     storage.RepairStageRepairing,
 		StartedAt: time.Now(),
-		Source:    source,
+		Source:    fmt.Sprintf("fix-broken:%s:%s", scope, actions.label()),
 	}
 	run.Stats.Candidates = healths.Size()
 	r.activeRunID = run.ID
@@ -1316,10 +1385,11 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 		return nil, fmt.Errorf("failed to persist repair run: %w", err)
 	}
 
-	// FixBroken is a bulk destructive path (it can act on every broken entry at
-	// once), so it is bounded by the same per-run deletion cap as the scheduled
-	// sweep: at most maxDeletionsPerRun entries get deleted per invocation, the
-	// rest stay broken for the next run.
+	// FixBroken is a bulk path (it can act on every broken entry at once), so its
+	// destructive components (PRUNE/RE-GRAB) are bounded by the same per-run
+	// deletion cap as the scheduled sweep: at most maxDeletionsPerRun entries get
+	// deleted per invocation, the rest stay broken for the next run. REPAIR
+	// re-acquires are non-destructive and never consume a slot.
 	budget := r.newDeletionBudget(run.ID)
 
 	r.runWG.Go(func() {
@@ -1332,10 +1402,8 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 			r.mu.Unlock()
 			cancel()
 		}()
-		// FixBroken is an explicit user-initiated destructive action, so it forces
-		// the full manual fix set (PRUNE + RE-GRAB) regardless of the per-component
-		// config knobs, preserving its pre-split behavior.
-		r.repairBroken(runCtx, run, healths, manualFixActions(), budget)
+		r.repairBroken(runCtx, run, healths, actions, budget)
+		recordBudgetStats(run, budget)
 		if runCtx.Err() != nil {
 			r.finalizeRun(run, storage.RepairRunCancelled, "", "context cancelled during repair")
 			return
@@ -1344,138 +1412,23 @@ func (r *Repair) FixBroken(ctx context.Context, names []string) (*storage.Repair
 		r.logger.Info().
 			Str("run_id", run.ID).
 			Int("candidates", run.Stats.Candidates).
-			Int("repaired", run.Stats.Repaired).
-			Int("repair_failed", run.Stats.RepairFailed).
-			Int("deletions", budget.deletions()).
-			Int("deletion_cap_skipped", budget.skippedCount()).
+			Int("reacquired", run.Stats.Reacquired).
+			Int("pruned", run.Stats.Pruned).
+			Int("regrabbed", run.Stats.Regrabbed).
+			Int("regrab_failed", run.Stats.RepairFailed).
+			Int("deletions", run.Stats.Deletions).
+			Int("deletion_cap_skipped", run.Stats.DeletionCapSkipped).
 			Msg("FixBroken: completed")
 	})
 	return run, nil
 }
 
-// ClearBroken removes currently-broken files from the local mount state. It
-// deliberately does not call Arrs, mark history failed, or trigger re-search.
-func (r *Repair) ClearBroken(ctx context.Context, names []string) (*storage.RepairRun, error) {
-	if ctx == nil {
-		ctx = r.parentCtx
-	}
-
-	healths, wantedCount := r.collectBrokenHealths(names, false)
-	if healths.Size() == 0 {
-		return nil, errors.New("no broken files to clear")
-	}
-
-	r.mu.Lock()
-	if r.activeRunID != "" {
-		id := r.activeRunID
-		r.mu.Unlock()
-		return nil, fmt.Errorf("repair already running (run %s)", id)
-	}
-	runCtx, cancel := context.WithCancel(ctx)
-	source := "clear-broken:all"
-	if wantedCount > 0 {
-		source = fmt.Sprintf("clear-broken:%d", wantedCount)
-	}
-	run := &storage.RepairRun{
-		ID:        uuid.NewString(),
-		Trigger:   storage.RepairTriggerManual,
-		Status:    storage.RepairRunRunning,
-		Stage:     storage.RepairStageRepairing,
-		StartedAt: time.Now(),
-		Source:    source,
-	}
-	run.Stats.Candidates = healths.Size()
-	r.activeRunID = run.ID
-	r.cancelRun = cancel
-	r.mu.Unlock()
-
-	if err := r.manager.storage.SaveRepairRun(run); err != nil {
-		r.mu.Lock()
-		r.activeRunID = ""
-		r.cancelRun = nil
-		r.mu.Unlock()
-		cancel()
-		return nil, fmt.Errorf("failed to persist repair run: %w", err)
-	}
-
-	r.runWG.Go(func() {
-		defer func() {
-			r.mu.Lock()
-			if r.activeRunID == run.ID {
-				r.activeRunID = ""
-				r.cancelRun = nil
-			}
-			r.mu.Unlock()
-			cancel()
-		}()
-		r.clearBroken(runCtx, run, healths)
-		if runCtx.Err() != nil {
-			r.finalizeRun(run, storage.RepairRunCancelled, "", "context cancelled during clear")
-			return
-		}
-		r.finalizeRun(run, storage.RepairRunCompleted, "", "")
-		r.logger.Info().
-			Str("run_id", run.ID).
-			Int("candidates", run.Stats.Candidates).
-			Int("cleared", run.Stats.Cleared).
-			Int("clear_failed", run.Stats.RepairFailed).
-			Msg("ClearBroken: completed")
-	})
-	return run, nil
-}
-
-func (r *Repair) clearBroken(ctx context.Context, run *storage.RepairRun, healths *xsync.Map[string, *storage.EntryHealth]) {
-	now := time.Now()
-	healths.Range(func(name string, h *storage.EntryHealth) bool {
-		if ctx != nil && ctx.Err() != nil {
-			return false
-		}
-		if h == nil {
-			return true
-		}
-		if len(h.BrokenFiles) == 0 {
-			r.markBrokenHealthCleared(h, now)
-			run.Stats.Cleared++
-			r.saveRun(run)
-			return true
-		}
-
-		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
-		for _, bf := range h.BrokenFiles {
-			if err := r.manager.RemoveTorrentFile(bf.EntryName, bf.FileName); err != nil {
-				if isAlreadyClearedFileError(err) {
-					run.Stats.Cleared++
-					r.saveRun(run)
-					continue
-				}
-				r.logger.Warn().Err(err).Str("entry", bf.EntryName).Str("file", bf.FileName).Msg("ClearBroken: failed to remove broken file from mount")
-				run.Stats.RepairFailed++
-				remaining = append(remaining, bf)
-				continue
-			}
-			run.Stats.Cleared++
-			r.saveRun(run)
-		}
-
-		h.LastRepairAt = now
-		h.BrokenFiles = remaining
-		if len(remaining) == 0 {
-			r.markBrokenHealthCleared(h, now)
-			return true
-		}
-
-		h.Status = storage.HealthBroken
-		h.FailureReason = topReason(remaining)
-		r.saveHealth(h)
-		return true
-	})
-}
-
-// RecheckEntry kicks off a recheck for a single entry and returns
-// immediately with an in-progress EntryHealth ack. The actual probe and
-// optional fix run in the background. With fix=true, broken Arr-known files
-// trigger delete + re-search after probing.
-func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (*storage.EntryHealth, error) {
+// RecheckEntry kicks off a recheck (CHECK) for a single entry and returns
+// immediately with an in-progress EntryHealth ack. CHECK always runs; the
+// selected components (sel / legacy fix flag, resolved via resolveManualActions)
+// then act on it if it probes broken. A CHECK-only recheck (no components / no
+// fix) just re-probes and records health.
+func (r *Repair) RecheckEntry(ctx context.Context, entryName string, sel *ManualActions, fix bool) (*storage.EntryHealth, error) {
 	if entryName == "" {
 		return nil, errors.New("entry name is empty")
 	}
@@ -1489,6 +1442,7 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		return nil, fmt.Errorf("entry %q not found", entryName)
 	}
 
+	actions := r.resolveManualActions(sel, fix)
 	runID := "recheck-" + entryName
 	c := &candidate{name: entryName, item: item}
 
@@ -1496,20 +1450,24 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		ctx = r.parentCtx
 	}
 	r.runWG.Go(func() {
-		if fix {
+		// Arr targeting is only needed when RE-GRAB is selected.
+		if actions.regrab {
 			r.attachArrContext(ctx, c)
 		}
 		heal := newHealCache()
-		final := r.probeEntry(ctx, runID, c, heal, RepairRunOptions{}, fix)
-		if !fix || final.Status != storage.HealthBroken {
+		// REPAIR runs inline during the probe (actions.repair). If it re-acquires
+		// the item, final rolls up healthy and the destructive pass is skipped.
+		final, _ := r.probeEntry(ctx, runID, c, heal, RepairRunOptions{}, actions.repair)
+		if final == nil || final.Status != storage.HealthBroken || !actions.destructive() {
 			return
 		}
 		pseudo := &storage.RepairRun{ID: runID, Stats: storage.RepairRunStats{}}
 		var statsMu sync.Mutex
-		// Explicit single-entry fix: run the full manual fix set (PRUNE +
-		// RE-GRAB). Single entry is inherently bounded, so it uses an unlimited
-		// budget (nil) and is never blocked by the per-run cap.
-		r.actOnDeadEntry(ctx, pseudo, &statsMu, entryName, final, manualFixActions(), nil)
+		// Single entry is inherently bounded, so it uses an unlimited budget
+		// (nil) and is never blocked by the per-run cap. actOnDeadEntry applies
+		// only the destructive components (PRUNE/RE-GRAB); REPAIR already ran
+		// inline above.
+		r.actOnDeadEntry(ctx, pseudo, &statsMu, entryName, final, actions, nil)
 	})
 
 	// Return an in-memory ack reflecting the freshly-started recheck. The
@@ -1522,13 +1480,13 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 	return h, nil
 }
 
-// RecheckMedia kicks off a recheck for every entry that an Arr's media-id
-// resolves to and returns immediately with the in-progress RepairRun. The
-// actual probing + repair runs in the background so HTTP callers don't have
-// to block. With arrName="" the first eligible Arr that resolves entries
-// wins. fix runs the same delete + re-search pass a sweep would. Honors the
-// singleton run lock.
-func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix bool) (*storage.RepairRun, error) {
+// RecheckMedia kicks off a recheck (CHECK) for every entry that an Arr's
+// media-id resolves to and returns immediately with the in-progress RepairRun.
+// The actual probing + action runs in the background so HTTP callers don't have
+// to block. With arrName="" the first eligible Arr that resolves entries wins.
+// CHECK always runs; the selected components (sel / legacy fix flag) then act on
+// anything that probes broken. Honors the singleton run lock.
+func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, sel *ManualActions, fix bool) (*storage.RepairRun, error) {
 	mediaID = strings.TrimSpace(mediaID)
 	if mediaID == "" {
 		return nil, errors.New("media_id is required")
@@ -1542,6 +1500,7 @@ func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix 
 	if err != nil {
 		return nil, err
 	}
+	actions := r.resolveManualActions(sel, fix)
 
 	r.mu.Lock()
 	if r.activeRunID != "" {
@@ -1556,7 +1515,7 @@ func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix 
 		Status:    storage.RepairRunRunning,
 		Stage:     storage.RepairStageSelecting,
 		StartedAt: time.Now(),
-		Source:    fmt.Sprintf("media:%s/%s", arrName, mediaID),
+		Source:    fmt.Sprintf("media:%s/%s:%s", arrName, mediaID, actions.label()),
 	}
 	r.activeRunID = run.ID
 	r.cancelRun = cancel
@@ -1581,14 +1540,16 @@ func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix 
 			r.mu.Unlock()
 			cancel()
 		}()
-		r.executeRecheckMedia(runCtx, run, arrs, arrName, mediaID, fix)
+		r.executeRecheckMedia(runCtx, run, arrs, arrName, mediaID, actions)
 	})
 	return run, nil
 }
 
 // executeRecheckMedia is the body of a media recheck. Mirrors executeSweep
-// but scoped to a specific media-id resolved through one or more Arrs.
-func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, fix bool) {
+// but scoped to a specific media-id resolved through one or more Arrs. CHECK
+// always runs; actions selects which components act on anything that probes
+// broken.
+func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, actions repairActions) {
 	candidates := make(map[string]*candidate)
 	var lastErr error
 	for _, a := range arrs {
@@ -1630,11 +1591,6 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 	}
 	// A media recheck is user-scoped to a single media id (inherently bounded),
 	// so it runs with an unlimited budget (nil) and is never blocked by the cap.
-	// fix=true forces the full manual fix set; fix=false is a CHECK-only recheck.
-	actions := repairActions{}
-	if fix {
-		actions = manualFixActions()
-	}
 	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{}, actions, nil)
 	candidates = nil
 	if err != nil {
@@ -1657,8 +1613,10 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 		Str("media_id", mediaID).
 		Int("candidates", run.Stats.Candidates).
 		Int("broken", run.Stats.Broken).
-		Int("repaired", run.Stats.Repaired).
-		Bool("fix", fix).
+		Int("reacquired", run.Stats.Reacquired).
+		Int("pruned", run.Stats.Pruned).
+		Int("regrabbed", run.Stats.Regrabbed).
+		Str("actions", actions.label()).
 		Msg("RecheckMedia: completed")
 }
 

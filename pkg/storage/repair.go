@@ -45,16 +45,32 @@ const (
 	RepairTriggerManual    RepairRunTrigger = "manual"
 )
 
+// RepairRunStats carries the per-component outcome counters for one run. The
+// four repair components each report their own outcome so the history UI can
+// show what actually happened rather than a single blended "repaired" count:
+//
+//	CHECK   → Probed / Healthy / Broken / Unknown (detection only).
+//	REPAIR  → Reacquired: dead items re-acquired across providers.
+//	PRUNE   → Pruned: entries deleted decypharr-side (no arr call).
+//	RE-GRAB → Regrabbed: arr file records deleted + blocklisted + re-searched;
+//	          RepairFailed counts arr file deletes that errored.
+//
+// Deletions is how many entries consumed a destructive-deletion slot this run
+// (PRUNE and/or RE-GRAB combined); DeletionCapSkipped is how many broken
+// entries were left un-deleted because the per-run cap was already exhausted.
 type RepairRunStats struct {
-	Candidates   int `json:"candidates"`
-	SkippedFresh int `json:"skipped_fresh"`
-	Probed       int `json:"probed"`
-	Healthy      int `json:"healthy"`
-	Broken       int `json:"broken"`
-	Unknown      int `json:"unknown"`
-	Repaired     int `json:"repaired"`
-	Cleared      int `json:"cleared,omitempty"`
-	RepairFailed int `json:"repair_failed"`
+	Candidates         int `json:"candidates"`
+	SkippedFresh       int `json:"skipped_fresh"`
+	Probed             int `json:"probed"`
+	Healthy            int `json:"healthy"`
+	Broken             int `json:"broken"`
+	Unknown            int `json:"unknown"`
+	Reacquired         int `json:"reacquired"`
+	Pruned             int `json:"pruned"`
+	Regrabbed          int `json:"regrabbed"`
+	RepairFailed       int `json:"repair_failed"`
+	Deletions          int `json:"deletions"`
+	DeletionCapSkipped int `json:"deletion_cap_skipped"`
 }
 
 // RepairRun is the append-only history record produced by a single sweep.

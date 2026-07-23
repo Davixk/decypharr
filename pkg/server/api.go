@@ -795,9 +795,10 @@ func (s *Server) handleGetEntryHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRecheckMedia(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Arr     string `json:"arr"`
-		MediaID string `json:"media_id"`
-		Fix     bool   `json:"fix"`
+		Arr     string             `json:"arr"`
+		MediaID string             `json:"media_id"`
+		Fix     bool               `json:"fix"`
+		Actions *repairActionsBody `json:"actions,omitempty"`
 	}
 	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -812,7 +813,7 @@ func (s *Server) handleRecheckMedia(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(req.Arr), strings.TrimSpace(req.MediaID), req.Fix)
+	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(req.Arr), strings.TrimSpace(req.MediaID), req.Actions.toManager(), req.Fix)
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already running") {
@@ -839,13 +840,25 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No entry name provided", http.StatusBadRequest)
 		return
 	}
+	// CHECK-only by default. An optional {"actions": {...}} body selects the
+	// component(s) to apply if the entry probes broken; the legacy ?fix=true
+	// query still maps to the configured knobs.
+	var req struct {
+		Actions *repairActionsBody `json:"actions,omitempty"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	fix := r.URL.Query().Get("fix") == "true"
 	svc := s.manager.Repair()
 	if svc == nil {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	state, err := svc.RecheckEntry(s.manager.Context(), name, fix)
+	state, err := svc.RecheckEntry(s.manager.Context(), name, req.Actions.toManager(), fix)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -853,16 +866,38 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, state, http.StatusOK)
 }
 
-// handleFixBroken kicks off the Arr delete + re-search pass on currently
-// broken entries. Body: {"names": ["...", ...]}. Empty/missing names ⇒ fix
-// every broken entry in storage.
+// repairActionsBody is the per-component action selection accepted by the
+// manual fix endpoints. A nil *repairActionsBody (the "actions" key absent)
+// means "not specified" → the manager falls back to the configured knobs under
+// the AutoRepair master gate (never force-all). Present-but-all-false means
+// CHECK-only for the recheck endpoints.
+type repairActionsBody struct {
+	Repair bool `json:"repair"`
+	Prune  bool `json:"prune"`
+	Regrab bool `json:"regrab"`
+}
+
+func (b *repairActionsBody) toManager() *manager.ManualActions {
+	if b == nil {
+		return nil
+	}
+	return &manager.ManualActions{Repair: b.Repair, Prune: b.Prune, Regrab: b.Regrab}
+}
+
+// handleFixBroken acts on currently-broken entries WITHOUT reprobing. Body:
+// {"names": ["..."], "actions": {"repair":bool,"prune":bool,"regrab":bool}}.
+// Empty/missing names ⇒ act on every broken entry. A specified "actions" runs
+// exactly those components (single-component invocation supported, e.g.
+// PRUNE-only); omitting "actions" falls back to the configured knobs under the
+// master gate.
 func (s *Server) handleFixBroken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Names []string `json:"names,omitempty"`
+		Names   []string           `json:"names,omitempty"`
+		Actions *repairActionsBody `json:"actions,omitempty"`
 	}
 	// Body is optional; ignore decode errors for empty / missing bodies.
 	if r.Body != nil && r.ContentLength != 0 {
-		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
 			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -872,37 +907,7 @@ func (s *Server) handleFixBroken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	run, err := svc.FixBroken(s.manager.Context(), req.Names)
-	if err != nil {
-		status := http.StatusBadRequest
-		if strings.Contains(err.Error(), "already running") {
-			status = http.StatusConflict
-		}
-		http.Error(w, err.Error(), status)
-		return
-	}
-	utils.JSONResponse(w, run, http.StatusOK)
-}
-
-// handleClearBroken clears currently broken files without asking the Arr to
-// re-search for replacements. Body: {"names": ["...", ...]}. Empty/missing
-// names ⇒ clear every broken entry in storage.
-func (s *Server) handleClearBroken(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Names []string `json:"names,omitempty"`
-	}
-	if r.Body != nil && r.ContentLength != 0 {
-		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-	}
-	svc := s.manager.Repair()
-	if svc == nil {
-		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
-		return
-	}
-	run, err := svc.ClearBroken(s.manager.Context(), req.Names)
+	run, err := svc.FixBroken(s.manager.Context(), req.Names, req.Actions.toManager())
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already running") {

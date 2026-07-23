@@ -55,7 +55,10 @@ func (s *Server) handleTautulli(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(payload.Arr), mediaID, payload.Fix)
+	// Legacy webhook: no explicit component selection. payload.Fix=true maps to
+	// the configured knobs under the master gate (nil selection); fix=false is a
+	// CHECK-only recheck.
+	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(payload.Arr), mediaID, nil, payload.Fix)
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already running") {
