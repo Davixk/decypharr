@@ -19,7 +19,15 @@ class RepairManager {
         const $ = (id) => document.getElementById(id);
         $('runNowBtn')?.addEventListener('click', () => this.openRunModal());
         $('stopRunBtn')?.addEventListener('click', () => this.stopRun());
-        $('fixBrokenBtn')?.addEventListener('click', () => this.fixBroken());
+        // "Act on broken" dropdown: each item drives a single component
+        // (REPAIR / PRUNE / RE-GRAB) over the whole broken set.
+        document.querySelectorAll('#actBrokenDropdown [data-fix-action]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                if (document.getElementById('actBrokenBtn')?.classList.contains('btn-disabled')) return;
+                this.fixBroken(btn.getAttribute('data-fix-action'));
+                document.activeElement?.blur?.();
+            });
+        });
         $('clearStateBtn')?.addEventListener('click', () => this.openClearStateModal());
         $('viewBrokenBtn')?.addEventListener('click', () => this.openBrokenModal());
         $('refreshHistoryBtn')?.addEventListener('click', () => this.loadHistory());
@@ -134,6 +142,16 @@ class RepairManager {
         }
     }
 
+    // fixComponentMeta maps a component key to its display label + one-liner,
+    // shared by the confirm dialogs and toasts so all surfaces read identically.
+    fixComponentMeta(component) {
+        return ({
+            repair: {label: 'REPAIR', desc: 're-acquire on the same or a backup provider'},
+            prune: {label: 'PRUNE', desc: 'delete decypharr-side only — the arr keeps monitoring and re-searches'},
+            regrab: {label: 'RE-GRAB', desc: 'arr delete + blocklist + search'},
+        })[component] || {label: String(component || '').toUpperCase(), desc: ''};
+    }
+
     async recheckMedia() {
         const $ = (id) => document.getElementById(id);
         const mediaId = $('recheckMediaId').value.trim();
@@ -141,10 +159,15 @@ class RepairManager {
             this.toast('Media id is required', 'warning');
             return;
         }
+        // CHECK always runs; the selected components act on whatever probes broken.
         const body = {
             arr: $('recheckArr').value,
             media_id: mediaId,
-            fix: $('recheckFix').checked,
+            actions: {
+                repair: !!$('recheckRepair')?.checked,
+                prune: !!$('recheckPrune')?.checked,
+                regrab: !!$('recheckRegrab')?.checked,
+            },
         };
         const btn = $('recheckMediaBtn');
         const out = $('recheckMediaResult');
@@ -201,12 +224,12 @@ class RepairManager {
                 ${run.source ? `<span class="opacity-70 text-xs">${this.escape(run.source)}</span>` : ''}
             </div>
             <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2 mt-3 text-xs">
-                <div>Candidates: <strong>${stats.candidates ?? 0}</strong></div>
-                <div>Probed: <strong>${stats.probed ?? 0}</strong></div>
+                <div>Checked: <strong>${stats.probed ?? 0}</strong></div>
                 <div class="${stats.broken ? 'text-error' : ''}">Broken: <strong>${stats.broken ?? 0}</strong></div>
-                <div class="${stats.healthy ? 'text-success' : ''}">Healthy: <strong>${stats.healthy ?? 0}</strong></div>
-                <div class="${stats.repaired ? 'text-success' : ''}">Repaired: <strong>${stats.repaired ?? 0}</strong></div>
-                <div class="${stats.repair_failed ? 'text-error' : ''}">Repair fail: <strong>${stats.repair_failed ?? 0}</strong></div>
+                <div class="${stats.reacquired ? 'text-success' : ''}">Repaired: <strong>${stats.reacquired ?? 0}</strong></div>
+                <div class="${stats.pruned ? 'text-warning' : ''}">Pruned: <strong>${stats.pruned ?? 0}</strong></div>
+                <div class="${stats.regrabbed ? 'text-info' : ''}">Re-grabbed: <strong>${stats.regrabbed ?? 0}</strong></div>
+                <div class="${stats.repair_failed ? 'text-error' : ''}">Re-grab fail: <strong>${stats.repair_failed ?? 0}</strong></div>
             </div>
             ${run.error ? `<div class="mt-2 text-error text-xs">${this.escape(run.error)}</div>` : ''}
         `;
@@ -250,23 +273,26 @@ class RepairManager {
         }
     }
 
-    async fixBroken() {
-        if (!confirm('Send delete + re-search for every currently broken entry to its Arr?')) return;
-        const btn = document.getElementById('fixBrokenBtn');
-        if (btn) btn.disabled = true;
+    // fixBroken posts /repair/fix with a SINGLE component selected, over the
+    // whole broken set. component ∈ {repair, prune, regrab}.
+    async fixBroken(component) {
+        const meta = this.fixComponentMeta(component);
+        if (!confirm(`Run ${meta.label} on every currently broken entry?\n\n${meta.label} = ${meta.desc}.`)) return;
+        const btn = document.getElementById('actBrokenBtn');
+        btn?.classList.add('btn-disabled');
         try {
             const res = await fetch(`${this.api}/repair/fix`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({}),
+                body: JSON.stringify({actions: {[component]: true}}),
             });
             const text = await res.text();
             if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
-            this.toast('Fix-broken started', 'success');
+            this.toast(`${meta.label} started`, 'success');
             window.location.reload();
         } catch (e) {
-            this.toast(`Fix failed: ${e.message}`, 'error');
-            if (btn) btn.disabled = false;
+            this.toast(`${meta.label} failed: ${e.message}`, 'error');
+            btn?.classList.remove('btn-disabled');
         }
     }
 
@@ -382,8 +408,8 @@ class RepairManager {
 
         const brokenCount = (status.health_counts || {}).broken || 0;
         this.updateBrokenCount(brokenCount);
-        const fix = document.getElementById('fixBrokenBtn');
-        if (fix) fix.disabled = !!status.active_run || brokenCount === 0;
+        const act = document.getElementById('actBrokenBtn');
+        if (act) act.classList.toggle('btn-disabled', !!status.active_run || brokenCount === 0);
         const clear = document.getElementById('clearStateBtn');
         if (clear) clear.disabled = !!status.active_run;
         const view = document.getElementById('viewBrokenBtn');
@@ -437,13 +463,13 @@ class RepairManager {
         if (!container) return;
         const fields = [
             ['candidates', 'Candidates'],
-            ['skipped_fresh', 'Skipped'],
-            ['probed', 'Probed'],
-            ['healthy', 'Healthy'],
+            ['probed', 'Checked'],
             ['broken', 'Broken'],
-            ['repaired', 'Repaired'],
-            ['cleared', 'Cleared'],
-            ['repair_failed', 'Repair fail'],
+            ['reacquired', 'Repaired'],
+            ['pruned', 'Pruned'],
+            ['regrabbed', 'Re-grabbed'],
+            ['deletions', 'Deletions'],
+            ['deletion_cap_skipped', 'Cap-skipped'],
         ];
         container.innerHTML = '';
         for (const [k, label] of fields) {
@@ -547,12 +573,14 @@ class RepairManager {
                 <td class="text-xs">${lastChecked}</td>
                 <td class="text-xs">${lastRepair}</td>
                 <td class="text-right whitespace-nowrap">
-                    <button class="btn btn-xs btn-outline" data-action="recheck" data-name="${this.escapeAttr(h.entry_name)}" aria-label="Recheck ${this.escape(h.entry_name)}">
-                        <i class="bi bi-search-heart"></i>
-                    </button>
-                    <button class="btn btn-xs btn-error btn-outline" data-action="fix" data-name="${this.escapeAttr(h.entry_name)}" aria-label="Fix ${this.escape(h.entry_name)}">
-                        <i class="bi bi-bandaid"></i>
-                    </button>
+                    <div class="inline-flex gap-1">
+                        <button class="btn btn-xs btn-outline" data-action="recheck" data-name="${this.escapeAttr(h.entry_name)}" title="Recheck (CHECK only)" aria-label="Recheck ${this.escape(h.entry_name)}">
+                            <i class="bi bi-search-heart"></i>
+                        </button>
+                        <button class="btn btn-xs btn-info btn-outline font-semibold" data-action="fix" data-component="repair" data-name="${this.escapeAttr(h.entry_name)}" title="REPAIR — re-acquire on same/backup provider" aria-label="Repair ${this.escape(h.entry_name)}">R</button>
+                        <button class="btn btn-xs btn-warning btn-outline font-semibold" data-action="fix" data-component="prune" data-name="${this.escapeAttr(h.entry_name)}" title="PRUNE — delete decypharr-side, arr keeps monitoring" aria-label="Prune ${this.escape(h.entry_name)}">P</button>
+                        <button class="btn btn-xs btn-error btn-outline font-semibold" data-action="fix" data-component="regrab" data-name="${this.escapeAttr(h.entry_name)}" title="RE-GRAB — arr delete + blocklist + search" aria-label="Re-grab ${this.escape(h.entry_name)}">G</button>
+                    </div>
                 </td>
             `;
             tbody.appendChild(tr);
@@ -579,9 +607,11 @@ class RepairManager {
                 ev.stopPropagation();
                 this.recheckOne(h.entry_name);
             });
-            tr.querySelector('[data-action="fix"]')?.addEventListener('click', (ev) => {
-                ev.stopPropagation();
-                this.fixOne(h.entry_name);
+            tr.querySelectorAll('[data-action="fix"]').forEach((btn) => {
+                btn.addEventListener('click', (ev) => {
+                    ev.stopPropagation();
+                    this.fixOne(h.entry_name, btn.getAttribute('data-component'));
+                });
             });
         }
         this.renderBrokenPagination();
@@ -677,19 +707,20 @@ class RepairManager {
         }
     }
 
-    async fixOne(name) {
-        if (!confirm(`Send delete + re-search for "${name}" to its Arr?`)) return;
+    async fixOne(name, component) {
+        const meta = this.fixComponentMeta(component);
+        if (!confirm(`Run ${meta.label} on "${name}"?\n\n${meta.label} = ${meta.desc}.`)) return;
         try {
             const res = await fetch(`${this.api}/repair/fix`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({names: [name]}),
+                body: JSON.stringify({names: [name], actions: {[component]: true}}),
             });
             if (!res.ok) throw new Error(await res.text() || `HTTP ${res.status}`);
-            this.toast(`Fix started for ${name}`, 'success');
+            this.toast(`${meta.label} started for ${name}`, 'success');
             window.location.reload();
         } catch (e) {
-            this.toast(`Fix failed: ${e.message}`, 'error');
+            this.toast(`${meta.label} failed: ${e.message}`, 'error');
         }
     }
 
@@ -724,14 +755,22 @@ class RepairManager {
             const start = run.started_at ? new Date(run.started_at) : null;
             const end = run.completed_at ? new Date(run.completed_at) : null;
             const duration = start && end ? this.formatDuration(end - start) : (start ? 'running' : '-');
+            const s = run.stats || {};
+            const deletions = s.deletions ?? 0;
+            const capSkipped = s.deletion_cap_skipped ?? 0;
+            const deletionsCell = capSkipped
+                ? `${deletions} <span class="text-warning" title="left un-deleted by the per-run cap">(+${capSkipped})</span>`
+                : `${deletions}`;
             tr.innerHTML = `
                 <td class="font-mono text-sm">${start ? start.toLocaleString() : '-'}</td>
                 <td>${run.trigger || '-'}</td>
                 <td>${this.statusBadge(run.status)}</td>
-                <td>${run.stats?.probed ?? 0}</td>
-                <td class="${run.stats?.broken ? 'text-error font-medium' : ''}">${run.stats?.broken ?? 0}</td>
-                <td class="${run.stats?.repaired ? 'text-success font-medium' : ''}">${run.stats?.repaired ?? 0}</td>
-                <td class="${run.stats?.cleared ? 'text-warning font-medium' : ''}">${run.stats?.cleared ?? 0}</td>
+                <td>${s.probed ?? 0}</td>
+                <td class="${s.broken ? 'text-error font-medium' : ''}">${s.broken ?? 0}</td>
+                <td class="${s.reacquired ? 'text-success font-medium' : ''}">${s.reacquired ?? 0}</td>
+                <td class="${s.pruned ? 'text-warning font-medium' : ''}">${s.pruned ?? 0}</td>
+                <td class="${s.regrabbed ? 'text-info font-medium' : ''}">${s.regrabbed ?? 0}</td>
+                <td class="${deletions ? 'font-medium' : ''}">${deletionsCell}</td>
                 <td>${duration}</td>
                 <td class="text-xs text-error">${run.error || ''}</td>
             `;
