@@ -11,13 +11,13 @@ import (
 
 // These tests pin the component-explicit manual fix endpoints: a request may
 // drive a SINGLE component (PRUNE-only, RE-GRAB-only, REPAIR-only), and an
-// omitted selection falls back to the CONFIGURED knobs under the AutoRepair
-// master gate — never the old force-all bundle. They also assert the run record
-// carries the per-component outcome counters.
+// omitted selection falls back to the CONFIGURED REPAIR/PRUNE/RE-GRAB knobs —
+// never the old force-all bundle. They also assert the run record carries the
+// per-component outcome counters.
 
 // TestResolveManualActionsPrecedence pins the precedence rules of
 // resolveManualActions: explicit selection wins; omitted + fix falls back to the
-// configured knobs under the master gate (NOT force-all); omitted + no fix is
+// configured REPAIR/PRUNE/RE-GRAB knobs (NOT force-all); omitted + no fix is
 // CHECK-only.
 func TestResolveManualActionsPrecedence(t *testing.T) {
 	config.Reset()
@@ -36,26 +36,26 @@ func TestResolveManualActionsPrecedence(t *testing.T) {
 		// An explicit single-component selection is honored verbatim, ignoring
 		// config — this is what makes PRUNE-only / RE-GRAB-only invocation work.
 		{"explicit_prune_only_wins", &ManualActions{Prune: true}, false,
-			config.RepairConfig{Repair: &on, Prune: true, Regrab: true, AutoRepair: true},
+			config.RepairConfig{Repair: &on, Prune: true, Regrab: true},
 			repairActions{prune: true}},
 		{"explicit_regrab_only", &ManualActions{Regrab: true}, false,
 			config.RepairConfig{}, repairActions{regrab: true}},
-		// Omitted selection + legacy fix:true → configured knobs under the master
-		// gate. Configured prune (repair defaults on, regrab off) → NOT force-all.
+		// Omitted selection + legacy fix:true → configured knobs. Configured
+		// prune (repair defaults on, regrab off) → NOT force-all.
 		{"omitted_fix_true_uses_configured_not_forceall", nil, true,
-			config.RepairConfig{Prune: true, AutoRepair: true},
+			config.RepairConfig{Prune: true},
 			repairActions{repair: true, prune: true}},
-		// Master gate off + omitted selection → CHECK-only (the footgun fix: the
-		// old code forced all three here).
-		{"omitted_fix_true_master_off_check_only", nil, true,
-			config.RepairConfig{Prune: true, Regrab: true},
+		// All component knobs off + omitted selection → CHECK-only (the footgun
+		// fix: the old code forced all three here).
+		{"omitted_fix_true_all_knobs_off_check_only", nil, true,
+			config.RepairConfig{Repair: &off, Prune: false, Regrab: false},
 			repairActions{}},
 		{"omitted_fix_false_check_only", nil, false,
-			config.RepairConfig{Prune: true, AutoRepair: true},
+			config.RepairConfig{Prune: true},
 			repairActions{}},
 		// A present-but-empty selection is treated as "unspecified" → fix path.
 		{"present_all_false_falls_to_fix", &ManualActions{}, true,
-			config.RepairConfig{Repair: &off, Regrab: true, AutoRepair: true},
+			config.RepairConfig{Repair: &off, Regrab: true},
 			repairActions{regrab: true}},
 	}
 	for _, tc := range cases {
@@ -141,15 +141,19 @@ func TestFixBrokenRegrabOnly(t *testing.T) {
 }
 
 // TestFixBrokenOmittedFallsBackToConfigured pins that omitting the selection
-// falls back to the configured knobs under the master gate — never force-all.
+// falls back to the configured REPAIR/PRUNE/RE-GRAB knobs — never force-all.
 func TestFixBrokenOmittedFallsBackToConfigured(t *testing.T) {
-	t.Run("master_off_no_selection_errors", func(t *testing.T) {
+	t.Run("all_knobs_off_no_selection_errors", func(t *testing.T) {
 		m, r, _, _ := newRepairCapFixture(t, 0)
-		config.Get().Repair.AutoRepair = false
+		off := false
+		cfg := config.Get()
+		cfg.Repair.Repair = &off  // REPAIR off
+		cfg.Repair.Prune = false  // PRUNE off
+		cfg.Repair.Regrab = false // RE-GRAB off
 		seedBrokenEntry(t, m, "fbcfg-a", "FbCfgA")
 
 		if _, err := r.FixBroken(context.Background(), nil, nil); err == nil {
-			t.Fatal("FixBroken with master gate off + no selection should error (not force-all)")
+			t.Fatal("FixBroken with all component knobs off + no selection should error (not force-all)")
 		}
 		if !entryExists(t, m, "fbcfg-a") {
 			t.Fatal("nothing should have been deleted when no action resolved")
@@ -160,7 +164,6 @@ func TestFixBrokenOmittedFallsBackToConfigured(t *testing.T) {
 		m, r, arrSrv, _ := newRepairCapFixture(t, 0)
 		off := false
 		cfg := config.Get()
-		cfg.Repair.AutoRepair = true
 		cfg.Repair.Repair = &off // REPAIR off
 		cfg.Repair.Prune = true  // PRUNE on
 		cfg.Repair.Regrab = false

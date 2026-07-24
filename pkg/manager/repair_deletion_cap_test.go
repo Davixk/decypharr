@@ -404,7 +404,7 @@ func TestSingleItemHealNotBlockedByCap(t *testing.T) {
 }
 
 // TestNonDestructiveRepairUnaffectedByCap pins that when no destructive
-// component is enabled (CHECK-only, e.g. auto_repair off) the sweep never
+// component is enabled (CHECK-only, e.g. all knobs off) the sweep never
 // reaches PRUNE/RE-GRAB, so nothing is deleted and no cap slot is consumed
 // regardless of how many entries are broken.
 func TestNonDestructiveRepairUnaffectedByCap(t *testing.T) {

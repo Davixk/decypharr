@@ -1446,7 +1446,7 @@
                                 </label>
                                 <input type="text" class="input w-full" name="repair.stop_schedule" id="repair.stop_schedule"
                                        placeholder="e.g. 06:00, 0 6 * * *, 4h">
-                                <span class="label-text-alt opacity-70">Cron expression, clock time, or interval. If a CHECK sweep is still running when this fires, it's stopped early. The <strong>Repair actions</strong> master switch below decides whether to act on whatever was found broken so far.</span>
+                                <span class="label-text-alt opacity-70">Cron expression, clock time, or interval. If a CHECK sweep is still running when this fires, it's stopped early. The enabled <strong>REPAIR</strong> / <strong>PRUNE</strong> / <strong>RE-GRAB</strong> components decide whether to act on whatever was found broken so far.</span>
                             </div>
 
                             <div>
@@ -1472,20 +1472,15 @@
                         <!-- Repair actions -->
                         <div class="divider text-sm opacity-70">Repair actions</div>
                         <div class="rounded-box border border-base-300 p-4 space-y-4">
-                            <label class="label cursor-pointer justify-start gap-3 items-start">
-                                <input type="checkbox" class="checkbox checkbox-lg checkbox-primary mt-0.5"
-                                       id="repair.auto_repair" name="repair.auto_repair">
-                                <div>
-                                    <span class="label-text font-medium text-base">Enable repair actions <span class="opacity-60 font-normal">(master switch)</span></span>
-                                    <div class="label-text-alt leading-relaxed max-w-2xl">
-                                        When <strong>off</strong>, every sweep is CHECK-only (detect + record, nothing acted on).
-                                        When <strong>on</strong>, the components below act on dead items:
-                                        <strong>REPAIR</strong> re-acquires, <strong>PRUNE</strong> deletes decypharr-side (the arr keeps
-                                        monitoring and re-searches), <strong>RE-GRAB</strong> goes through the arr (delete + blocklist + search).
-                                        Each is independent.
-                                    </div>
-                                </div>
-                            </label>
+                            <div class="alert alert-info alert-soft text-sm leading-relaxed">
+                                <span>
+                                    <strong>CHECK</strong> always runs (detect + record). Enable any of
+                                    <strong>REPAIR</strong> / <strong>PRUNE</strong> / <strong>RE-GRAB</strong> below to act on dead items —
+                                    REPAIR re-acquires, PRUNE deletes decypharr-side (the arr keeps monitoring and re-searches),
+                                    RE-GRAB goes through the arr (delete + blocklist + search). Each is independent; with all
+                                    three off the sweep is detect-only.
+                                </span>
+                            </div>
 
                             <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                                 <label class="label cursor-pointer justify-start gap-3">

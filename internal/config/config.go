@@ -205,8 +205,11 @@ type RepairConfig struct {
 	Strategy              string       `json:"strategy,omitempty"`
 	RecheckInterval       string       `json:"recheck_interval,omitempty"`
 	Arrs                  []string     `json:"arrs,omitempty"`
-	AutoRepair            bool         `json:"auto_repair,omitempty"`
-	SkipNZBRepair         bool         `json:"skip_nzb_repair,omitempty"`
+	// AutoRepair is DEPRECATED and no longer gates actions. It is retained only
+	// so configs written before the REPAIR/PRUNE/RE-GRAB component split still
+	// round-trip through JSON; the resolver ignores it entirely.
+	AutoRepair    bool `json:"auto_repair,omitempty"`
+	SkipNZBRepair bool `json:"skip_nzb_repair,omitempty"`
 
 	// The repair feature is split into four independent, named components:
 	//
@@ -226,9 +229,11 @@ type RepairConfig struct {
 	//              arr-coupled component. Independent of PRUNE (not gated behind
 	//              it). Destructive; defaults false.
 	//
-	// AutoRepair is the MASTER ACTION GATE for backward compat: when false the
-	// sweep is CHECK-only (detect + record, no REPAIR/PRUNE/RE-GRAB), exactly the
-	// old safe behavior. When true, the three per-component knobs below apply.
+	// Actions are driven directly by the REPAIR / PRUNE / RE-GRAB knobs below:
+	// each component acts whenever its own knob is on. A sweep is CHECK-only
+	// (detect + record, no REPAIR/PRUNE/RE-GRAB) exactly when all three are off.
+	// There is no separate master gate; the deprecated AutoRepair field above is
+	// ignored by the resolver.
 	//
 	// Repair is a *bool so an unset field (nil, e.g. a config written before this
 	// split) resolves to the safe default of true via RepairEnabled(); Prune and
@@ -256,8 +261,9 @@ type RepairConfig struct {
 	// A repair sweep still running when StopSchedule fires is cancelled before it
 	// finishes enumerating/probing every candidate. Empty disables the stop
 	// schedule entirely - the repair sweep always runs to completion. When a stop
-	// fires mid-repair-sweep, AutoRepair decides what happens to whatever was
-	// already found broken: repaired if true, left alone if false.
+	// fires mid-repair-sweep, the enabled REPAIR / PRUNE / RE-GRAB components
+	// decide what happens to whatever was already found broken: acted on if any
+	// component is on, left alone (CHECK-only) if all three are off.
 	StopSchedule string `json:"stop_schedule,omitempty"`
 }
 
@@ -270,7 +276,7 @@ func (r RepairConfig) IsZero() bool {
 
 // RepairEnabled resolves the REPAIR (re-acquire) component knob. It defaults to
 // true when unset (nil) — the safe default is to attempt re-acquisition of a
-// dead item. Only takes effect when the AutoRepair master gate is on.
+// dead item.
 func (r RepairConfig) RepairEnabled() bool {
 	if r.Repair == nil {
 		return true

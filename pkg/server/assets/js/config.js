@@ -164,7 +164,6 @@ class ConfigManager {
         if ($('repair.nntp_connection_percent')) $('repair.nntp_connection_percent').value = repair.nntp_connection_percent || 20;
         if ($('repair.strategy')) $('repair.strategy').value = repair.strategy || 'per_entry';
         if ($('repair.stop_schedule')) $('repair.stop_schedule').value = repair.stop_schedule || '';
-        if ($('repair.auto_repair')) $('repair.auto_repair').checked = !!repair.auto_repair;
         if ($('repair.skip_nzb_repair')) $('repair.skip_nzb_repair').checked = !!repair.skip_nzb_repair;
         // Repair-action component knobs. REPAIR defaults to ON when unset (null/
         // undefined) — matching the backend's *bool default — so a config from
@@ -194,11 +193,11 @@ class ConfigManager {
             nntp_connection_percent: parseInt($('repair.nntp_connection_percent')?.value, 10) || 0,
             strategy: $('repair.strategy')?.value || 'per_entry',
             stop_schedule: $('repair.stop_schedule')?.value.trim() || '',
-            auto_repair: $('repair.auto_repair')?.checked || false,
             skip_nzb_repair: $('repair.skip_nzb_repair')?.checked || false,
-            // Repair-action component knobs (master-gated by auto_repair on the
-            // backend). REPAIR = re-acquire (default on); PRUNE = decypharr-side
-            // delete only (never calls the arr); RE-GRAB = arr delete + search.
+            // Repair-action component knobs — each drives its component directly
+            // (no master gate). REPAIR = re-acquire (default on); PRUNE =
+            // decypharr-side delete only (never calls the arr); RE-GRAB = arr
+            // delete + search.
             repair: $('repair.repair') ? !!$('repair.repair').checked : true,
             prune: $('repair.prune')?.checked || false,
             regrab: $('repair.regrab')?.checked || false,

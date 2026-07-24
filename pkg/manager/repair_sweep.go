@@ -87,16 +87,16 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	cfg := r.cfg()
 	log := r.logger.With().Str("run_id", run.ID).Logger()
 
-	// Resolve the action set once. AutoRepair is the MASTER ACTION GATE: when
-	// off the sweep is CHECK-only (probe + record, no REPAIR/PRUNE/RE-GRAB);
-	// when on the three per-component knobs apply. This also decides what
-	// happens to whatever was found broken so far if a StopSchedule cuts the
-	// sweep short.
-	autoRepair := cfg.AutoRepair
-	if opts.AutoRepair != nil {
-		autoRepair = *opts.AutoRepair
+	// Resolve the action set once from the configured REPAIR/PRUNE/RE-GRAB knobs.
+	// There is no master gate: the sweep is CHECK-only (probe + record, no
+	// REPAIR/PRUNE/RE-GRAB) exactly when all three knobs are off. A one-off run
+	// (Run modal) may pass opts.Actions to override the configured knobs for that
+	// run. This also decides what happens to whatever was found broken so far if
+	// a StopSchedule cuts the sweep short.
+	actions := resolveActions(cfg)
+	if opts.Actions != nil {
+		actions = repairActions{repair: opts.Actions.Repair, prune: opts.Actions.Prune, regrab: opts.Actions.Regrab}
 	}
-	actions := resolveActions(cfg, autoRepair)
 
 	// One destructive-deletion budget for the whole sweep. It bounds how many
 	// entries this run may destructively act on (PRUNE decypharr-delete and/or
@@ -149,7 +149,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 
 	run.Stage = storage.RepairStageProbing
 	r.saveRun(run)
-	log.Info().Int("due", len(due)).Int("skipped_fresh", skipped).Str("protocol", protocolScope).Bool("auto_repair", autoRepair).Msg("Sweep: probing")
+	log.Info().Int("due", len(due)).Int("skipped_fresh", skipped).Str("protocol", protocolScope).Bool("repair", actions.repair).Bool("prune", actions.prune).Bool("regrab", actions.regrab).Msg("Sweep: probing")
 
 	heal := newHealCache()
 	err = r.probeAndHealCandidates(ctx, run, due, names, heal, opts, actions, budget)
@@ -1328,8 +1328,8 @@ func (r *Repair) markBrokenHealthCleared(h *storage.EntryHealth, at time.Time) {
 //
 // Component precedence (resolveManualActions): an explicit selection runs
 // exactly those components — single-component invocation (e.g. PRUNE-only) is
-// supported; a nil selection falls back to the configured knobs under the
-// AutoRepair master gate — never force-all.
+// supported; a nil selection falls back to the configured REPAIR/PRUNE/RE-GRAB
+// knobs — never force-all.
 //
 // Use this from the UI when a previous sweep already identified broken entries
 // and the user wants to act on them without paying for another probe pass.

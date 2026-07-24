@@ -652,7 +652,10 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IgnoreLastChecked bool   `json:"ignore_last_checked,omitempty"`
 		Force             bool   `json:"force,omitempty"`
-		AutoRepair        *bool  `json:"auto_repair,omitempty"`
+		Repair            *bool  `json:"repair,omitempty"`
+		Prune             *bool  `json:"prune,omitempty"`
+		Regrab            *bool  `json:"regrab,omitempty"`
+		AutoRepair        *bool  `json:"auto_repair,omitempty"` // Deprecated: back-compat only.
 		UnrestrictLink    bool   `json:"unrestrict_link,omitempty"`
 		Protocol          string `json:"protocol,omitempty"`
 	}
@@ -671,6 +674,33 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	case "1", "true", "yes", "on":
 		ignoreLastChecked = true
 	}
+	repair := req.Repair
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("repair"))) {
+	case "1", "true", "yes", "on":
+		v := true
+		repair = &v
+	case "0", "false", "no", "off":
+		v := false
+		repair = &v
+	}
+	prune := req.Prune
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("prune"))) {
+	case "1", "true", "yes", "on":
+		v := true
+		prune = &v
+	case "0", "false", "no", "off":
+		v := false
+		prune = &v
+	}
+	regrab := req.Regrab
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("regrab"))) {
+	case "1", "true", "yes", "on":
+		v := true
+		regrab = &v
+	case "0", "false", "no", "off":
+		v := false
+		regrab = &v
+	}
 	autoRepair := req.AutoRepair
 	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("auto_repair"))) {
 	case "1", "true", "yes", "on":
@@ -679,6 +709,23 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	case "0", "false", "no", "off":
 		v := false
 		autoRepair = &v
+	}
+	// Resolve the one-off per-component override for this run. Explicit
+	// REPAIR/PRUNE/RE-GRAB keys (JSON body or query param) win: if any is present
+	// build an explicit override with each absent key defaulting to false.
+	// Otherwise fall back to the deprecated auto_repair flag for old clients:
+	// true → use the configured knobs (nil override); false → explicit all-false
+	// (CHECK-only). With nothing set, use the configured knobs (nil override).
+	var actions *manager.ManualActions
+	switch {
+	case repair != nil || prune != nil || regrab != nil:
+		actions = &manager.ManualActions{
+			Repair: repair != nil && *repair,
+			Prune:  prune != nil && *prune,
+			Regrab: regrab != nil && *regrab,
+		}
+	case autoRepair != nil && !*autoRepair:
+		actions = &manager.ManualActions{}
 	}
 	unrestrictLink := req.UnrestrictLink
 	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("unrestrict_link"))) {
@@ -708,7 +755,7 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := svc.RunNow(manager.RepairRunOptions{
 		IgnoreLastChecked: ignoreLastChecked,
-		AutoRepair:        autoRepair,
+		Actions:           actions,
 		UnrestrictLink:    unrestrictLink,
 		ProtocolScope:     protocolScope,
 	})
@@ -868,8 +915,8 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 
 // repairActionsBody is the per-component action selection accepted by the
 // manual fix endpoints. A nil *repairActionsBody (the "actions" key absent)
-// means "not specified" → the manager falls back to the configured knobs under
-// the AutoRepair master gate (never force-all). Present-but-all-false means
+// means "not specified" → the manager falls back to the configured
+// REPAIR/PRUNE/RE-GRAB knobs (never force-all). Present-but-all-false means
 // CHECK-only for the recheck endpoints.
 type repairActionsBody struct {
 	Repair bool `json:"repair"`
@@ -888,8 +935,8 @@ func (b *repairActionsBody) toManager() *manager.ManualActions {
 // {"names": ["..."], "actions": {"repair":bool,"prune":bool,"regrab":bool}}.
 // Empty/missing names ⇒ act on every broken entry. A specified "actions" runs
 // exactly those components (single-component invocation supported, e.g.
-// PRUNE-only); omitting "actions" falls back to the configured knobs under the
-// master gate.
+// PRUNE-only); omitting "actions" falls back to the configured
+// REPAIR/PRUNE/RE-GRAB knobs.
 func (s *Server) handleFixBroken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Names   []string           `json:"names,omitempty"`

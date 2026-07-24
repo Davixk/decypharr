@@ -39,9 +39,12 @@ type RepairStatus struct {
 // Nil fields inherit the persisted repair config.
 type RepairRunOptions struct {
 	IgnoreLastChecked bool
-	AutoRepair        *bool
-	UnrestrictLink    bool
-	ProtocolScope     string
+	// Actions, when non-nil, is an explicit per-component override for this
+	// one-off run (from the Run modal). Nil means use the configured
+	// REPAIR/PRUNE/RE-GRAB knobs.
+	Actions        *ManualActions
+	UnrestrictLink bool
+	ProtocolScope  string
 }
 
 type ClearRepairStateResult struct {
@@ -143,15 +146,11 @@ func (a repairActions) label() string {
 	return strings.Join(parts, "+")
 }
 
-// resolveActions maps config + the effective auto-repair master gate to the
-// per-component action set. AutoRepair is preserved as a MASTER ACTION GATE for
-// backward compat: when it is off the run is CHECK-only (no REPAIR/PRUNE/
-// RE-GRAB), exactly the old safe behavior; when it is on the three per-component
-// knobs apply (REPAIR defaults on, PRUNE/RE-GRAB default off).
-func resolveActions(cfg config.RepairConfig, autoRepair bool) repairActions {
-	if !autoRepair {
-		return repairActions{}
-	}
+// resolveActions maps the configured component knobs directly to the
+// per-component action set: REPAIR defaults on (RepairEnabled), PRUNE/RE-GRAB
+// default off. There is no master gate — the run is CHECK-only (no REPAIR/
+// PRUNE/RE-GRAB) exactly when all three knobs are off.
+func resolveActions(cfg config.RepairConfig) repairActions {
 	return repairActions{
 		repair: cfg.RepairEnabled(),
 		prune:  cfg.Prune,
@@ -180,17 +179,16 @@ func (a *ManualActions) any() bool {
 //
 //   - sel names ≥1 component            → exactly those components (single-
 //     component invocation, e.g. PRUNE-only, works here).
-//   - sel is nil/empty but fix == true  → fall back to the CONFIGURED knobs
-//     under the AutoRepair master gate (back-compat with the old fix:true
-//     clients) — NOT force-all, fixing the previous force-all footgun.
+//   - sel is nil/empty but fix == true  → fall back to the CONFIGURED
+//     REPAIR/PRUNE/RE-GRAB knobs (back-compat with the old fix:true clients) —
+//     NOT force-all, fixing the previous force-all footgun.
 //   - otherwise                         → CHECK-only (no action).
 func (r *Repair) resolveManualActions(sel *ManualActions, fix bool) repairActions {
 	if sel.any() {
 		return repairActions{repair: sel.Repair, prune: sel.Prune, regrab: sel.Regrab}
 	}
 	if fix {
-		cfg := r.cfg()
-		return resolveActions(cfg, cfg.AutoRepair)
+		return resolveActions(r.cfg())
 	}
 	return repairActions{}
 }
@@ -508,8 +506,9 @@ func (r *Repair) StopRun() error {
 
 // stopActiveRepairSweep is invoked by the StopSchedule job. Unlike StopRun, this is
 // not a user-initiated abort: the repair sweep is marked completed (not cancelled),
-// and whether whatever was found broken up to this point gets repaired is
-// decided by AutoRepair. With no active repair sweep this is a no-op.
+// and whether whatever was found broken up to this point gets acted on is
+// decided by the enabled REPAIR / PRUNE / RE-GRAB components. With no active
+// repair sweep this is a no-op.
 func (r *Repair) stopActiveRepairSweep() {
 	r.mu.Lock()
 	cancel := r.cancelRun
@@ -652,12 +651,9 @@ func (r *Repair) runSweep(trigger storage.RepairRunTrigger, opts RepairRunOption
 	if opts.IgnoreLastChecked {
 		sourceParts = append(sourceParts, "ignore-last-checked")
 	}
-	if opts.AutoRepair != nil {
-		if *opts.AutoRepair {
-			sourceParts = append(sourceParts, "auto-repair")
-		} else {
-			sourceParts = append(sourceParts, "no-auto-repair")
-		}
+	if opts.Actions != nil {
+		override := repairActions{repair: opts.Actions.Repair, prune: opts.Actions.Prune, regrab: opts.Actions.Regrab}
+		sourceParts = append(sourceParts, override.label())
 	}
 	if opts.UnrestrictLink {
 		sourceParts = append(sourceParts, "unrestrict-link")

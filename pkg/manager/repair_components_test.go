@@ -104,7 +104,7 @@ func TestCheckEnumeratesWholeLibraryViaManaged(t *testing.T) {
 	}
 
 	run := newRun(t, m)
-	// CHECK-only action set (auto_repair off equivalent): probe + record only.
+	// CHECK-only action set (all component knobs off): probe + record only.
 	if err := r.probeAndHealCandidates(context.Background(), run, cands, names, newHealCache(), RepairRunOptions{}, repairActions{}, r.newDeletionBudget(run.ID)); err != nil {
 		t.Fatalf("probeAndHealCandidates: %v", err)
 	}
@@ -263,26 +263,26 @@ func TestRepairReacquiresAndStopsPipeline(t *testing.T) {
 	}
 }
 
-// TestResolveActionsMasterGate pins the auto_repair MASTER ACTION GATE and the
-// per-component defaults (REPAIR on, PRUNE/RE-GRAB off).
-func TestResolveActionsMasterGate(t *testing.T) {
+// TestResolveActionsComponents pins that the configured REPAIR/PRUNE/RE-GRAB
+// knobs drive the action set directly (there is no master gate): REPAIR
+// defaults on, PRUNE/RE-GRAB default off, and all three off ⇒ CHECK-only.
+func TestResolveActionsComponents(t *testing.T) {
 	on := true
 	off := false
 	cases := []struct {
-		name       string
-		cfg        config.RepairConfig
-		autoRepair bool
-		want       repairActions
+		name string
+		cfg  config.RepairConfig
+		want repairActions
 	}{
-		{"master_off_is_check_only", config.RepairConfig{Repair: &on, Prune: true, Regrab: true}, false, repairActions{}},
-		{"master_on_defaults", config.RepairConfig{}, true, repairActions{repair: true}},
-		{"master_on_repair_explicit_off", config.RepairConfig{Repair: &off}, true, repairActions{}},
-		{"master_on_all", config.RepairConfig{Repair: &on, Prune: true, Regrab: true}, true, repairActions{repair: true, prune: true, regrab: true}},
-		{"master_on_prune_only", config.RepairConfig{Repair: &off, Prune: true}, true, repairActions{prune: true}},
+		{"all_knobs_off_is_check_only", config.RepairConfig{Repair: &off, Prune: false, Regrab: false}, repairActions{}},
+		{"defaults", config.RepairConfig{}, repairActions{repair: true}},
+		{"repair_explicit_off", config.RepairConfig{Repair: &off}, repairActions{}},
+		{"all", config.RepairConfig{Repair: &on, Prune: true, Regrab: true}, repairActions{repair: true, prune: true, regrab: true}},
+		{"prune_only", config.RepairConfig{Repair: &off, Prune: true}, repairActions{prune: true}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveActions(tc.cfg, tc.autoRepair); got != tc.want {
+			if got := resolveActions(tc.cfg); got != tc.want {
 				t.Fatalf("resolveActions = %+v, want %+v", got, tc.want)
 			}
 		})
