@@ -570,9 +570,21 @@ func (m *Manager) streamHTTPURL(ctx context.Context, url, provider string, file 
 	}
 	expectedLen := plan.logicalEnd - plan.logicalStart + 1
 
-	resp, reqErr := m.doRequest(ctx, url, plan.upstreamStart, plan.upstreamEnd, plan.upstreamRequested)
+	// Progress-based idle deadline for the whole debrid transfer. One timer of
+	// duration debridReadTimeout() covers the wait for the first byte
+	// (connection + headers) and mid-stream idle; it is reset on every byte
+	// delivered to the client (streamProgressWriter) and fires only after the
+	// full timeout elapses with ZERO delivery. The HTTP request and copy run on
+	// streamCtx so a fire aborts the in-flight resp.Body read; a slow but
+	// progressing stream never trips it. timeout <= 0 ("off"/"0"/"none") is a
+	// pure passthrough with no watchdog goroutine and streamCtx == ctx.
+	deadline := newStreamProgressDeadline(ctx, m.debridReadTimeout())
+	defer deadline.Close()
+	streamCtx := deadline.Context
+
+	resp, reqErr := m.doRequest(streamCtx, url, plan.upstreamStart, plan.upstreamEnd, plan.upstreamRequested)
 	if reqErr != nil {
-		return reqErr
+		return m.stallOr(deadline, reqErr)
 	}
 	if plan.upstreamRequested && resp.StatusCode == http.StatusOK && plan.upstreamStart > streamRangeIgnoredMaxDiscard {
 		// The upstream ignored the Range request and the offset is too large
@@ -584,22 +596,33 @@ func (m *Manager) streamHTTPURL(ctx context.Context, url, provider string, file 
 			Str("file", filename).
 			Int64("offset", plan.upstreamStart).
 			Msg("Upstream ignored Range request with a large offset; retrying once")
-		resp, reqErr = m.doRequest(ctx, url, plan.upstreamStart, plan.upstreamEnd, plan.upstreamRequested)
+		resp, reqErr = m.doRequest(streamCtx, url, plan.upstreamStart, plan.upstreamEnd, plan.upstreamRequested)
 		if reqErr != nil {
-			return reqErr
+			return m.stallOr(deadline, reqErr)
 		}
 	}
 	defer resp.Body.Close()
 
 	discardPrefix, responseErr := m.resolveHTTPStreamResponse(resp, plan, expectedLen, provider, filename)
 	if responseErr != nil {
+		// A definitive dead status (404/410) is classified by
+		// resolveHTTPStreamResponse as a permanent *customerror.Error. Surface it
+		// unwrapped (only marked unrecoverable) so errors.As in the WebDAV layer
+		// still maps it to 410 Gone; everything else keeps the historical
+		// StreamError wrapping.
+		var permanent *customerror.Error
+		if errors.As(responseErr, &permanent) {
+			return retry.Unrecoverable(responseErr)
+		}
 		return retry.Unrecoverable(StreamError{Err: responseErr, Retryable: false})
 	}
 	if discardPrefix > 0 {
 		// Skip the prefix before committing headers so a failure here can
-		// still surface as a proper error response.
-		if _, discardErr := io.CopyN(io.Discard, resp.Body, discardPrefix); discardErr != nil {
-			return classifyStreamTransferError(ctx, discardErr)
+		// still surface as a proper error response. The discard reads through
+		// the same idle deadline (progress pulses keep a healthy discard alive).
+		discardWriter := streamProgressWriter{Writer: io.Discard, progress: deadline.Progress}
+		if _, discardErr := io.CopyN(discardWriter, resp.Body, discardPrefix); discardErr != nil {
+			return m.stallOr(deadline, classifyStreamTransferError(ctx, discardErr))
 		}
 	}
 
@@ -629,14 +652,32 @@ func (m *Manager) streamHTTPURL(ctx context.Context, url, provider string, file 
 	buf := *bufPtr
 	defer streamBufPool.Put(bufPtr)
 
-	n, copyErr := io.CopyBuffer(writer, io.LimitReader(resp.Body, expectedLen), buf)
+	// Wrap the client writer so each successful delivery resets the idle
+	// deadline; read from streamCtx-bound resp.Body so a deadline fire aborts a
+	// stalled read.
+	progressWriter := streamProgressWriter{Writer: writer, progress: deadline.Progress}
+	n, copyErr := io.CopyBuffer(progressWriter, io.LimitReader(resp.Body, expectedLen), buf)
 	if n < expectedLen && copyErr == nil {
 		copyErr = io.ErrUnexpectedEOF
 	}
 	if copyErr == nil || copyErr == io.EOF {
 		return nil
 	}
-	return classifyStreamTransferError(ctx, copyErr)
+	return m.stallOr(deadline, classifyStreamTransferError(ctx, copyErr))
+}
+
+// stallOr returns the ErrDebridReadStalled sentinel (logged, unrecoverable) when
+// the idle deadline fired, otherwise it returns fallback unchanged. It is called
+// at every debrid-stream exit that the deadline could have aborted so an idle
+// timeout is surfaced distinctly instead of being masked as a silent context
+// cancellation. The fallback is still computed with the caller context so a
+// genuine client disconnect keeps its historical (silent) classification.
+func (m *Manager) stallOr(deadline *streamProgressDeadline, fallback error) error {
+	if stall := deadline.stallCause(); stall != nil {
+		m.logger.Warn().Err(stall).Msg("Debrid stream stalled with no byte progress; aborting read")
+		return retry.Unrecoverable(stall)
+	}
+	return fallback
 }
 
 // classifyStreamTransferError mirrors the historical copy-error handling:
@@ -671,6 +712,17 @@ func (m *Manager) resolveHTTPStreamResponse(resp *http.Response, plan httpStream
 	}
 	discardPrefix := int64(0)
 	switch {
+	case resp.StatusCode == http.StatusGone:
+		// HTTP 410 Gone is the ONLY status treated as a definitive dead verdict:
+		// the debrid link resolved but the upstream affirmatively signals the
+		// content is permanently gone. Classify it as a permanent 410 so the
+		// WebDAV layer maps it to 410 Gone (before the first byte) and the retry
+		// loop treats it as non-retryable. 404 is deliberately NOT treated as
+		// dead — debrid CDNs also return 404 for merely expired/refetchable
+		// links, and a false "dead" verdict on a still-live file would violate
+		// the read-deadline safety bar. 404, 403/expired, and every other status
+		// keep their existing (non-permanent) behavior below.
+		return 0, customerror.NewContentGoneError(fmt.Errorf("debrid content gone: HTTP %d for %q (provider %s)", resp.StatusCode, filename, provider))
 	case plan.upstreamRequested && resp.StatusCode == http.StatusPartialContent:
 		contentRange := resp.Header.Get("Content-Range")
 		start, end, err := parseContentRange(contentRange)

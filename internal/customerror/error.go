@@ -144,3 +144,19 @@ func NewArticleNotFoundError(err error) *Error {
 		Code:       "usenet_article_missing",
 	}).Permanent()
 }
+
+// NewContentGoneError is the debrid analog of NewArticleNotFoundError: the
+// download link resolved but the upstream reports the content is definitively
+// gone (HTTP 404/410). It carries a permanent 410 so the WebDAV layer maps it
+// to 410 Gone before the first byte and the stream retry loop never masks it as
+// a transient failure.
+func NewContentGoneError(err error) *Error {
+	if err == nil {
+		err = errors.New("debrid content gone")
+	}
+	return (&Error{
+		err:        err,
+		statusCode: http.StatusGone,
+		Code:       "debrid_content_gone",
+	}).Permanent()
+}

@@ -281,6 +281,17 @@
                                 <span class="text-sm opacity-70">Duration before stalled active downloads are removed</span>
                             </div>
                             <div>
+                                <label class="label" for="debrid_read_timeout">
+                                    <span class="font-medium">Debrid Stream Read Timeout</span>
+                                </label>
+                                <input type="text" class="input w-full" name="debrid_read_timeout"
+                                       id="debrid_read_timeout" placeholder="60s">
+                                <span class="text-sm opacity-70">Errors a debrid file read after this long with ZERO
+                                    byte-flow to the client, so rclone/Plex see a prompt error instead of wedging on a
+                                    dead stream. A slow-but-progressing read is never affected. Default 60s; "off"
+                                    disables.</span>
+                            </div>
+                            <div>
                                 <label class="label" for="nzbUserAgent">
                                     <span class="font-medium">NZB User Agent</span>
                                 </label>

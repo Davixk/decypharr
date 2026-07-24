@@ -336,6 +336,15 @@ type Config struct {
 	Retries      int    `json:"retries,omitempty"`
 	SkipAutoMove bool   `json:"skip_auto_move,omitempty"`
 
+	// DebridReadTimeout bounds how long a debrid HTTP file read may deliver ZERO
+	// bytes to the WebDAV/DFS client before the read is aborted. It is a
+	// progress/idle deadline: a slow but still-progressing stream is never
+	// affected; only a fully stalled read (a dead connection held open with no
+	// byte-flow) trips it, so rclone/Plex see a prompt error instead of wedging
+	// on their own multi-minute timeouts. Default "60s"; "0"/"off"/"none"
+	// disables it (unbounded passthrough, matching usenet.read_timeout).
+	DebridReadTimeout string `json:"debrid_read_timeout,omitempty"`
+
 	Repair RepairConfig `json:"repair,omitzero"`
 
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
@@ -568,6 +577,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.MaxActiveDownloads <= 0 {
 		c.MaxActiveDownloads = 5
+	}
+	if c.DebridReadTimeout == "" {
+		c.DebridReadTimeout = "60s"
 	}
 
 	for i, debrid := range c.Debrids {

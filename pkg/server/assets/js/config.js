@@ -244,7 +244,7 @@ class ConfigManager {
         const fields = [
             'remove_stalled_after', 'nzb_user_agent', 'download_folder',
             'refresh_interval', 'max_active_downloads', 'skip_pre_cache',
-            'always_rm_tracker_urls', 'default_download_action'
+            'always_rm_tracker_urls', 'default_download_action', 'debrid_read_timeout'
         ];
 
         fields.forEach(field => {
@@ -1236,6 +1236,7 @@ class ConfigManager {
             min_file_size: document.querySelector('[name="min_file_size"]').value,
             max_file_size: document.querySelector('[name="max_file_size"]').value,
             remove_stalled_after: document.querySelector('[name="remove_stalled_after"]').value || "10m",
+            debrid_read_timeout: document.querySelector('[name="debrid_read_timeout"]')?.value || "60s",
             nzb_user_agent: document.querySelector('[name="nzb_user_agent"]').value,
             download_folder: document.querySelector('[name="download_folder"]').value,
             refresh_interval: document.querySelector('[name="refresh_interval"]').value || "30s",
