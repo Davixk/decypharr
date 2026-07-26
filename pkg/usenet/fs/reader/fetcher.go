@@ -732,8 +732,10 @@ func (sf *SegmentFetcher) fetchWithRetry(ctx context.Context, segIdx int) error 
 		}
 		lastErr = err
 
-		// Don't retry permanent errors or cancellations.
-		if nntp.IsArticleNotFoundError(err) || ctx.Err() != nil || sf.ctx.Err() != nil {
+		// Don't retry permanent errors or cancellations. A definitive
+		// content-missing verdict covers both a 430 and an article that decoded
+		// to no payload at all: re-fetching a stub only burns provider budget.
+		if nntp.IsContentMissingError(err) || ctx.Err() != nil || sf.ctx.Err() != nil {
 			return err
 		}
 	}

@@ -516,30 +516,39 @@ func (pm *Premiumize) RefreshDownloadLinks() error {
 	})
 }
 
+// CheckFile probes availability with a three-way verdict:
+// nil (available), customerror.HosterUnavailableError (definitively gone), or
+// types.ErrAvailabilityIndeterminate (unknown).
+//
+// For a direct link a HEAD 404/410 is definitive. Every other non-2xx —
+// including the 3xx the client did not follow and the 401/429/5xx family — is
+// an infrastructure answer, not evidence about the file. The /api/item/details
+// path is a fixed API route, so its failures are always indeterminate.
 func (pm *Premiumize) CheckFile(ctx context.Context, infohash, fileID string) error {
 	if strings.HasPrefix(fileID, "http://") || strings.HasPrefix(fileID, "https://") {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, fileID, nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: premiumize check: building request: %w", types.ErrAvailabilityIndeterminate, err)
 		}
 		resp, err := pm.client.Do(req)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: premiumize check: transport error: %w", types.ErrAvailabilityIndeterminate, err)
 		}
 		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			return nil
+		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
 			return customerror.HosterUnavailableError
+		default:
+			return fmt.Errorf("%w: premiumize check: HTTP status %d", types.ErrAvailabilityIndeterminate, resp.StatusCode)
 		}
-		if resp.StatusCode >= 400 {
-			return fmt.Errorf("premiumize link check failed: Status: %d", resp.StatusCode)
-		}
-		return nil
 	}
 	if fileID == "" {
 		return customerror.HosterUnavailableError
 	}
 	if _, err := pm.itemDetails(fileID); err != nil {
-		return err
+		return fmt.Errorf("%w: premiumize check: item details: %w", types.ErrAvailabilityIndeterminate, err)
 	}
 	return nil
 }

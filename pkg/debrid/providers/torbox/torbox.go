@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	json "github.com/bytedance/sonic"
@@ -36,6 +37,26 @@ var planSlots = map[string]int{
 	"pro":       10,
 }
 
+// downloadPresentTTL bounds how stale the download_present snapshot may be
+// before a cache MISS is allowed to mean anything. A miss is only ever reported
+// as definitively dead against a snapshot no older than this. One full
+// /api/torrents/mylist walk per TTL is shared by every probe in a sweep, which
+// keeps the refresh well clear of TorBox's 300 req/min cap.
+const downloadPresentTTL = 5 * time.Minute
+
+// downloadPresentSnapshot is an immutable point-in-time view of which torrent
+// IDs the account holds and whether their download is present. It is replaced
+// wholesale on every reload — never merged — so a torrent removed from the
+// account actually disappears instead of lingering as a stale "present" entry.
+type downloadPresentSnapshot struct {
+	present  map[string]bool
+	loadedAt time.Time
+}
+
+func (s *downloadPresentSnapshot) fresh() bool {
+	return s != nil && time.Since(s.loadedAt) < downloadPresentTTL
+}
+
 type Torbox struct {
 	Host                  string `json:"host"`
 	APIKey                string
@@ -45,9 +66,8 @@ type Torbox struct {
 	logger                zerolog.Logger
 	Profile               *types.Profile
 	config                config.Debrid
-	downloadPresentCache  sync.Map
+	downloadPresent       atomic.Pointer[downloadPresentSnapshot]
 	downloadPresentMu     sync.Mutex
-	downloadPresentLoaded bool
 }
 
 func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*Torbox, error) {
@@ -353,9 +373,13 @@ func (tb *Torbox) GetTorrent(torrentId string) (*types.Torrent, error) {
 	return t, nil
 }
 
+// loadDownloadPresent walks the account's torrent list and installs the result
+// as a new snapshot. On failure the previous snapshot is left in place — a
+// refresh that could not complete must not destroy what we already knew.
+// Callers must hold downloadPresentMu.
 func (tb *Torbox) loadDownloadPresent() error {
 	offset := 0
-	total := 0
+	present := make(map[string]bool)
 	for {
 		var res TorrentsListResponse
 		resp, err := tb.doGet("/api/torrents/mylist", map[string]string{"offset": fmt.Sprintf("%d", offset)}, &res)
@@ -369,13 +393,41 @@ func (tb *Torbox) loadDownloadPresent() error {
 			break
 		}
 		for _, t := range *res.Data {
-			tb.downloadPresentCache.Store(strconv.Itoa(t.Id), t.DownloadPresent)
+			present[strconv.Itoa(t.Id)] = t.DownloadPresent
 		}
-		total += len(*res.Data)
 		offset += len(*res.Data)
 	}
-	tb.logger.Info().Int("count", total).Msg("loaded download_present cache for repair")
+	tb.downloadPresent.Store(&downloadPresentSnapshot{present: present, loadedAt: time.Now()})
+	tb.logger.Info().Int("count", len(present)).Msg("loaded download_present cache for repair")
 	return nil
+}
+
+// snapshot returns the current snapshot, building one if none exists yet. It
+// deliberately does NOT refresh a stale snapshot: staleness only matters on a
+// miss, and forcing a reload on every hit would walk the whole torrent list far
+// too often.
+func (tb *Torbox) snapshot() (*downloadPresentSnapshot, error) {
+	if snap := tb.downloadPresent.Load(); snap != nil {
+		return snap, nil
+	}
+	return tb.refreshSnapshot()
+}
+
+// refreshSnapshot reloads the snapshot unless a concurrent probe already
+// produced a fresh one. Serialized on downloadPresentMu with a re-check inside,
+// so a sweep in which many files miss pays for ONE list walk per TTL rather
+// than one per file.
+func (tb *Torbox) refreshSnapshot() (*downloadPresentSnapshot, error) {
+	tb.downloadPresentMu.Lock()
+	defer tb.downloadPresentMu.Unlock()
+
+	if current := tb.downloadPresent.Load(); current.fresh() {
+		return current, nil
+	}
+	if err := tb.loadDownloadPresent(); err != nil {
+		return nil, err
+	}
+	return tb.downloadPresent.Load(), nil
 }
 
 func (tb *Torbox) UpdateTorrent(t *types.Torrent) error {
@@ -608,16 +660,28 @@ func (tb *Torbox) RefreshDownloadLinks() error {
 	return tb.accountsManager.RefreshLinks(tb.fetchDownloadLinks)
 }
 
+// CheckFile answers from the download_present snapshot of the account's torrent
+// list with a three-way verdict: nil (available),
+// customerror.HosterUnavailableError (definitively gone), or
+// types.ErrAvailabilityIndeterminate (unknown).
+//
+// If the snapshot itself cannot be built — Torbox unreachable, rate limited,
+// credentials rejected — we know nothing about the file, so the probe must
+// report indeterminate rather than an error the caller could confuse with a
+// verdict. Only a loaded snapshot can produce a definitive answer.
+//
+// A MISS is the dangerous case. The snapshot was previously loaded once and
+// never invalidated, so a torrent added after that load was absent from it and
+// was reported definitively dead — a false "dead" on perfectly healthy content,
+// which is exactly the verdict that authorises destructive repair. A miss is
+// therefore confirmed against a snapshot refreshed within downloadPresentTTL
+// before any dead verdict, and if that refresh cannot be completed the answer
+// is indeterminate. An absence we cannot currently verify is never death.
 func (tb *Torbox) CheckFile(ctx context.Context, infohash, link string) error {
-	tb.downloadPresentMu.Lock()
-	if !tb.downloadPresentLoaded {
-		if err := tb.loadDownloadPresent(); err != nil {
-			tb.downloadPresentMu.Unlock()
-			return err
-		}
-		tb.downloadPresentLoaded = true
+	snap, err := tb.snapshot()
+	if err != nil {
+		return fmt.Errorf("%w: torbox check: loading download_present snapshot: %w", types.ErrAvailabilityIndeterminate, err)
 	}
-	tb.downloadPresentMu.Unlock()
 
 	torrentID := link
 	if after, ok := strings.CutPrefix(link, "torbox://"); ok {
@@ -627,12 +691,30 @@ func (tb *Torbox) CheckFile(ctx context.Context, infohash, link string) error {
 		}
 	}
 
-	if present, ok := tb.downloadPresentCache.Load(torrentID); ok {
-		if !present.(bool) {
+	if present, ok := snap.present[torrentID]; ok {
+		if !present {
 			return customerror.HosterUnavailableError
 		}
 		return nil
 	}
+
+	// Missing from a snapshot that may predate the torrent. Re-confirm.
+	if !snap.fresh() {
+		refreshed, err := tb.refreshSnapshot()
+		if err != nil {
+			return fmt.Errorf("%w: torbox check: torrent %s absent from a stale snapshot that could not be refreshed: %w",
+				types.ErrAvailabilityIndeterminate, torrentID, err)
+		}
+		snap = refreshed
+		if present, ok := snap.present[torrentID]; ok {
+			if !present {
+				return customerror.HosterUnavailableError
+			}
+			return nil
+		}
+	}
+
+	// Absent from a snapshot known to be fresh: genuinely not on the account.
 	return customerror.HosterUnavailableError
 }
 

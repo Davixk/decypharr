@@ -605,26 +605,33 @@ func (dl *DebridLink) getTorrents(page, perPage int) ([]*types.Torrent, error) {
 	return torrents, nil
 }
 
+// CheckFile probes link availability with a three-way verdict:
+// nil (available), customerror.HosterUnavailableError (definitively gone, 404/410),
+// or types.ErrAvailabilityIndeterminate (unknown — 401/403/429/5xx, transport failure).
+// The probe is a ranged GET straight at the CDN link, so 404/410 there really
+// does mean the object is gone; every other non-2xx is an infrastructure answer
+// and must not be scored either healthy or dead.
 func (dl *DebridLink) CheckFile(ctx context.Context, _, link string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: debridlink check: building request: %w", types.ErrAvailabilityIndeterminate, err)
 	}
 	req.Header.Set("Range", "bytes=0-0")
 
 	resp, err := dl.repairClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: debridlink check: transport error: %w", types.ErrAvailabilityIndeterminate, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return nil
+	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
 		return customerror.HosterUnavailableError
+	default:
+		return fmt.Errorf("%w: debridlink check: HTTP status %d", types.ErrAvailabilityIndeterminate, resp.StatusCode)
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("debridlink file check error: Status: %d", resp.StatusCode)
-	}
-	return nil
 }
 
 func (dl *DebridLink) GetAvailableSlots() (int, error) {

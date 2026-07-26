@@ -581,13 +581,21 @@ func (dls *Downloaders) countErrors(n int64, err error) {
 		if !customerror.IsSilentError(err) {
 			dls.item.logger.Debug().Err(err).Int("count", dls.errorCount).Msg("download error")
 		}
-		// Only a genuinely permanent provider failure (article missing, auth,
+		// Only a genuinely permanent provider failure (content missing, auth,
 		// payment/permission) fast-trips the breaker — retrying those 10× is
 		// pointless. Transient/ambiguous errors (timeout, stall, "stream
 		// produced no data", "exhausted retries") only increment, so the
 		// breaker requires SUSTAINED failure. This is what stops one bad
 		// moment under load from locking a file out of every ffprobe.
-		if nntp.IsArticleNotFoundError(err) || customerror.IsPermanentError(err) {
+		//
+		// IsContentMissingError, not IsArticleNotFoundError: a 430 and an
+		// article that decodes to NO payload at all (present, but carrying no
+		// "=ybegin" — a stub) are the same definitive verdict about the
+		// content. The WebDAV path already treats both as permanently dead;
+		// the narrower check left the DFS/FUSE mount grinding a payload-less
+		// article through the full retry budget, so the two read paths
+		// disagreed about the same file.
+		if nntp.IsContentMissingError(err) || customerror.IsPermanentError(err) {
 			dls.errorCount = maxErrorCount
 		}
 		// Trip circuit breaker when max errors reached

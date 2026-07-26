@@ -578,28 +578,39 @@ func (ad *AllDebrid) RefreshDownloadLinks() error {
 	return ad.accountsManager.RefreshLinks(ad.fetchDownloadLinks)
 }
 
+// CheckFile probes link availability with a three-way verdict:
+// nil (available), customerror.HosterUnavailableError (definitively gone), or
+// types.ErrAvailabilityIndeterminate (unknown).
+//
+// AllDebrid does not signal a dead link through the HTTP status of
+// /link/infos — that endpoint is a fixed API route, so a 404/5xx there means
+// our request or their infrastructure is wrong, not that the file is gone.
+// Deadness is only ever reported by the per-link Error field inside a
+// successfully decoded 200 envelope. Everything else (transport failure,
+// non-success envelope such as AUTH_BAD_APIKEY, malformed body, unexpected
+// info count) is indeterminate and must not score healthy.
 func (ad *AllDebrid) CheckFile(ctx context.Context, _, link string) error {
 	form := url.Values{}
 	form.Add("link[]", link)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ad.Host+allDebridLinkInfosEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: alldebrid check: building request: %w", types.ErrAvailabilityIndeterminate, err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := ad.repairClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: alldebrid check: transport error: %w", types.ErrAvailabilityIndeterminate, err)
 	}
 	defer resp.Body.Close()
 
 	var data LinkInfosResponse
 	if err := decodeAllDebridResponse(resp, &data); err != nil {
-		return err
+		return fmt.Errorf("%w: alldebrid check: %w", types.ErrAvailabilityIndeterminate, err)
 	}
 	if len(data.Data.Infos) != 1 {
-		return fmt.Errorf("alldebrid API error: expected one link info, got %d", len(data.Data.Infos))
+		return fmt.Errorf("%w: alldebrid check: expected one link info, got %d", types.ErrAvailabilityIndeterminate, len(data.Data.Infos))
 	}
 	if linkErr := data.Data.Infos[0].Error; linkErr != nil {
 		return fmt.Errorf("%w: %s: %s", customerror.HosterUnavailableError, linkErr.Code, linkErr.Message)

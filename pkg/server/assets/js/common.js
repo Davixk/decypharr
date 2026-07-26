@@ -144,6 +144,21 @@ class DecypharrUtils {
     }
 
     // Enhanced toast system
+    //
+    // `message` is treated as PLAIN TEXT and is escaped here, once, before it
+    // reaches insertAdjacentHTML. Callers pass server-supplied strings (API
+    // error bodies, provider error messages, file names), so interpolating them
+    // raw injected arbitrary markup/script into the page. Escaping lives here
+    // rather than at the call sites so it cannot be forgotten — and so it is
+    // never applied twice, which would show the user literal `&lt;` artifacts.
+    //
+    // Newlines still render as line breaks: the message is escaped FIRST and
+    // the <br> substitution happens afterwards, on the escaped text, so the
+    // escaping cannot be bypassed by embedding markup around a newline.
+    //
+    // No caller currently passes intentional markup. If one ever needs to, add
+    // an explicit opt-in (e.g. an `{html: true}` option) instead of loosening
+    // the default.
     createToast(message, type = 'success', duration = null) {
         const toastTimeouts = {
             success: 5000,
@@ -176,6 +191,12 @@ class DecypharrUtils {
             info: '<path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"></path>'
         };
 
+        // Escape first, THEN turn newlines into <br>: doing it the other way
+        // round would escape the line breaks we just inserted, and escaping
+        // after any interpolation is what makes the substitution unbypassable.
+        const safeMessage = this.escapeHtml(message == null ? '' : String(message))
+            .replace(/\n/g, '<br>');
+
         const toastHtml = `
             <div id="${toastId}" class="alert ${alertTypeClass[type]} shadow-lg mb-2">
                 <div class="flex items-start gap-3">
@@ -183,7 +204,7 @@ class DecypharrUtils {
                         ${icons[type]}
                     </svg>
                     <div class="flex-1">
-                        <span class="text-sm">${message.replace(/\n/g, '<br>')}</span>
+                        <span class="text-sm">${safeMessage}</span>
                     </div>
                     <button class="btn btn-sm btn-ghost btn-circle" onclick="window.decypharrUtils.closeToast('${toastId}');">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

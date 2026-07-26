@@ -111,9 +111,24 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 	if err := ctx.Err(); err != nil {
 		return emptyDownloadLink, err
 	}
+	// Short-circuit a bad-marked entry BEFORE any provider work. Bad is only
+	// set after re-insertion has already been exhausted, so every read of it is
+	// guaranteed to fail — yet the test used to sit after a store read+decode,
+	// a possible live entry refresh, and a GetDownloadLink call that the
+	// account manager repeats across every active account. Those calls consume
+	// the provider's download rate-limit bucket and actively starve legitimate
+	// streams. Rejecting here costs zero provider API calls.
+	//
+	// This only short-circuits the SERVING path (GetLink). Repair/re-insertion
+	// (Fixer.MoveTorrent, ReinsertEntry) does not route through the link
+	// service, so it can still clear Bad; and the post-repair re-entries below
+	// only happen once Bad is known to be false.
+	if err := badEntryError(entry); err != nil {
+		return emptyDownloadLink, err
+	}
 	link, err := s.fetchLink(ctx, entry, filename, attempt)
 	if err != nil {
-		return s.handleBadLink(ctx, err, entry, link, attempt)
+		return s.handleBadLink(ctx, err, entry, filename, link, attempt)
 	}
 
 	// Is link already validated
@@ -167,28 +182,74 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 	return emptyDownloadLink, validationErr
 }
 
-func (s *Service) handleBadLink(ctx context.Context, err error, entry *storage.Entry, dl types.DownloadLink, attempt int) (types.DownloadLink, error) {
-	if errors.Is(err, customerror.HosterUnavailableError) {
-		if entry.Bad {
-			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())
-		}
-		if attempt >= MaxReinsertionAttempt {
-			s.markEntryBad(entry, dl.Filename, attempt, "hoster_unavailable")
-			return emptyDownloadLink, fmt.Errorf("entry %s file %s still unresolvable after %d re-insertion attempts", entry.GetFolder(), dl.Filename, attempt)
-		}
-		if err := s.repairer(ctx, entry); err != nil {
-			return emptyDownloadLink, err
-		}
-
-		if entry.Bad {
-			// Entry is still bad
-			return emptyDownloadLink, fmt.Errorf("entry %s(%s) still bad after repair, un-repairable", entry.GetFolder(), dl.Link)
-		}
-		// Bypass singleflight re-entry to avoid deadlock
-		return s.fetchAndValidate(ctx, entry, dl.Filename, attempt+1)
+// badEntryError converts the durable Bad flag into the typed, permanent 410 a
+// serving read must surface. A bare error here became a generic HTTP 500 in the
+// WebDAV layer, and 500 is RETRYABLE: rclone retries it instead of converting
+// it to EIO, so the reader never fails and re-requests the dead entry forever.
+// 410 Gone is both semantically correct and the status that actually stops the
+// retry loop. The message text is preserved verbatim — operators grep for it.
+func badEntryError(entry *storage.Entry) error {
+	if entry == nil || !entry.Bad {
+		return nil
 	}
-	// Just return the error
-	return dl, err
+	return customerror.NewContentGoneError(
+		fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder()),
+	)
+}
+
+// reinsertReason names the failure class that triggered a re-insertion cycle,
+// or "" when err is not a re-insertion trigger.
+//
+// Both classes mean "the provider has no usable copy of this file right now",
+// which re-inserting the entry can genuinely fix. EmptyDownloadLinkError used to
+// reach this path indirectly: the account manager swallowed provider errors and
+// returned an EMPTY link with a nil error, and fetchLink's downloadLink.Empty()
+// branch drove the recovery. The account manager now returns the typed error
+// instead, so the empty-link case must be routed here explicitly or the whole
+// re-insertion recovery silently stops happening.
+//
+// Deliberately NOT included: 429/auth/5xx on the download endpoint. Those also
+// used to surface as an empty link and could permanently condemn an entry
+// (Bad = true) after three attempts. They are typed errors now and are left
+// alone — a transient throttle must never permanently kill an entry.
+func reinsertReason(err error) string {
+	switch {
+	case errors.Is(err, customerror.HosterUnavailableError):
+		return "hoster_unavailable"
+	case errors.Is(err, types.EmptyDownloadLinkError):
+		return "empty_link"
+	default:
+		return ""
+	}
+}
+
+func (s *Service) handleBadLink(ctx context.Context, err error, entry *storage.Entry, filename string, dl types.DownloadLink, attempt int) (types.DownloadLink, error) {
+	reason := reinsertReason(err)
+	if reason == "" {
+		// Just return the error
+		return dl, err
+	}
+	if badErr := badEntryError(entry); badErr != nil {
+		return emptyDownloadLink, badErr
+	}
+	if attempt >= MaxReinsertionAttempt {
+		s.markEntryBad(entry, filename, attempt, reason)
+		return emptyDownloadLink, fmt.Errorf("entry %s file %s still unresolvable (%s) after %d re-insertion attempts",
+			entry.GetFolder(), filename, reason, attempt)
+	}
+	if repairErr := s.repairer(ctx, entry); repairErr != nil {
+		return emptyDownloadLink, repairErr
+	}
+
+	if entry.Bad {
+		// Entry is still bad
+		return emptyDownloadLink, fmt.Errorf("entry %s(%s) still bad after repair, un-repairable", entry.GetFolder(), dl.Link)
+	}
+	// Bypass singleflight re-entry to avoid deadlock. filename comes from the
+	// caller, not from dl: the provider returns an EMPTY DownloadLink alongside
+	// its error, so dl.Filename is "" and retrying with it resolved to a bogus
+	// "file not found" and logged a blank filename when marking the entry bad.
+	return s.fetchAndValidate(ctx, entry, filename, attempt+1)
 }
 
 // markEntryBad sets entry.Bad and persists it so subsequent GetLink calls
@@ -268,24 +329,12 @@ func (s *Service) fetchLink(ctx context.Context, entry *storage.Entry, filename 
 	}
 
 	if downloadLink.Empty() {
-		// Let's try to reinsert the entry
-		if entry.Bad {
-			return emptyDownloadLink, fmt.Errorf("can't repair %s since it's been marked as bad", entry.GetFolder())
-		}
-		if attempt >= MaxReinsertionAttempt {
-			s.markEntryBad(entry, filename, attempt, "empty_link")
-			return emptyDownloadLink, fmt.Errorf("entry %s file %s still resolves to an empty link after %d re-insertion attempts", entry.GetFolder(), filename, attempt)
-		}
-		if err := s.repairer(ctx, entry); err != nil {
-			return emptyDownloadLink, err
-		}
-
-		if entry.Bad {
-			// Entry is still bad
-			return emptyDownloadLink, fmt.Errorf("entry %s(%s) still bad after repair, un-repairable", entry.GetFolder(), downloadLink.Link)
-		}
-		// Bypass singleflight re-entry to avoid deadlock
-		return s.fetchAndValidate(ctx, entry, filename, attempt+1)
+		// Defensive only. The account manager now returns a typed error for
+		// every invalid link, so (empty link, nil error) should be unreachable;
+		// if a provider ever produces it again, convert it to the canonical
+		// empty-link error so it takes the SAME re-insertion recovery path
+		// through handleBadLink rather than handing an unusable link upstream.
+		return emptyDownloadLink, types.EmptyDownloadLinkError
 	}
 
 	return downloadLink, nil

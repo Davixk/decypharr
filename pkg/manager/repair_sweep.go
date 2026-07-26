@@ -19,10 +19,39 @@ import (
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	"github.com/sirrobot01/decypharr/internal/nntp"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/sirrobot01/decypharr/pkg/usenet"
+)
+
+const (
+	// repairProbeReadBytes is how much REAL payload a CHECK probe transfers at
+	// each sampled offset to prove a file is servable. Metadata-level probes
+	// (NNTP STAT, a hoster availability call, a HEAD served from cached
+	// metadata) move zero bytes, which is precisely how a 100%-unreadable entry
+	// recorded `healthy` with broken_count 0.
+	repairProbeReadBytes = 256 * 1024
+
+	// repairProbeSamplePoints is how many offsets the payload verification
+	// samples: head, evenly spaced interior offsets, and the tail. A GOOD HEAD
+	// IS NOT PROOF OF HEALTH — a live 3.2 GB file served 0%, 25% and 50%
+	// correctly, returned a success status with ZERO bytes at 75%, and a
+	// permanent 410 at the tail. Head-only verification would have called it
+	// healthy. Tunable: raising it linearly raises sweep cost.
+	repairProbeSamplePoints = 5
+
+	// repairProbeReadTimeout bounds one file's whole payload verification (all
+	// sample points) so a stalled provider degrades the probe to `unknown`
+	// instead of hanging the sweep.
+	repairProbeReadTimeout = 2 * time.Minute
+
+	// repairIndeterminateRetry is how soon an entry whose CHECK reached no
+	// verdict is re-examined. Far shorter than the recheck interval so
+	// `unknown` cannot become a permanent resting state.
+	repairIndeterminateRetry = 6 * time.Hour
 )
 
 // candidate is the unit of work for a sweep. One per entry-folder.
@@ -80,6 +109,70 @@ type fileResult struct {
 	healthy  bool
 	broken   bool
 	reason   string // populated only when broken or unknown
+}
+
+// Component names used as EntryHealth.ActionSkips keys.
+const (
+	componentRepair = "repair"
+	componentPrune  = "prune"
+	componentRegrab = "regrab"
+)
+
+// Machine-readable reasons recorded when a component DECLINES to act, or when a
+// probe reaches a verdict no future probe can change. Every one of these used
+// to be a bare `continue` / `return` with no counter and no trace, which is how
+// a correct refusal became indistinguishable from a broken action path.
+const (
+	// reasonRepairUnsupportedProtocol: REPAIR re-acquires by re-inserting the
+	// item across debrid providers (Fixer.FixTorrent). Only a torrent can be
+	// re-inserted — Entry.CanBeFixed() is literally IsTorrent(). Usenet has no
+	// analogue: the articles either exist on the news servers or they do not,
+	// and re-parsing the same NZB asks the same providers for the same message
+	// ids. A dead nzb is recovered by RE-GRAB (a fresh NZB from the indexer) or
+	// PRUNE, never by REPAIR.
+	reasonRepairUnsupportedProtocol = "repair_unsupported_protocol"
+	// reasonRepairEntryMissing: the health record names an infohash whose entry
+	// row is gone, so there is nothing to re-insert.
+	reasonRepairEntryMissing = "repair_entry_missing"
+	// reasonRepairNoInfohash: nothing broken on this entry carries an infohash,
+	// so REPAIR has no handle to act on.
+	reasonRepairNoInfohash = "repair_no_infohash"
+
+	// reasonPruneNoBrokenFiles / reasonPrunePartialEntry / reasonPruneNoInfohash
+	// are the three ways pruneEligible declines. reasonPrunePartialEntry is the
+	// important one: refusing to delete a 13-file entry because 5 of its files
+	// are dead is CORRECT — it keeps the surviving files' symlinks — and it is
+	// also the single most confusing "PRUNE did nothing" outcome, because
+	// nothing recorded that the refusal happened.
+	reasonPruneNoBrokenFiles = "prune_no_broken_files"
+	reasonPrunePartialEntry  = "prune_partial_entry"
+	reasonPruneNoInfohash    = "prune_no_infohash"
+
+	// reasonRegrabNoArrLink: no broken file resolved to an arr file record, so
+	// there is no arr to delete from, blocklist in, or re-search.
+	reasonRegrabNoArrLink = "regrab_no_arr_link"
+
+	// reasonDeletionCapReached: the per-run destructive budget was exhausted
+	// before this entry, so ALL destructive components were skipped for it.
+	reasonDeletionCapReached = "deletion_cap_reached"
+
+	// reasonEntryHasNoFiles is a STRUCTURAL verdict: the entry-item exists but
+	// lists no probeable file (empty, or every file soft-deleted). Nothing can
+	// be served from it and no probe can ever say otherwise.
+	reasonEntryHasNoFiles = "entry_has_no_files"
+)
+
+// repairAttempt is the per-entry outcome of the REPAIR component. It exists so
+// a repair that was ATTEMPTED AND FAILED is distinguishable from one that was
+// never attempted: previously both produced reacquired=0, repair_failed=0 and
+// last_repair_at=never, simultaneously, which is an unreadable run record.
+type repairAttempt struct {
+	reacquired  int    // infohashes successfully re-acquired
+	failed      int    // re-acquire attempts that were made and errored
+	unsupported int    // dead placements REPAIR structurally cannot re-acquire
+	attempted   bool   // at least one re-acquire was actually invoked
+	err         string // reason the last failed attempt failed
+	skip        string // reason REPAIR declined, when it never attempted anything
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -175,9 +268,13 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		Int("broken", run.Stats.Broken).
 		Int("healthy", run.Stats.Healthy).
 		Int("reacquired", run.Stats.Reacquired).
+		Int("repair_failed", run.Stats.RepairFailed).
+		Int("repair_skipped_unsupported", run.Stats.RepairSkippedUnsupported).
 		Int("pruned", run.Stats.Pruned).
+		Int("prune_skipped_not_eligible", run.Stats.PruneSkippedNotEligible).
 		Int("regrabbed", run.Stats.Regrabbed).
-		Int("regrab_failed", run.Stats.RepairFailed).
+		Int("regrab_failed", run.Stats.RegrabFailed).
+		Int("regrab_skipped_no_arr_link", run.Stats.RegrabSkippedNoArrLink).
 		Int("deletions", run.Stats.Deletions).
 		Int("deletion_cap_skipped", run.Stats.DeletionCapSkipped).
 		Msg("Sweep: completed")
@@ -277,9 +374,9 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 				return gctx.Err()
 			}
 
-			h, reacquired := r.probeEntry(gctx, run.ID, c, heal, opts, actions.repair)
+			h, attempt := r.probeEntry(gctx, run.ID, c, heal, opts, actions.repair)
 			if h == nil {
-				// Entry vanished or had no files between enumeration and probe;
+				// Entry body could not be loaded between enumeration and probe;
 				// skip without counting. Release any loaded body.
 				c.item = nil
 				c.contentMap = nil
@@ -295,7 +392,9 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 
 			runMu.Lock()
 			run.Stats.Probed++
-			run.Stats.Reacquired += reacquired
+			run.Stats.Reacquired += attempt.reacquired
+			run.Stats.RepairFailed += attempt.failed
+			run.Stats.RepairSkippedUnsupported += attempt.unsupported
 			switch h.Status {
 			case storage.HealthHealthy:
 				run.Stats.Healthy++
@@ -322,15 +421,24 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 // repair is set), then persists final health. When REPAIR heals the item its
 // rolled-up status becomes healthy, which is what stops the downstream
 // PRUNE/RE-GRAB pipeline for it.
-func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, repair bool) (*storage.EntryHealth, int) {
+func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, repair bool) (*storage.EntryHealth, repairAttempt) {
 	s := r.manager.storage
 	// Lazily load the entry body. Enumeration only recorded the name, so the
-	// store isn't fully decoded up front. A vanished or empty entry is a skip
-	// (nil tells the worker not to count it).
+	// store isn't fully decoded up front. A body that cannot be READ is a skip
+	// (nil tells the worker not to count it); a body that reads fine but lists
+	// nothing probeable is a real, countable verdict handled below.
 	if c.item == nil {
 		item, err := s.GetEntryItem(c.name)
-		if err != nil || item == nil || len(item.Files) == 0 {
-			return nil, 0
+		if err != nil || item == nil {
+			// The entry body could not be loaded, so nothing can be verified.
+			// Skipping silently used to leave a STALE `healthy` record in place
+			// forever — an entry whose content had vanished from the mount kept
+			// reporting healthy with last_failed_at never set. Downgrade any
+			// such record to `unknown` instead: it stops asserting health while
+			// staying non-actionable (a storage read failure must never trigger
+			// PRUNE/RE-GRAB).
+			r.downgradeUnverifiableHealth(c.name)
+			return nil, repairAttempt{}
 		}
 		c.item = item
 	}
@@ -349,25 +457,40 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	r.saveHealth(h)
 
 	names := orderedFilenames(c.item)
+	if len(names) == 0 {
+		// STRUCTURAL: the entry-item read fine but lists no probeable file —
+		// empty, or every file soft-deleted. Nothing behind it can be served,
+		// and no probe on any future run can say otherwise.
+		//
+		// This used to roll up `unknown` (rollupStatus of an empty result set),
+		// which is a lie twice over: it asserted "this run could not reach a
+		// verdict" when the verdict is certain, and `unknown` is non-actionable,
+		// so the entry sat on the indeterminate retry forever, re-probed every
+		// run, stamped, and instantly returning the same non-answer with
+		// last_ok_at AND last_failed_at both never set.
+		return r.recordStructurallyEmptyEntry(h, c.item)
+	}
+
 	results := r.probeFiles(ctx, c.item, names, opts)
-	reacquired := 0
+	var attempt repairAttempt
 	if repair {
-		// REPAIR component: re-acquire dead torrents across providers. On
-		// success the file's result flips to healthy so the entry rolls up
-		// healthy and the destructive pipeline never runs for it.
-		reacquired = r.autoHealResults(ctx, results, heal)
+		// REPAIR component: re-acquire dead items across providers. On success
+		// the file's result flips to healthy so the entry rolls up healthy and
+		// the destructive pipeline never runs for it.
+		attempt = r.autoHealResults(ctx, results, heal)
 	}
 
 	broken := r.brokenFiles(c, results)
 	final := rollupStatus(results)
 
 	h.Status = final
+	h.Structural = false
 	h.FileCount = len(names)
 	h.BrokenFiles = broken
 	h.BrokenCount = len(broken)
 	h.Fingerprint = storage.EntryItemRepairFingerprint(c.item)
 	h.LastCheckedAt = time.Now()
-	h.NextCheckDueAt = h.LastCheckedAt.Add(r.recheckInterval())
+	h.NextCheckDueAt = h.LastCheckedAt.Add(r.verdictRecheckDelay(final))
 	h.Dirty = false
 	h.DirtyReason = ""
 	h.ActiveRunID = ""
@@ -382,16 +505,112 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	case storage.HealthBroken:
 		h.LastFailedAt = h.LastCheckedAt
 		h.FailureReason = topReason(broken)
+	default:
+		// `unknown` used to record NO reason at all: brokenFiles() only
+		// collects results with broken=true, so the per-file reason that
+		// produced the non-verdict (usenet_probe_indeterminate,
+		// provider_probe_error, usenet_client_not_configured, …) was computed
+		// and then dropped. An operator staring at a library of `unknown`
+		// entries had literally nothing to go on. Carry the dominant reason.
+		h.FailureReason = topIndeterminateReason(results)
+	}
+	if repair {
+		r.applyRepairAttempt(h, attempt)
 	}
 
 	r.saveHealth(h)
-	return h, reacquired
+	return h, attempt
+}
+
+// recordStructurallyEmptyEntry persists the terminal verdict for an entry-item
+// that lists no probeable file.
+//
+// It records `broken`, which is a DESTRUCTIVE-ELIGIBLE class, so state the
+// consequence plainly: an entry with zero probeable files carries zero
+// BrokenFiles, therefore BrokenCount == 0, therefore pruneEligible() is false
+// and entryHealthHasArrLink() is false. Neither PRUNE nor RE-GRAB can act on
+// it — it is honest and visible without being deletable. `broken` is chosen
+// over `unknown` because the statement being made is "nothing here can be
+// served", which is true and permanent, not "this run could not tell".
+func (r *Repair) recordStructurallyEmptyEntry(h *storage.EntryHealth, item *storage.EntryItem) (*storage.EntryHealth, repairAttempt) {
+	now := time.Now()
+	h.Status = storage.HealthBroken
+	h.Structural = true
+	h.FileCount = 0
+	h.BrokenFiles = nil
+	h.BrokenCount = 0
+	h.Fingerprint = storage.EntryItemRepairFingerprint(item)
+	h.LastCheckedAt = now
+	h.LastFailedAt = now
+	h.FailureReason = reasonEntryHasNoFiles
+	// A structural verdict takes the FULL recheck interval, never the short
+	// indeterminate retry: there is nothing to retry sooner for. IsDue also
+	// stops treating it as always-due, so it leaves the every-run treadmill.
+	h.NextCheckDueAt = now.Add(r.verdictRecheckDelay(storage.HealthBroken))
+	h.Dirty = false
+	h.DirtyReason = ""
+	h.ActiveRunID = ""
+	h.PreviousStatus = ""
+	r.saveHealth(h)
+	return h, repairAttempt{}
+}
+
+// applyRepairAttempt folds the REPAIR component's outcome onto the health
+// record. LastRepairAt is stamped whenever an attempt was MADE, successful or
+// not — stamping only on success is what made a failed repair and a
+// never-attempted repair look identical from storage.
+func (r *Repair) applyRepairAttempt(h *storage.EntryHealth, attempt repairAttempt) {
+	if h == nil {
+		return
+	}
+	if attempt.attempted {
+		h.LastRepairAt = time.Now()
+	}
+	h.LastRepairError = attempt.err
+	h.SetActionSkip(componentRepair, attempt.skip)
+}
+
+// verdictRecheckDelay schedules the next CHECK. A definitive verdict (healthy
+// or broken) waits the full recheck interval; an INDETERMINATE one does not.
+//
+// `unknown` means this run could not reach a verdict — a provider 429, an auth
+// failure, a stalled substrate. Parking that for a week would turn `unknown`
+// into a permanent resting state where an entry is neither trusted nor
+// re-examined, which is how a silently-dead entry hides. Retry it soon instead,
+// never later than the configured interval.
+func (r *Repair) verdictRecheckDelay(status storage.HealthStatus) time.Duration {
+	interval := r.recheckInterval()
+	if status != storage.HealthUnknown {
+		return interval
+	}
+	if repairIndeterminateRetry < interval {
+		return repairIndeterminateRetry
+	}
+	return interval
+}
+
+// downgradeUnverifiableHealth clears a stale positive verdict for an entry the
+// probe could not load at all. It never asserts broken: the load failure says
+// nothing about the content, only that this run could not check it.
+func (r *Repair) downgradeUnverifiableHealth(name string) {
+	h, _ := r.manager.storage.GetEntryHealth(name)
+	if h == nil || h.Status == storage.HealthUnknown {
+		return
+	}
+	h.PreviousStatus = h.Status
+	h.Status = storage.HealthUnknown
+	h.ActiveRunID = ""
+	h.FailureReason = "entry_item_unreadable"
+	h.LastCheckedAt = time.Now()
+	h.NextCheckDueAt = h.LastCheckedAt.Add(r.verdictRecheckDelay(storage.HealthUnknown))
+	r.saveHealth(h)
 }
 
 // probeFiles fans per-file probes inside a single entry, capped at
 // repairFilesPerEntry concurrent workers.
 func (r *Repair) probeFiles(ctx context.Context, item *storage.EntryItem, names []string, opts RepairRunOptions) []fileResult {
 	results := make([]fileResult, len(names))
+	payloadProbe := selectPayloadProbeFiles(item, names)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(repairFilesPerEntry)
 	for i, name := range names {
@@ -400,7 +619,7 @@ func (r *Repair) probeFiles(ctx context.Context, item *storage.EntryItem, names 
 				results[i] = fileResult{name: name, reason: "context_cancelled"}
 				return nil
 			}
-			results[i] = r.probeFile(gctx, item, name, opts)
+			results[i] = r.probeFile(gctx, item, name, opts, payloadProbe[name])
 			return nil
 		})
 	}
@@ -408,14 +627,97 @@ func (r *Repair) probeFiles(ctx context.Context, item *storage.EntryItem, names 
 	return results
 }
 
+// selectPayloadProbeFiles picks which files get the expensive "move real bytes"
+// verification: exactly one per infohash, deterministically the first in probe
+// order.
+//
+// The failure modes this verification exists to catch are placement-scoped, not
+// file-scoped — an entry marked bad, an unresolvable/expired link, a stubbed
+// post — so one verified file per infohash is enough to condemn the entry:
+// rollupStatus fails the whole entry if ANY file is broken. Verifying every file
+// would multiply a sweep's cost by the file count (a 23-file NZB would pull
+// ~17 MB of segments per probe), which is not viable across a large library.
+//
+// The trade-off, stated plainly: a single dead file inside an otherwise-healthy
+// multi-file entry is still caught only by the metadata-level probe (STAT /
+// hoster check) that already ran on every file — the byte-level check does not
+// run on the unselected siblings.
+func selectPayloadProbeFiles(item *storage.EntryItem, names []string) map[string]bool {
+	if item == nil {
+		return nil
+	}
+	selected := make(map[string]bool, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		file := item.Files[name]
+		if file == nil || file.InfoHash == "" {
+			continue
+		}
+		if _, ok := seen[file.InfoHash]; ok {
+			continue
+		}
+		seen[file.InfoHash] = struct{}{}
+		selected[name] = true
+	}
+	return selected
+}
+
+// isDeadContentVerdict reports whether err is a DEFINITIVE statement that the
+// content is gone, as opposed to a failure of the machinery that was asked.
+// Only these may flip a file to broken; everything else (auth, rate limits,
+// 5xx, timeouts, cancellations, unclassified failures) must degrade to
+// `unknown`, which is non-actionable.
+//
+// Deliberately NOT included: link.CategoryPermanent as a whole. That category
+// also covers ErrUnauthorized (a 401 is an ACCOUNT problem), and treating it as
+// dead content would condemn an entire library the moment a token expired.
+func isDeadContentVerdict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// A usenet 430 or an article that decoded to no payload at all.
+	if nntp.IsContentMissingError(err) {
+		return true
+	}
+	if errors.Is(err, customerror.HosterUnavailableError) || errors.Is(err, debridTypes.EmptyDownloadLinkError) {
+		return true
+	}
+	var custom *customerror.Error
+	if errors.As(err, &custom) {
+		switch custom.Code {
+		case "usenet_article_missing", "usenet_segment_missing", "debrid_content_gone":
+			return true
+		}
+	}
+	return false
+}
+
+// countingWriter counts payload bytes without retaining them. Probe reads must
+// prove bytes flowed, not keep them.
+type countingWriter struct{ n int64 }
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.n += int64(len(p))
+	return len(p), nil
+}
+
 // probeFile checks one file. NZB probes use usenet.CheckFile. Torrent probes
 // use the provider CheckFile endpoint unless this run requests unrestrict-link
 // probing.
-func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name string, opts RepairRunOptions) fileResult {
+func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name string, opts RepairRunOptions, payloadProbe bool) fileResult {
 	file := item.Files[name]
 	res := fileResult{name: name}
 
 	if file == nil || file.InfoHash == "" {
+		// A listed file with no infohash cannot be resolved to any placement or
+		// NZB, so the read path can never serve it. That is a durable data
+		// defect, not a transient substrate failure: it must be broken, not
+		// `unknown`. Leaving it unknown let entries whose content is entirely
+		// absent from the mount roll up healthy off their surviving siblings.
+		res.broken = true
 		res.reason = "missing_infohash"
 		return res
 	}
@@ -423,6 +725,10 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 
 	entry, err := r.manager.GetEntry(file.InfoHash)
 	if err != nil || entry == nil {
+		// Same reasoning: the entry item still lists this file, but the entry
+		// row it points at is gone, so there is no placement, no link and no
+		// segment map behind it. Nothing can serve it.
+		res.broken = true
 		res.reason = "entry_not_found"
 		return res
 	}
@@ -433,38 +739,65 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 	}
 
 	if entry.IsNZB() {
-		return r.probeNZBFile(ctx, entry, name, res)
+		return r.probeNZBFile(ctx, entry, name, res, payloadProbe)
 	}
-	return r.probeTorrentFile(ctx, entry, file, name, res, opts)
+	return r.probeTorrentFile(ctx, entry, file, name, res, opts, payloadProbe)
 }
 
-func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name string, res fileResult) fileResult {
+func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name string, res fileResult, payloadProbe bool) fileResult {
 	if r.manager.usenet == nil {
 		res.reason = "usenet_client_not_configured"
 		return res
 	}
 	err := r.manager.usenet.CheckFile(ctx, entry.InfoHash, name)
-	if err == nil {
+	switch {
+	case err == nil:
+		// The STAT sample passed. That only proves the message ids exist; it
+		// moved ZERO bytes, so it cannot see a post that is present but carries
+		// no decodable payload. Fall through to the byte-level verification.
+	case errors.Is(err, customerror.UsenetSegmentMissingError):
+		res.broken = true
+		res.reason = "usenet_segment_missing"
+		return res
+	case errors.Is(err, usenet.ErrAvailabilityIndeterminate):
+		// The substrate failed, the content did not. Neither healthy nor broken
+		// — rolls up to `unknown`, which no destructive component acts on.
+		res.reason = "usenet_probe_indeterminate"
+		return res
+	default:
+		res.reason = "usenet_probe_error"
+		return res
+	}
+
+	if !payloadProbe {
 		res.healthy = true
 		return res
 	}
-	if errors.Is(err, customerror.UsenetSegmentMissingError) {
-		res.broken = true
-		res.reason = "usenet_segment_missing"
-	} else {
-		res.reason = "usenet_probe_error"
-	}
-	return res
+	return r.verifyPayload(ctx, res, "usenet", func(probeCtx context.Context) (int64, error) {
+		return r.manager.usenet.CheckFileReadable(probeCtx, entry.InfoHash, name, repairProbeReadBytes, repairProbeSamplePoints)
+	})
 }
 
-func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions) fileResult {
+func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions, payloadProbe bool) fileResult {
+	// decypharr's own read path refuses a bad-marked entry outright ("can't
+	// repair X since it's been marked as bad") before it even asks the
+	// provider, so EVERY read of it fails. Bad is durable and only set after
+	// re-insertion was already exhausted. No metadata-level probe — not the
+	// hoster availability call, certainly not a HEAD served from cached
+	// metadata in half a millisecond — ever notices, which is exactly how a
+	// 100%-unreadable entry recorded healthy with broken_count 0.
+	if entry.Bad {
+		res.broken = true
+		res.reason = "entry_marked_bad"
+		return res
+	}
 	client := r.manager.ProviderClient(entry.ActiveProvider)
 	if client == nil {
 		res.reason = "provider_client_not_found"
 		return res
 	}
 	if opts.UnrestrictLink {
-		return r.probeTorrentFileByUnrestrict(entry, file, name, res, client)
+		return r.probeTorrentFileByUnrestrict(ctx, entry, file, name, res, client, payloadProbe)
 	}
 	if !client.SupportsCheck() {
 		res.reason = "provider_check_unsupported"
@@ -477,20 +810,35 @@ func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, fil
 		return res
 	}
 	err := client.CheckFile(ctx, file.InfoHash, link)
-	if err == nil {
+	switch {
+	case err == nil:
+		// Availability claimed. Prove it with bytes below.
+	case errors.Is(err, customerror.HosterUnavailableError):
+		res.broken = true
+		res.reason = "hoster_unavailable"
+		return res
+	case errors.Is(err, debridTypes.ErrAvailabilityIndeterminate):
+		// 401/403/429/5xx/transport: the provider never gave a verdict about the
+		// content. Mirrors usenet.ErrAvailabilityIndeterminate — never healthy,
+		// never broken, and re-checked soon rather than parked for a full
+		// recheck interval (see probeEntry).
+		res.reason = "provider_probe_indeterminate"
+		return res
+	default:
+		res.reason = "provider_probe_error"
+		return res
+	}
+
+	if !payloadProbe {
 		res.healthy = true
 		return res
 	}
-	if errors.Is(err, customerror.HosterUnavailableError) {
-		res.broken = true
-		res.reason = "hoster_unavailable"
-	} else {
-		res.reason = "provider_probe_error"
-	}
-	return res
+	return r.verifyPayload(ctx, res, "provider", func(probeCtx context.Context) (int64, error) {
+		return r.readTorrentPayload(probeCtx, entry, file, name, client)
+	})
 }
 
-func (r *Repair) probeTorrentFileByUnrestrict(entry *storage.Entry, file *storage.File, name string, res fileResult, client debrid.Client) fileResult {
+func (r *Repair) probeTorrentFileByUnrestrict(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, client debrid.Client, payloadProbe bool) fileResult {
 	placement := entry.GetActiveProvider()
 	if placement == nil {
 		res.reason = "placement_not_found"
@@ -507,18 +855,20 @@ func (r *Repair) probeTorrentFileByUnrestrict(entry *storage.Entry, file *storag
 		return res
 	}
 
-	debridFile := &debridTypes.File{
-		Id:        placementFile.Id,
-		Link:      placementFile.Link,
-		Path:      placementFile.Path,
-		Name:      file.Name,
-		Size:      file.Size,
-		ByteRange: file.ByteRange,
-		Deleted:   file.Deleted,
-	}
-	downloadLink, err := client.GetDownloadLink(placement.ID, debridFile)
+	downloadLink, err := client.GetDownloadLink(placement.ID, torrentProbeFile(placementFile, file))
 	if err == nil && !downloadLink.Empty() {
-		res.healthy = true
+		if !payloadProbe {
+			res.healthy = true
+			return res
+		}
+		// An unrestricted link that resolves still proves nothing about the
+		// bytes behind it; fetch a bounded window of them.
+		return r.verifyPayload(ctx, res, "provider", func(probeCtx context.Context) (int64, error) {
+			return r.readPayloadFromURL(probeCtx, entry, file, name, downloadLink.DownloadLink)
+		})
+	}
+	if errors.Is(err, debridTypes.ErrAvailabilityIndeterminate) {
+		res.reason = "provider_probe_indeterminate"
 		return res
 	}
 	if err == nil || errors.Is(err, debridTypes.EmptyDownloadLinkError) || errors.Is(err, customerror.HosterUnavailableError) {
@@ -534,41 +884,228 @@ func (r *Repair) probeTorrentFileByUnrestrict(entry *storage.Entry, file *storag
 	return res
 }
 
-// autoHealResults walks broken torrent infohashes and tries one re-insert per
+func torrentProbeFile(placementFile *storage.ProviderFile, file *storage.File) *debridTypes.File {
+	return &debridTypes.File{
+		Id:        placementFile.Id,
+		Link:      placementFile.Link,
+		Path:      placementFile.Path,
+		Name:      file.Name,
+		Size:      file.Size,
+		ByteRange: file.ByteRange,
+		Deleted:   file.Deleted,
+	}
+}
+
+// verifyPayload runs one bounded real-payload read and folds its outcome into
+// the three-way probe discipline:
+//
+//	bytes transferred            -> healthy
+//	definitive dead-content      -> broken
+//	zero bytes without an error  -> broken (a "successful" empty body is the
+//	                                exact shape of the bug this exists to catch)
+//	anything else (transport,    -> unknown; NEVER healthy, and never actionable
+//	timeout, cancellation, auth)
+func (r *Repair) verifyPayload(ctx context.Context, res fileResult, kind string, read func(context.Context) (int64, error)) fileResult {
+	probeCtx, cancel := context.WithTimeout(ctx, repairProbeReadTimeout)
+	defer cancel()
+
+	n, err := read(probeCtx)
+	switch {
+	case err == nil && n > 0:
+		res.healthy = true
+	case isDeadContentVerdict(err):
+		res.broken = true
+		res.reason = kind + "_payload_missing"
+	case err == nil:
+		res.broken = true
+		res.reason = kind + "_payload_empty"
+	default:
+		res.reason = kind + "_payload_indeterminate"
+	}
+	return res
+}
+
+// readTorrentPayload resolves a download link directly through the provider
+// client and transfers a bounded window of real bytes.
+//
+// It deliberately does NOT go through Manager.Stream / linkService.GetLink: that
+// path triggers re-insertion cycles as a side effect of a failed link, which a
+// read-only CHECK must never do to a whole library.
+func (r *Repair) readTorrentPayload(ctx context.Context, entry *storage.Entry, file *storage.File, name string, client debrid.Client) (int64, error) {
+	placement := entry.GetActiveProvider()
+	if placement == nil {
+		return 0, fmt.Errorf("placement not found for entry %s", entry.InfoHash)
+	}
+	placementFile := placement.Files[name]
+	if placementFile == nil {
+		return 0, fmt.Errorf("placement file %q not found", name)
+	}
+	downloadLink, err := client.GetDownloadLink(placement.ID, torrentProbeFile(placementFile, file))
+	if err != nil {
+		return 0, err
+	}
+	if downloadLink.Empty() {
+		return 0, debridTypes.EmptyDownloadLinkError
+	}
+	return r.readPayloadFromURL(ctx, entry, file, name, downloadLink.DownloadLink)
+}
+
+// readPayloadFromURL transfers a bounded window at each sampled offset through
+// the same HTTP streaming code a client read uses, so a definitive 410 or a
+// truncated/empty body is classified identically to a real playback failure.
+//
+// It samples a ladder of offsets rather than just the head: a file can serve its
+// head perfectly and be dead mid-file (measured in production at the 75% mark),
+// so a head-only read would report such a file healthy.
+func (r *Repair) readPayloadFromURL(ctx context.Context, entry *storage.Entry, file *storage.File, name, url string) (int64, error) {
+	if url == "" {
+		return 0, debridTypes.EmptyDownloadLinkError
+	}
+	target := file
+	if entry.Files != nil {
+		if authoritative, ok := entry.Files[name]; ok && authoritative != nil {
+			target = authoritative
+		}
+	}
+	if target == nil {
+		return 0, fmt.Errorf("file %q not found in entry %s", name, entry.InfoHash)
+	}
+	if target.Size <= 0 {
+		return 0, fmt.Errorf("file %q has no readable bytes", name)
+	}
+	window := int64(repairProbeReadBytes)
+	if window > target.Size {
+		window = target.Size
+	}
+
+	var total int64
+	for _, off := range usenet.SampleOffsets(target.Size, window, repairProbeSamplePoints) {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		counter := &countingWriter{}
+		accepted := false
+		err := r.manager.streamHTTPURL(ctx, url, entry.ActiveProvider, target, name, off, off+window-1, true, counter,
+			func(*StreamMetadata) error {
+				// Reached only after the upstream status was accepted, i.e. the
+				// server promised this range.
+				accepted = true
+				return nil
+			})
+		if accepted && counter.n == 0 {
+			// The upstream committed a success status for the range and then
+			// delivered NOTHING. That is the exact signature of a dead region
+			// (curl reports CURLE_PARTIAL_FILE), not a transport hiccup: a
+			// dropped connection normally fails before the status or after some
+			// bytes. Treat it as definitively gone rather than healthy.
+			return total, customerror.NewContentGoneError(
+				fmt.Errorf("file %q returned a success status with zero bytes at offset %d", name, off))
+		}
+		if err != nil {
+			return total + counter.n, err
+		}
+		total += counter.n
+	}
+	return total, nil
+}
+
+// autoHealResults walks every broken infohash and tries one re-insert per
 // infohash (singleflighted). On success, every file in that infohash group is
-// marked healthy. Returns the number of infohashes REPAIR successfully
-// re-acquired, for the run's Reacquired outcome counter.
-func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal *healCache) int {
+// marked healthy.
+//
+// The protocol gate lives on the ENTRY, not on the fileResult. The old filter
+// (`res.protocol != config.ProtocolTorrent`) was wrong in both directions: it
+// silently excluded every nzb entry — so an nzb could never be repaired and,
+// worse, nothing said so — and it also excluded TORRENTS whose fileResult never
+// got a protocol stamped (the `entry_not_found` path returns before
+// `res.protocol = entry.Protocol`). Grouping by infohash and asking the
+// authoritative Entry.CanBeFixed() fixes both and turns every exclusion into a
+// counted, named skip instead of a bare `continue`.
+//
+// nzb is genuinely NOT repairable here, and that is a statement about usenet,
+// not an oversight: REPAIR means "re-insert the item across debrid providers"
+// (Fixer.FixTorrent, gated by Entry.CanBeFixed() == IsTorrent()). A usenet
+// entry has no placement to re-insert; its articles either still exist on the
+// news servers or they do not. Re-parsing the staged NZB asks the same
+// providers for the same message ids and cannot resurrect a 430 or a
+// payload-less article. A dead nzb is recovered by RE-GRAB (a fresh NZB from
+// the indexer) or PRUNE.
+func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal *healCache) repairAttempt {
 	byHash := make(map[string][]int)
+	noHash := false
 	for i, res := range results {
-		if !res.broken || res.protocol != config.ProtocolTorrent || res.infoHash == "" {
+		if !res.broken {
+			continue
+		}
+		if res.infoHash == "" {
+			noHash = true
 			continue
 		}
 		byHash[res.infoHash] = append(byHash[res.infoHash], i)
 	}
 	if len(byHash) == 0 {
-		return 0
+		if noHash {
+			return repairAttempt{skip: reasonRepairNoInfohash}
+		}
+		return repairAttempt{}
 	}
-	reacquired := 0
+
+	var attempt repairAttempt
 	for infoHash, indices := range byHash {
-		entry, err := r.manager.GetEntry(infoHash)
-		if err != nil || entry == nil {
+		if !r.tryReacquireInfoHash(ctx, infoHash, "", heal, &attempt) {
 			continue
 		}
-		err = heal.do(infoHash, func() error {
-			return r.manager.ReinsertEntry(ctx, entry)
-		})
-		if err != nil {
-			continue
-		}
-		reacquired++
 		for _, i := range indices {
 			results[i].broken = false
 			results[i].healthy = true
 			results[i].reason = "repaired"
 		}
 	}
-	return reacquired
+	return attempt
+}
+
+// tryReacquireInfoHash runs the REPAIR component for ONE infohash and folds the
+// outcome into attempt. It is the single definition of "what REPAIR can act
+// on", shared by the inline sweep path (autoHealResults) and the batch
+// no-reprobe path (reacquireDeadEntry) so the two cannot drift — they had
+// already drifted into two different, and differently wrong, protocol filters.
+//
+// heal may be nil (the batch path has no per-run memo); healCache.do handles it.
+// Every negative outcome is counted and named on attempt rather than dropped.
+func (r *Repair) tryReacquireInfoHash(ctx context.Context, infoHash, entryName string, heal *healCache, attempt *repairAttempt) bool {
+	log := r.logger.With().Str("component", "REPAIR").Str("infohash", infoHash).Logger()
+	if entryName != "" {
+		log = log.With().Str("entry", entryName).Logger()
+	}
+
+	entry, err := r.manager.GetEntry(infoHash)
+	if err != nil || entry == nil {
+		attempt.unsupported++
+		attempt.skip = reasonRepairEntryMissing
+		log.Debug().Msg("REPAIR: entry row is gone; nothing to re-acquire")
+		return false
+	}
+	if !entry.CanBeFixed() {
+		attempt.unsupported++
+		attempt.skip = reasonRepairUnsupportedProtocol + ":" + string(entry.Protocol)
+		log.Debug().Str("protocol", string(entry.Protocol)).
+			Msg("REPAIR: protocol has no re-acquire path (only torrents can be re-inserted); leaving dead for PRUNE/RE-GRAB")
+		return false
+	}
+
+	attempt.attempted = true
+	if err := heal.do(infoHash, func() error { return r.manager.ReinsertEntry(ctx, entry) }); err != nil {
+		// A FAILED repair must be counted and named. As a bare `continue` it
+		// produced reacquired=0 AND repair_failed=0 AND last_repair_at=never,
+		// all at once — a run record in which a failed attempt and no attempt
+		// at all look exactly the same.
+		attempt.failed++
+		attempt.err = err.Error()
+		log.Debug().Err(err).Msg("REPAIR: re-acquire failed; leaving dead for PRUNE/RE-GRAB")
+		return false
+	}
+	attempt.reacquired++
+	return true
 }
 
 // brokenFiles flattens broken results into BrokenFile records, attaching Arr
@@ -671,42 +1208,79 @@ func (r *Repair) repairBroken(ctx context.Context, run *storage.RepairRun, healt
 
 // reacquireDeadEntry is the REPAIR component on the batch (no-reprobe) path used
 // by FixBroken and the stop-schedule post-stop pass: it re-inserts the dead
-// item's broken torrent infohashes across providers. On success (every broken
-// torrent re-acquired) it clears the entry's broken health so the next CHECK
-// confirms it, records the Reacquired outcome, and returns true so the caller
-// skips the destructive components for this item. Non-destructive: it never
-// consumes a deletion slot and makes ZERO arr calls.
+// item's broken infohashes across providers. On success (every broken infohash
+// re-acquired) it clears the entry's broken health so the next CHECK confirms
+// it, records the Reacquired outcome, and returns true so the caller skips the
+// destructive components for this item. Non-destructive: it never consumes a
+// deletion slot and makes ZERO arr calls.
+//
+// THIS IS WHERE `/api/repair/fix` WENT INERT. The old selector was
+//
+//	if bf.Protocol == config.ProtocolTorrent && bf.InfoHash != "" { ... }
+//	if len(hashes) == 0 { return false }
+//
+// so a FixBroken run with REPAIR selected over broken entries that are nzb — or
+// whose BrokenFile.Protocol was never stamped, which is what the
+// `missing_infohash` / `entry_not_found` probe paths produce — collected zero
+// hashes and returned false WITHOUT a counter, a log line or a reason. Control
+// then fell into actOnDeadEntry, which with prune=false and regrab=false
+// returned just as silently. The result is a completed run over N candidates
+// with every counter at zero and started_at == completed_at.
+//
+// Now: the protocol capability is asked of the authoritative Entry
+// (CanBeFixed), every exclusion is counted and named, and a failed attempt
+// stamps LastRepairAt so it is distinguishable from no attempt at all.
 func (r *Repair) reacquireDeadEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth) bool {
 	if h == nil || h.Status != storage.HealthBroken {
 		return false
 	}
 	hashes := make(map[string]struct{})
 	for _, bf := range h.BrokenFiles {
-		if bf.Protocol == config.ProtocolTorrent && bf.InfoHash != "" {
+		if bf.InfoHash != "" {
 			hashes[bf.InfoHash] = struct{}{}
 		}
 	}
+
+	var attempt repairAttempt
 	if len(hashes) == 0 {
-		return false
+		attempt.skip = reasonRepairNoInfohash
 	}
+	// The entry is only healed when EVERY broken infohash re-acquires; a
+	// partial success leaves it dead for the destructive components.
+	healed := len(hashes) > 0
 	for hash := range hashes {
 		if ctx != nil && ctx.Err() != nil {
-			return false
+			healed = false
+			break
 		}
-		entry, err := r.manager.GetEntry(hash)
-		if err != nil || entry == nil {
-			return false
-		}
-		if err := r.manager.ReinsertEntry(ctx, entry); err != nil {
-			r.logger.Debug().Err(err).Str("component", "REPAIR").Str("entry", name).Str("infohash", hash).Msg("REPAIR: re-acquire failed; leaving dead for PRUNE/RE-GRAB")
-			return false
+		if !r.tryReacquireInfoHash(ctx, hash, name, nil, &attempt) {
+			healed = false
 		}
 	}
+
+	if statsMu != nil && run != nil && (attempt.failed > 0 || attempt.unsupported > 0 || (healed && attempt.reacquired > 0)) {
+		statsMu.Lock()
+		run.Stats.RepairFailed += attempt.failed
+		run.Stats.RepairSkippedUnsupported += attempt.unsupported
+		if healed && attempt.reacquired > 0 {
+			run.Stats.Reacquired++
+		}
+		r.saveRun(run)
+		statsMu.Unlock()
+	}
+
+	if !healed || attempt.reacquired == 0 {
+		// Record the attempt on the health record BEFORE returning so the
+		// failure is durable, then let the destructive components have their
+		// turn. markBrokenHealthCleared is not reached, so this save is the
+		// only thing that writes the reason.
+		r.applyRepairAttempt(h, attempt)
+		r.saveHealth(h)
+		return false
+	}
+
 	r.logger.Info().Str("component", "REPAIR").Str("entry", name).Msg("REPAIR: re-acquired dead item across providers")
-	statsMu.Lock()
-	run.Stats.Reacquired++
-	r.saveRun(run)
-	statsMu.Unlock()
+	r.applyRepairAttempt(h, attempt)
 	r.markBrokenHealthCleared(h, time.Now())
 	return true
 }
@@ -723,21 +1297,36 @@ func entryHealthHasArrLink(h *storage.EntryHealth) bool {
 	return false
 }
 
-// pruneEligible reports whether PRUNE may delete this entry decypharr-side.
+// pruneIneligibleReason returns "" when PRUNE may delete this entry
+// decypharr-side, otherwise the machine-readable reason it may not.
+//
 // Only fully-broken entries (every file dead) are deletable, so a
 // partially-broken entry keeps its healthy files' symlinks. Requires at least
-// one infohash to delete by.
-func pruneEligible(h *storage.EntryHealth) bool {
-	if h.BrokenCount == 0 || h.BrokenCount != h.FileCount {
-		return false
+// one infohash to delete by. THIS POLICY IS CORRECT AND UNCHANGED — refusing to
+// delete a 13-file entry because 5 of its files are dead is the right call.
+//
+// What was wrong is that the refusal was invisible. A run over three
+// partially-broken entries reported pruned=0 with no counter, no reason and
+// nothing in the run record: identical to PRUNE being broken. The reason now
+// lands on the health record (EntryHealth.ActionSkips) and the count lands on
+// the run (RepairRunStats.PruneSkippedNotEligible).
+func pruneIneligibleReason(h *storage.EntryHealth) string {
+	if h == nil || h.BrokenCount == 0 {
+		return reasonPruneNoBrokenFiles
+	}
+	if h.BrokenCount != h.FileCount {
+		return reasonPrunePartialEntry
 	}
 	for _, bf := range h.BrokenFiles {
 		if bf.InfoHash != "" {
-			return true
+			return ""
 		}
 	}
-	return false
+	return reasonPruneNoInfohash
 }
+
+// pruneEligible reports whether PRUNE may delete this entry decypharr-side.
+func pruneEligible(h *storage.EntryHealth) bool { return pruneIneligibleReason(h) == "" }
 
 // actOnDeadEntry runs the destructive pipeline for one dead item after CHECK
 // found it dead and REPAIR (if enabled) failed to re-acquire it. PRUNE and
@@ -755,15 +1344,37 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 		return
 	}
 
-	wantRegrab := actions.regrab && entryHealthHasArrLink(h)
-	wantPrune := actions.prune && pruneEligible(h)
-	if actions.regrab && !wantRegrab {
+	// Every decline below is counted on the run and named on the health record.
+	// A destructive component that correctly refuses to act is otherwise
+	// indistinguishable from one that is broken: the operator sees pruned=0 and
+	// has no way to learn whether PRUNE declined, errored, or never ran.
+	pruneSkip := ""
+	if actions.prune {
+		pruneSkip = pruneIneligibleReason(h)
+	}
+	regrabSkip := ""
+	if actions.regrab && !entryHealthHasArrLink(h) {
+		regrabSkip = reasonRegrabNoArrLink
+	}
+
+	wantRegrab := actions.regrab && regrabSkip == ""
+	wantPrune := actions.prune && pruneSkip == ""
+
+	if regrabSkip != "" {
 		r.logger.Debug().Str("component", "RE-GRAB").Str("entry", name).Msg("RE-GRAB: no arr link resolved for dead item; cannot re-grab it")
 	}
+	if pruneSkip != "" {
+		r.logger.Debug().Str("component", "PRUNE").Str("entry", name).
+			Str("reason", pruneSkip).
+			Int("broken_files", h.BrokenCount).Int("total_files", h.FileCount).
+			Msg("PRUNE: declined to delete dead item decypharr-side (partial entries keep their surviving files' symlinks)")
+	}
+
 	if !wantRegrab && !wantPrune {
 		// Nothing destructive to do (no arr link and not prune-eligible): don't
 		// consume a deletion slot. Non-destructive probes/re-inserts never count
 		// against the cap.
+		r.recordActionSkips(run, statsMu, h, pruneSkip, regrabSkip)
 		return
 	}
 
@@ -771,8 +1382,16 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 	// PRUNE). If the run's cap is exhausted, skip ALL destructive actions for
 	// this entry and leave it dead so it is re-picked next run.
 	if !budget.reserve() {
+		if wantPrune {
+			pruneSkip = reasonDeletionCapReached
+		}
+		if wantRegrab {
+			regrabSkip = reasonDeletionCapReached
+		}
+		r.recordActionSkips(run, statsMu, h, pruneSkip, regrabSkip)
 		return
 	}
+	r.recordActionSkips(run, statsMu, h, pruneSkip, regrabSkip)
 
 	// RE-GRAB first (arr-side), then PRUNE (decypharr-side). Both read only from
 	// the in-memory health record, so order doesn't couple them; RE-GRAB runs
@@ -786,6 +1405,38 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 		r.saveRun(run)
 		statsMu.Unlock()
 	}
+}
+
+// recordActionSkips persists why PRUNE / RE-GRAB declined to act on this entry
+// and counts the decline on the run. An empty reason CLEARS that component's
+// stale skip, so the health record always describes the most recent run that
+// considered the entry rather than accumulating history.
+//
+// A deletion-cap skip is deliberately NOT counted here: it already has its own
+// run counter (DeletionCapSkipped, from the budget) and counting it as an
+// eligibility decline would misreport a capped run as a policy refusal. The
+// reason still lands on the health record so a per-entry lookup explains it.
+func (r *Repair) recordActionSkips(run *storage.RepairRun, statsMu *sync.Mutex, h *storage.EntryHealth, pruneSkip, regrabSkip string) {
+	if h == nil {
+		return
+	}
+	h.SetActionSkip(componentPrune, pruneSkip)
+	h.SetActionSkip(componentRegrab, regrabSkip)
+
+	countPrune := pruneSkip != "" && pruneSkip != reasonDeletionCapReached
+	countRegrab := regrabSkip != "" && regrabSkip != reasonDeletionCapReached
+	if (countPrune || countRegrab) && run != nil && statsMu != nil {
+		statsMu.Lock()
+		if countPrune {
+			run.Stats.PruneSkippedNotEligible++
+		}
+		if countRegrab {
+			run.Stats.RegrabSkippedNoArrLink++
+		}
+		r.saveRun(run)
+		statsMu.Unlock()
+	}
+	r.saveHealth(h)
 }
 
 // regrabDeadEntry is the RE-GRAB component: the ONLY arr-coupled action. For a
@@ -920,7 +1571,12 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	if err := a.DeleteFiles(ctx, files); err != nil {
 		r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Repair: DeleteFiles failed")
 		statsMu.Lock()
-		run.Stats.RepairFailed += len(files)
+		// RegrabFailed, not RepairFailed: this is an arr-side RE-GRAB delete
+		// that errored, which is a different event from a REPAIR (re-acquire)
+		// attempt failing. They shared a counter, so `repair_failed` could not
+		// answer "did REPAIR fail?" — the question the operator actually had.
+		// The run logs already called this one `regrab_failed`.
+		run.Stats.RegrabFailed += len(files)
 		r.saveRun(run)
 		statsMu.Unlock()
 		return false
@@ -1338,7 +1994,15 @@ func (r *Repair) FixBroken(ctx context.Context, names []string, sel *ManualActio
 		ctx = r.parentCtx
 	}
 
-	actions := r.resolveManualActions(sel, true)
+	// Pass the caller's REAL intent as the legacy fix flag instead of a
+	// hardcoded true: the fallback to the configured knobs is what "no
+	// selection supplied" means, and nothing else. Hardcoding true here is
+	// what compounded the all-false footgun — an explicit "run no components"
+	// selection resolved to the operator's configured (possibly destructive)
+	// knobs. resolveManualActions now short-circuits that shape on its own, and
+	// this keeps the two consistent: sel == nil ⇒ configured knobs, an explicit
+	// all-false sel ⇒ no components ⇒ the error below.
+	actions := r.resolveManualActions(sel, sel == nil)
 	if !actions.any() {
 		return nil, errors.New("no repair action selected: enable REPAIR, PRUNE, or RE-GRAB")
 	}
@@ -1413,9 +2077,13 @@ func (r *Repair) FixBroken(ctx context.Context, names []string, sel *ManualActio
 			Str("run_id", run.ID).
 			Int("candidates", run.Stats.Candidates).
 			Int("reacquired", run.Stats.Reacquired).
+			Int("repair_failed", run.Stats.RepairFailed).
+			Int("repair_skipped_unsupported", run.Stats.RepairSkippedUnsupported).
 			Int("pruned", run.Stats.Pruned).
+			Int("prune_skipped_not_eligible", run.Stats.PruneSkippedNotEligible).
 			Int("regrabbed", run.Stats.Regrabbed).
-			Int("regrab_failed", run.Stats.RepairFailed).
+			Int("regrab_failed", run.Stats.RegrabFailed).
+			Int("regrab_skipped_no_arr_link", run.Stats.RegrabSkippedNoArrLink).
 			Int("deletions", run.Stats.Deletions).
 			Int("deletion_cap_skipped", run.Stats.DeletionCapSkipped).
 			Msg("FixBroken: completed")
@@ -1463,11 +2131,15 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, sel *Manual
 		}
 		pseudo := &storage.RepairRun{ID: runID, Stats: storage.RepairRunStats{}}
 		var statsMu sync.Mutex
-		// Single entry is inherently bounded, so it uses an unlimited budget
-		// (nil) and is never blocked by the per-run cap. actOnDeadEntry applies
-		// only the destructive components (PRUNE/RE-GRAB); REPAIR already ran
-		// inline above.
-		r.actOnDeadEntry(ctx, pseudo, &statsMu, entryName, final, actions, nil)
+		// Carry a real budget even though a single entry is inherently bounded.
+		// max_deletions_per_run is the ONLY guard against a mass-delete, so no
+		// path that can reach a destructive action may run uncapped: nil here
+		// meant this entry point silently opted out of the cap. actOnDeadEntry
+		// applies only the destructive components (PRUNE/RE-GRAB); REPAIR
+		// already ran inline above.
+		budget := r.newDeletionBudget(runID)
+		r.actOnDeadEntry(ctx, pseudo, &statsMu, entryName, final, actions, budget)
+		recordBudgetStats(pseudo, budget)
 	})
 
 	// Return an in-memory ack reflecting the freshly-started recheck. The
@@ -1589,9 +2261,13 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 	for name := range candidates {
 		mediaNames = append(mediaNames, name)
 	}
-	// A media recheck is user-scoped to a single media id (inherently bounded),
-	// so it runs with an unlimited budget (nil) and is never blocked by the cap.
-	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{}, actions, nil)
+	// A media id can resolve to a whole series' worth of entries, so this path
+	// is NOT inherently bounded and must honour max_deletions_per_run exactly
+	// like the scheduled sweep. It previously passed a nil (unlimited) budget,
+	// which bypassed the cap entirely.
+	budget := r.newDeletionBudget(run.ID)
+	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{}, actions, budget)
+	recordBudgetStats(run, budget)
 	candidates = nil
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1688,6 +2364,32 @@ func orderedFilenames(item *storage.EntryItem) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// topIndeterminateReason returns the dominant reason among results that reached
+// NO verdict (neither healthy nor broken), so an `unknown` entry can say WHY it
+// is unknown. Without it the per-file reason was computed by every probe path
+// and then thrown away, because only broken results are flattened into
+// BrokenFiles — leaving a library of `unknown` entries with an empty
+// failure_reason and no way to tell a mis-configured usenet client from a
+// rate-limited provider from a stalled substrate.
+func topIndeterminateReason(results []fileResult) string {
+	counts := make(map[string]int)
+	for _, res := range results {
+		if res.healthy || res.broken || res.reason == "" {
+			continue
+		}
+		counts[res.reason]++
+	}
+	best, bestN := "", 0
+	for reason, n := range counts {
+		// Ties break on the lexicographically smaller reason so the recorded
+		// value is deterministic across runs (map iteration is not).
+		if n > bestN || (n == bestN && reason < best) {
+			best, bestN = reason, n
+		}
+	}
+	return best
 }
 
 func topReason(files []storage.BrokenFile) string {

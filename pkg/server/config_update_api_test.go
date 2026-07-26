@@ -25,16 +25,42 @@ const apiTestConfigJSON = `{
   "arrs": [{"name": "radarr", "host": "http://radarr:7878", "token": "tok"}]
 }`
 
-func setupConfigAPITest(t *testing.T) string {
+// apiTestNestedConfigJSON adds a repair block with every destructive-action
+// safeguard set, for the nested-merge tests below.
+const apiTestNestedConfigJSON = `{
+  "log_level": "info",
+  "download_folder": "/downloads",
+  "debrids": [{"name": "rd", "provider": "realdebrid", "api_key": "rd-key"}],
+  "repair": {
+    "enabled": true,
+    "source": "managed",
+    "schedule": "0 3 * * *",
+    "stop_schedule": "06:00",
+    "workers": 3,
+    "max_deletions_per_run": 5,
+    "repair": false,
+    "prune": true,
+    "regrab": true,
+    "arrs": ["sonarr", "radarr"]
+  }
+}`
+
+func setupConfigAPITestWith(t *testing.T, fixture string) string {
 	t.Helper()
 	config.Reset()
 	t.Cleanup(config.Reset)
 	dir := t.TempDir()
 	config.SetConfigPath(dir)
 	cfgFile := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(cfgFile, []byte(apiTestConfigJSON), 0644); err != nil {
+	if err := os.WriteFile(cfgFile, []byte(fixture), 0644); err != nil {
 		t.Fatalf("write initial config: %v", err)
 	}
+	return cfgFile
+}
+
+func setupConfigAPITest(t *testing.T) string {
+	t.Helper()
+	cfgFile := setupConfigAPITestWith(t, apiTestConfigJSON)
 	if cfg := config.Get(); len(cfg.Debrids) != 2 {
 		t.Fatalf("fixture did not load: %+v", cfg.Debrids)
 	}
@@ -171,5 +197,85 @@ func TestHandleUpdateConfigFullPostOverwrites(t *testing.T) {
 	}
 	if saved.DownloadFolder != "/new-downloads" || saved.LogLevel != "trace" {
 		t.Fatalf("full POST fields not applied: folder=%q level=%q", saved.DownloadFolder, saved.LogLevel)
+	}
+}
+
+// TestHandleUpdateConfigNestedPartialPostPreservesSafetyKnobs is the end-to-end
+// regression for the nested half of the wipe. The merge used to run at the TOP
+// LEVEL only, so a POST carrying {"repair":{"enabled":true}} replaced the whole
+// repair block on disk — zeroing max_deletions_per_run (the destructive-action
+// cap), stop_schedule, prune and regrab — and answered 200.
+//
+// The body also changes log_level, a cold field, so the handler takes the
+// restart branch and never touches the (nil) manager.
+func TestHandleUpdateConfigNestedPartialPostPreservesSafetyKnobs(t *testing.T) {
+	cfgFile := setupConfigAPITestWith(t, apiTestNestedConfigJSON)
+	if got := config.Get().Repair.MaxDeletionsPerRun; got != 5 {
+		t.Fatalf("fixture did not load: max_deletions_per_run = %d", got)
+	}
+
+	rec := postConfigUpdate(t, `{"log_level":"debug","repair":{"enabled":true}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	saved := readSavedConfig(t, cfgFile)
+	if saved.LogLevel != "debug" || !saved.Repair.Enabled {
+		t.Fatalf("posted values not applied: %+v", saved.Repair)
+	}
+	if saved.Repair.MaxDeletionsPerRun != 5 {
+		t.Fatalf("nested partial POST wiped max_deletions_per_run: %d", saved.Repair.MaxDeletionsPerRun)
+	}
+	if saved.Repair.StopSchedule != "06:00" {
+		t.Fatalf("nested partial POST wiped stop_schedule: %q", saved.Repair.StopSchedule)
+	}
+	if !saved.Repair.Prune || !saved.Repair.Regrab {
+		t.Fatalf("nested partial POST wiped prune/regrab: %+v", saved.Repair)
+	}
+	if saved.Repair.Schedule != "0 3 * * *" || saved.Repair.Source != config.RepairSourceManaged || saved.Repair.Workers != 3 {
+		t.Fatalf("nested partial POST wiped scheduling fields: %+v", saved.Repair)
+	}
+	if saved.Repair.Repair == nil || *saved.Repair.Repair {
+		t.Fatalf("nested partial POST lost the repair:false tri-state: %v", saved.Repair.Repair)
+	}
+	if len(saved.Repair.Arrs) != 2 {
+		t.Fatalf("nested partial POST wiped repair.arrs: %+v", saved.Repair.Arrs)
+	}
+	if len(saved.Debrids) != 1 || saved.Debrids[0].APIKey != "rd-key" {
+		t.Fatalf("omitted top-level sections were not preserved: %+v", saved.Debrids)
+	}
+}
+
+// TestHandleUpdateConfigNestedExplicitValuesStillApply: within a posted
+// section, an explicit zero/false/empty is a real instruction — otherwise the
+// operator could never clear the cap or turn a knob off through this endpoint.
+// An explicitly posted array still replaces the stored one wholesale.
+func TestHandleUpdateConfigNestedExplicitValuesStillApply(t *testing.T) {
+	cfgFile := setupConfigAPITestWith(t, apiTestNestedConfigJSON)
+
+	body := `{"log_level":"debug","repair":{"max_deletions_per_run":-1,"stop_schedule":"","prune":false,"regrab":false,"repair":true,"arrs":["radarr"]}}`
+	rec := postConfigUpdate(t, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	saved := readSavedConfig(t, cfgFile)
+	if saved.Repair.MaxDeletionsPerRun != -1 {
+		t.Fatalf("explicit max_deletions_per_run:-1 not applied: %d", saved.Repair.MaxDeletionsPerRun)
+	}
+	if saved.Repair.StopSchedule != "" {
+		t.Fatalf("explicit stop_schedule:\"\" not applied: %q", saved.Repair.StopSchedule)
+	}
+	if saved.Repair.Prune || saved.Repair.Regrab {
+		t.Fatalf("explicit prune/regrab:false not applied: %+v", saved.Repair)
+	}
+	if saved.Repair.Repair == nil || !*saved.Repair.Repair {
+		t.Fatalf("explicit repair:true not applied: %v", saved.Repair.Repair)
+	}
+	if len(saved.Repair.Arrs) != 1 || saved.Repair.Arrs[0] != "radarr" {
+		t.Fatalf("explicitly posted repair.arrs did not replace wholesale: %+v", saved.Repair.Arrs)
+	}
+	if !saved.Repair.Enabled || saved.Repair.Schedule != "0 3 * * *" {
+		t.Fatalf("unmentioned repair fields were not preserved: %+v", saved.Repair)
 	}
 }

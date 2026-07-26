@@ -29,7 +29,25 @@ import (
 
 const (
 	bufferSize = 256 * 1024 // 256KB buffer for streaming
+
+	// streamFirstChunkSize bounds how much decoded payload a stream obtains
+	// BEFORE it commits the response status and headers. It only has to prove
+	// the article exists and decodes to real bytes; the segment backing those
+	// bytes is downloaded whole regardless, so a larger value would not cost an
+	// extra fetch and a smaller one would not save one.
+	streamFirstChunkSize = 64 * 1024
+
+	// readableProbeBytes is the default bounded payload the repair probe reads
+	// to prove a file is actually servable. See CheckFileReadable.
+	readableProbeBytes = 64 * 1024
 )
+
+// ErrAvailabilityIndeterminate means an availability check could not reach a
+// verdict: the NNTP substrate failed before any provider answered about the
+// article itself. It is neither "healthy" nor "broken" — reporting healthy
+// makes a dead provider look fine (broken_count 0), and reporting broken would
+// let one provider outage condemn a whole library.
+var ErrAvailabilityIndeterminate = errors.New("usenet availability indeterminate")
 
 var streamBufferPool = sync.Pool{
 	New: func() any {
@@ -768,6 +786,18 @@ func (u *Usenet) checkNZBAvailability(ctx context.Context, nzb *storage.NZB) err
 			return ctx.Err()
 		}
 		if err := u.CheckFileAvailability(ctx, file, samplePercent); err != nil {
+			if errors.Is(err, ErrAvailabilityIndeterminate) {
+				// No verdict was reached (connection/system failures only).
+				// This gate has always been fail-open for that case and must
+				// stay so: a provider hiccup must never fail an import. Only
+				// the repair probe needs to tell "unknown" from "healthy".
+				u.logger.Warn().
+					Err(err).
+					Str("nzb_id", nzb.ID).
+					Str("file", file.Name).
+					Msg("Post-parse availability check reached no verdict; not failing the import")
+				continue
+			}
 			u.logger.Warn().
 				Err(err).
 				Str("nzb_id", nzb.ID).
@@ -801,6 +831,130 @@ func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFil
 	return u.checkAvailability(ctx, file.Name, u.sampleSegments(file.Segments, samplePercent))
 }
 
+// CheckFileReadable proves a file is actually SERVABLE by moving real bytes:
+// it downloads and yEnc-decodes a bounded window at each of several offsets
+// spread across the file, through the same reader stack a client read uses,
+// and returns the total number of payload bytes produced.
+//
+// A STAT-only probe moves zero bytes, which is exactly why a stubbed article —
+// present on the provider but carrying no yEnc payload — reported healthy while
+// every read of it failed. Only a decoded byte disproves that.
+//
+// A GOOD HEAD IS NOT PROOF OF HEALTH. Measured on a live 3.2 GB file: offsets
+// 0, 25% and 50% each served 256 KiB fine, 75% returned a success status with
+// ZERO bytes, and the tail returned a permanent 410. Reading only the first
+// chunk would have called that file healthy. Hence the offset ladder.
+//
+// Cost control: the probe reader is built with read-ahead disabled and a single
+// connection, so it fetches only the segments backing the windows it reads
+// (~750 KB each for a typical post) instead of a 16 MB streaming window, and it
+// does not disturb (or inherit) the shared streaming reader cache. The whole
+// reader, including its disk buffer, is torn down before returning.
+//
+// Errors are returned unwrapped so the caller can classify them: a definitive
+// content-missing verdict means dead, anything else means indeterminate.
+func (u *Usenet) CheckFileReadable(ctx context.Context, nzoID, filename string, window int64, points int) (int64, error) {
+	if window <= 0 {
+		window = readableProbeBytes
+	}
+	file, err := u.getFile(nzoID, filename)
+	if err != nil {
+		return 0, err
+	}
+	if err := u.preStreamChecks(file); err != nil {
+		return 0, err
+	}
+	volumes := GetFileVolumes(file)
+	if len(volumes) == 0 {
+		return 0, fmt.Errorf("no volumes available for file %s", filename)
+	}
+
+	probeFS, err := fs.NewFS(ctx, u.nntp, 1, 0, volumes, u.logger, fs.WithDownloadTimeout(u.downloadTimeout))
+	if err != nil {
+		return 0, fmt.Errorf("create probe reader for %q: %w", filename, err)
+	}
+	readerAt, size, cleanup, err := probeFS.CreateReaderAtForVolume(volumes[0])
+	if err != nil {
+		return 0, fmt.Errorf("create probe reader for %q: %w", filename, err)
+	}
+	defer cleanup()
+
+	if size <= 0 {
+		return 0, fmt.Errorf("file %q has no readable bytes", filename)
+	}
+	if window > size {
+		window = size
+	}
+
+	buf := make([]byte, window)
+	var total int64
+	for _, off := range SampleOffsets(size, window, points) {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, readErr := readerAt.ReadAtContext(ctx, buf, off)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return total, readErr
+		}
+		if n <= 0 {
+			// A read that "succeeds" with no bytes is the exact shape of a dead
+			// region: the segment map promises data the article cannot deliver.
+			return total, customerror.NewArticleNotFoundError(
+				fmt.Errorf("file %q decoded to zero bytes at offset %d", filename, off))
+		}
+		total += int64(n)
+	}
+	if total <= 0 {
+		return 0, customerror.NewArticleNotFoundError(fmt.Errorf("file %q decoded to zero bytes", filename))
+	}
+	return total, nil
+}
+
+// SampleOffsets spreads `points` read windows of `window` bytes across a file of
+// `size` bytes: the head, evenly spaced interior offsets, and always the tail
+// window last so the very end of the file is covered. Offsets are clamped so a
+// window never runs past EOF, and duplicates are dropped, which is what makes
+// small files degrade to one or two reads instead of several overlapping ones.
+//
+// With points=5 this reproduces the head / 25% / 50% / 75% / tail ladder that
+// localized a mid-file dead region in production.
+func SampleOffsets(size, window int64, points int) []int64 {
+	if size <= 0 || window <= 0 {
+		return nil
+	}
+	if size <= window {
+		return []int64{0}
+	}
+	if points < 1 {
+		points = 1
+	}
+	maxOff := size - window
+	offsets := make([]int64, 0, points)
+	seen := make(map[int64]struct{}, points)
+	add := func(off int64) {
+		if off < 0 {
+			off = 0
+		}
+		if off > maxOff {
+			off = maxOff
+		}
+		if _, ok := seen[off]; ok {
+			return
+		}
+		seen[off] = struct{}{}
+		offsets = append(offsets, off)
+	}
+	if points == 1 {
+		add(0)
+		return offsets
+	}
+	for i := range points - 1 {
+		add(size * int64(i) / int64(points-1))
+	}
+	add(maxOff)
+	return offsets
+}
+
 // checkAvailability batch-STATs the given sampled message ids. The NNTP client
 // gates each worker through its internal repair bank so concurrent availability
 // checks don't starve streaming connections.
@@ -814,30 +968,53 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		// Connection/system error - log and continue (don't fail availability check)
+	}
+	return u.classifyAvailability(fileName, len(messageIDs), result, err)
+}
+
+// classifyAvailability turns one BatchStat outcome into a three-way verdict:
+// nil (every sampled segment answered present), UsenetSegmentMissingError (at
+// least one segment is definitively gone on every provider), or
+// ErrAvailabilityIndeterminate (the substrate failed, so no verdict exists).
+//
+// The indeterminate case used to return nil. That is what let a dead or
+// unreachable provider probe "healthy" with broken_count 0. It must not report
+// broken either: one provider outage would otherwise condemn a whole library.
+func (u *Usenet) classifyAvailability(fileName string, sampled int, result *nntp.BatchStatResult, err error) error {
+	if err != nil || result == nil {
+		if err == nil {
+			err = fmt.Errorf("no batch result")
+		}
 		u.logger.Warn().
 			Err(err).
 			Str("file", fileName).
-			Msg("Non-fatal error during availability check, ignoring")
-		return nil
+			Msg("Availability check reached no verdict (substrate error); reporting indeterminate")
+		return fmt.Errorf("%w for %q: %v", ErrAvailabilityIndeterminate, fileName, err)
 	}
 
 	// Check if all sampled segments are available.
 	// Distinguish genuine article-not-found from connection errors:
 	//   TotalCount = FoundCount + notFoundCount + ErrorCount
 	// Only treat a file as unavailable when segments are definitively missing
-	// (notFoundCount > 0). Connection errors mean we couldn't check — treat
-	// those the same as the top-level error path above (non-fatal, skip check).
+	// (notFoundCount > 0).
 	if !result.AllAvailable() {
 		notFoundCount := result.TotalCount - result.FoundCount - result.ErrorCount
 		if result.ErrorCount > 0 && notFoundCount == 0 {
-			// All failures were connection errors, not missing articles.
-			return nil
+			// All failures were connection errors, not missing articles: no
+			// verdict either way, so this is indeterminate rather than healthy.
+			u.logger.Warn().
+				Str("file", fileName).
+				Int("sampled_segments", sampled).
+				Int("available_segments", result.FoundCount).
+				Int("error_count", result.ErrorCount).
+				Msg("Availability check saw only connection errors; reporting indeterminate")
+			return fmt.Errorf("%w for %q: %d of %d sampled segments failed with connection errors",
+				ErrAvailabilityIndeterminate, fileName, result.ErrorCount, result.TotalCount)
 		}
 		// At least some segments are definitively missing.
 		u.logger.Warn().
 			Str("file", fileName).
-			Int("sampled_segments", len(messageIDs)).
+			Int("sampled_segments", sampled).
 			Int("available_segments", result.FoundCount).
 			Int("missing_segments", notFoundCount).
 			Int("error_count", result.ErrorCount).
@@ -1241,29 +1418,6 @@ func (u *Usenet) streamForGeneration(ctx context.Context, nzoID, generation, fil
 		return fmt.Errorf("invalid reader byte range %d-%d for size %d", rangeStart, rangeEnd, readerSize)
 	}
 	u.runLifecycleTestHook("stream-reader-acquired", nzoID)
-	readyInfo := StreamReadyInfo{Size: readerSize, Start: rangeStart, End: rangeEnd}
-	if generation != "" {
-		// Serialize the final current-generation check with replacement through
-		// the readiness callback. Replacement may proceed once headers are
-		// committed; the retained fsEntry remains safe for this response, and a
-		// later 430 is still conditionally fenced by its generation.
-		unlockLifecycle := u.lockNZBLifecycle(nzoID)
-		if _, generationErr := u.nzbStorage.assertGenerationWithLifecycleHeld(nzoID, generation); generationErr != nil {
-			unlockLifecycle()
-			return generationErr
-		}
-		if onReady != nil {
-			if readyErr := onReady(readyInfo); readyErr != nil {
-				unlockLifecycle()
-				return readyErr
-			}
-		}
-		unlockLifecycle()
-	} else if onReady != nil {
-		if err := onReady(readyInfo); err != nil {
-			return err
-		}
-	}
 
 	length := rangeEnd - rangeStart + 1
 
@@ -1290,19 +1444,87 @@ func (u *Usenet) streamForGeneration(ctx context.Context, nzoID, generation, fil
 	buf := acquireStreamBuffer()
 	defer releaseStreamBuffer(buf)
 
-	// Use a safe copy loop that checks context and validates read counts
-	_, err = safeCopyBuffer(ctx, progressWriter{Writer: writer, progress: deadline.Progress}, section, buf)
+	// Obtain the FIRST decoded payload bytes before any status line or header
+	// is committed.
+	//
+	// Committing 206 + Content-Length first and only then discovering that the
+	// article carries no yEnc payload produced a "successful" response with an
+	// empty body: rclone/FUSE never saw an error, re-requested every ~63s
+	// forever, and readers piled up in D-state. Proving at least one real byte
+	// exists first means such a file now fails with a genuine HTTP error status
+	// (410 Gone for a definitive dead verdict) BEFORE headers are written.
+	//
+	// The primed bytes are the head of the response body. They are written
+	// exactly once, in order, immediately after onReady and before the copy
+	// loop resumes from the very same section reader, so no byte is dropped or
+	// duplicated for any range.
+	primeLen := int64(streamFirstChunkSize)
+	if primeLen > length {
+		primeLen = length
+	}
+	if primeLen > int64(len(buf)) {
+		primeLen = int64(len(buf))
+	}
+	primed, primeErr := io.ReadAtLeast(section, buf[:primeLen], 1)
+	if primeErr != nil {
+		return u.classifyStreamFailure(ctx, nzoID, ufsEntry.generation, filename, primeErr)
+	}
 
-	// Handle context cancellation explicitly
-	if err != nil && ctx.Err() != nil {
+	readyInfo := StreamReadyInfo{Size: readerSize, Start: rangeStart, End: rangeEnd}
+	if generation != "" {
+		// Serialize the final current-generation check with replacement through
+		// the readiness callback. Replacement may proceed once headers are
+		// committed; the retained fsEntry remains safe for this response, and a
+		// later 430 is still conditionally fenced by its generation.
+		unlockLifecycle := u.lockNZBLifecycle(nzoID)
+		if _, generationErr := u.nzbStorage.assertGenerationWithLifecycleHeld(nzoID, generation); generationErr != nil {
+			unlockLifecycle()
+			return generationErr
+		}
+		if onReady != nil {
+			if readyErr := onReady(readyInfo); readyErr != nil {
+				unlockLifecycle()
+				return readyErr
+			}
+		}
+		unlockLifecycle()
+	} else if onReady != nil {
+		if err := onReady(readyInfo); err != nil {
+			return err
+		}
+	}
+
+	out := progressWriter{Writer: writer, progress: deadline.Progress}
+	if nw, writeErr := out.Write(buf[:primed]); writeErr != nil {
+		return writeErr
+	} else if nw != primed {
+		return io.ErrShortWrite
+	}
+	if int64(primed) == length {
+		// The whole requested range fit in the primed chunk.
+		return nil
+	}
+
+	// Use a safe copy loop that checks context and validates read counts
+	_, err = safeCopyBuffer(ctx, out, section, buf)
+	return u.classifyStreamFailure(ctx, nzoID, ufsEntry.generation, filename, err)
+}
+
+// classifyStreamFailure maps a stream read/copy failure onto the response
+// error, preserving the historical precedence: an aborted context wins over
+// everything, then a definitive content-missing verdict is recorded durably
+// (and surfaces as a permanent 410) so later requests short-circuit instead of
+// re-fetching a dead article on every retry.
+func (u *Usenet) classifyStreamFailure(ctx context.Context, nzoID, generation, filename string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
 		return contextError(ctx)
 	}
-
-	// Mark file as failed if article not found (permanent error)
-	if err != nil && nntp.IsArticleNotFoundError(err) {
-		return u.recordPermanentArticleFailureForGeneration(nzoID, ufsEntry.generation, filename, err)
+	if nntp.IsContentMissingError(err) {
+		return u.recordPermanentArticleFailureForGeneration(nzoID, generation, filename, err)
 	}
-
 	return err
 }
 

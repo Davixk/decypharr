@@ -35,44 +35,15 @@
                         <i class="bi bi-bug mr-1"></i>View broken
                         <span id="brokenCountBadge" class="badge badge-error badge-sm ml-1 hidden">0</span>
                     </button>
-                    <div class="dropdown dropdown-end" id="actBrokenDropdown">
-                        <div tabindex="0" role="button" id="actBrokenBtn"
-                             class="btn btn-error btn-outline btn-sm"
-                             title="Act on all currently broken entries">
-                            <i class="bi bi-tools mr-1"></i>Act on broken
-                            <i class="bi bi-chevron-down ml-1"></i>
-                        </div>
-                        <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow-xl w-80 p-2 z-20 mt-1">
-                            <li class="menu-title text-[11px] uppercase tracking-wide">Act on all broken entries</li>
-                            <li>
-                                <button type="button" data-fix-action="repair">
-                                    <i class="bi bi-arrow-repeat text-info"></i>
-                                    <span class="flex flex-col items-start gap-0.5">
-                                        <span class="font-semibold">REPAIR</span>
-                                        <span class="text-[11px] opacity-60 whitespace-normal leading-tight">Re-acquire on the same or a backup provider (non-destructive).</span>
-                                    </span>
-                                </button>
-                            </li>
-                            <li>
-                                <button type="button" data-fix-action="prune">
-                                    <i class="bi bi-scissors text-warning"></i>
-                                    <span class="flex flex-col items-start gap-0.5">
-                                        <span class="font-semibold">PRUNE</span>
-                                        <span class="text-[11px] opacity-60 whitespace-normal leading-tight">Delete decypharr-side only; the arr keeps monitoring and re-searches.</span>
-                                    </span>
-                                </button>
-                            </li>
-                            <li>
-                                <button type="button" data-fix-action="regrab">
-                                    <i class="bi bi-bandaid text-error"></i>
-                                    <span class="flex flex-col items-start gap-0.5">
-                                        <span class="font-semibold">RE-GRAB</span>
-                                        <span class="text-[11px] opacity-60 whitespace-normal leading-tight">Arr delete + blocklist + search (arr-coupled).</span>
-                                    </span>
-                                </button>
-                            </li>
-                        </ul>
-                    </div>
+                    <!-- Opens the select-MANY "act on broken" modal. Deliberately a
+                         real, always-clickable button: when the action is unavailable
+                         JS marks it aria-disabled and a click explains why, so a
+                         disabled state is never mistaken for a broken control. -->
+                    <button type="button" id="actBrokenBtn" class="btn btn-error btn-outline btn-sm"
+                            aria-haspopup="dialog" aria-disabled="false"
+                            title="Act on all currently broken entries">
+                        <i class="bi bi-tools mr-1"></i>Act on broken
+                    </button>
                     <button id="clearStateBtn" class="btn btn-warning btn-outline btn-sm"
                             title="Clear persisted repair state locally">
                         <i class="bi bi-eraser mr-1"></i>Clear State
@@ -201,9 +172,9 @@
                         <th>Status</th>
                         <th title="CHECK: entries probed">Checked</th>
                         <th title="CHECK: entries found dead">Broken</th>
-                        <th title="REPAIR: dead items re-acquired">Repaired</th>
-                        <th title="PRUNE: entries deleted decypharr-side">Pruned</th>
-                        <th title="RE-GRAB: arr delete + search">Re-grabbed</th>
+                        <th title="REPAIR: dead items re-acquired; (fail N) attempts that errored, (n/a N) declined because the protocol cannot be re-acquired — nzb entries can only be RE-GRABbed or PRUNEd">Repaired</th>
+                        <th title="PRUNE: entries deleted decypharr-side; (skipped N) declined because only some files in the entry are broken">Pruned</th>
+                        <th title="RE-GRAB: arr delete + search; (fail N) arr-side failures, (no arr N) declined because the entry has no arr link">Re-grabbed</th>
                         <th title="Entries deleted this run (PRUNE + RE-GRAB); (+N) left by the per-run cap">Deletions</th>
                         <th>Duration</th>
                         <th>Error</th>
@@ -308,6 +279,78 @@
                 <button type="submit" class="btn btn-primary" id="runRepairSubmitBtn">
                     <i class="bi bi-play-fill mr-1"></i>Run
                 </button>
+            </div>
+        </form>
+    </div>
+    <form method="dialog" class="modal-backdrop">
+        <button>close</button>
+    </form>
+</dialog>
+
+<!-- Act on broken modal (select-MANY) -->
+<!-- REPAIR / PRUNE / RE-GRAB are independent and COMPOSE: any combination is
+     valid and is sent as ONE POST /api/repair/fix. Step 1 picks components,
+     step 2 confirms them by name before anything destructive runs. -->
+<dialog id="actBrokenModal" class="modal">
+    <div class="modal-box max-w-2xl">
+        <form method="dialog">
+            <button class="btn btn-sm btn-circle btn-ghost absolute right-3 top-3" aria-label="Close">✕</button>
+        </form>
+        <h3 class="font-bold text-lg flex items-center gap-2 mb-1 pr-10">
+            <i class="bi bi-tools text-error"></i>Act on broken entries
+        </h3>
+        <p class="text-sm opacity-70 mb-4">
+            Applies to all <span class="font-semibold" id="actBrokenTargetCount">0</span> currently broken entries,
+            without re-probing them. Components are independent — tick any combination and they run together in one pass.
+        </p>
+
+        <form id="actBrokenForm">
+            <div id="actBrokenPicker" class="space-y-3">
+                <div class="grid grid-cols-1 gap-2">
+                    <label class="label cursor-pointer justify-start items-start gap-3 rounded border border-base-300 px-3 py-2">
+                        <input type="checkbox" class="checkbox checkbox-info checkbox-sm mt-0.5" id="actBrokenRepair"
+                               data-act-component="repair">
+                        <span class="label-text flex flex-col items-start gap-0.5">
+                            <span class="font-semibold">REPAIR
+                                <span class="badge badge-ghost badge-xs ml-1">non-destructive</span></span>
+                            <span class="text-xs opacity-60 whitespace-normal leading-tight">Re-acquire on the same or a backup provider.</span>
+                        </span>
+                    </label>
+                    <label class="label cursor-pointer justify-start items-start gap-3 rounded border border-base-300 px-3 py-2">
+                        <input type="checkbox" class="checkbox checkbox-warning checkbox-sm mt-0.5" id="actBrokenPrune"
+                               data-act-component="prune">
+                        <span class="label-text flex flex-col items-start gap-0.5">
+                            <span class="font-semibold">PRUNE
+                                <span class="badge badge-warning badge-xs ml-1">deletes</span></span>
+                            <span class="text-xs opacity-60 whitespace-normal leading-tight">Delete decypharr-side only; the arr keeps monitoring and re-searches.</span>
+                        </span>
+                    </label>
+                    <label class="label cursor-pointer justify-start items-start gap-3 rounded border border-base-300 px-3 py-2">
+                        <input type="checkbox" class="checkbox checkbox-error checkbox-sm mt-0.5" id="actBrokenRegrab"
+                               data-act-component="regrab">
+                        <span class="label-text flex flex-col items-start gap-0.5">
+                            <span class="font-semibold">RE-GRAB
+                                <span class="badge badge-error badge-xs ml-1">deletes</span></span>
+                            <span class="text-xs opacity-60 whitespace-normal leading-tight">Arr delete + blocklist + search (arr-coupled).</span>
+                        </span>
+                    </label>
+                </div>
+                <div id="actBrokenError" class="text-error text-sm hidden"></div>
+            </div>
+
+            <div id="actBrokenConfirm" class="hidden">
+                <div role="alert" class="alert alert-warning items-start">
+                    <i class="bi bi-exclamation-triangle text-xl"></i>
+                    <div>
+                        <h4 class="font-bold">Confirm: <span id="actBrokenConfirmComponents">—</span></h4>
+                        <div class="text-sm" id="actBrokenConfirmDetail"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-action">
+                <button type="button" class="btn btn-ghost" id="actBrokenBackBtn">Cancel</button>
+                <button type="submit" class="btn btn-error" id="actBrokenApplyBtn">Continue</button>
             </div>
         </form>
     </div>

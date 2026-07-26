@@ -11,6 +11,11 @@ class RepairManager {
         this.brokenState = {items: [], page: 1, pageSize: 25};
         this.repairConfig = {};
         this.latestStatus = {};
+        // "Act on broken" modal state. actBrokenBlockedReason is null when the
+        // action is available and otherwise holds the human-readable reason it
+        // is not — the button stays clickable and reports that reason.
+        this.actBrokenStep = 'picker';
+        this.actBrokenBlockedReason = null;
         this.bind();
         this.loadAll();
     }
@@ -19,14 +24,20 @@ class RepairManager {
         const $ = (id) => document.getElementById(id);
         $('runNowBtn')?.addEventListener('click', () => this.openRunModal());
         $('stopRunBtn')?.addEventListener('click', () => this.stopRun());
-        // "Act on broken" dropdown: each item drives a single component
-        // (REPAIR / PRUNE / RE-GRAB) over the whole broken set.
-        document.querySelectorAll('#actBrokenDropdown [data-fix-action]').forEach((btn) => {
-            btn.addEventListener('click', () => {
-                if (document.getElementById('actBrokenBtn')?.classList.contains('btn-disabled')) return;
-                this.fixBroken(btn.getAttribute('data-fix-action'));
-                document.activeElement?.blur?.();
-            });
+        // "Act on broken": select-MANY over the whole broken set. REPAIR /
+        // PRUNE / RE-GRAB compose, so the modal collects any combination and
+        // sends them in a single request.
+        $('actBrokenBtn')?.addEventListener('click', () => this.openActBrokenModal());
+        $('actBrokenForm')?.addEventListener('submit', (e) => {
+            e.preventDefault();
+            this.actBrokenAdvance();
+        });
+        $('actBrokenBackBtn')?.addEventListener('click', () => {
+            if (this.actBrokenStep === 'confirm') {
+                this.setActBrokenStep('picker');
+                return;
+            }
+            $('actBrokenModal')?.close?.();
         });
         $('clearStateBtn')?.addEventListener('click', () => this.openClearStateModal());
         $('viewBrokenBtn')?.addEventListener('click', () => this.openBrokenModal());
@@ -231,9 +242,13 @@ class RepairManager {
                 <div>Checked: <strong>${stats.probed ?? 0}</strong></div>
                 <div class="${stats.broken ? 'text-error' : ''}">Broken: <strong>${stats.broken ?? 0}</strong></div>
                 <div class="${stats.reacquired ? 'text-success' : ''}">Repaired: <strong>${stats.reacquired ?? 0}</strong></div>
+                <div class="${stats.repair_failed ? 'text-error' : ''}" title="${RepairManager.STAT_TITLES.repair_failed}">Repair fail: <strong>${stats.repair_failed ?? 0}</strong></div>
+                <div class="${stats.repair_skipped_unsupported ? 'text-warning' : ''}" title="${RepairManager.STAT_TITLES.repair_skipped_unsupported}">Repair n/a: <strong>${stats.repair_skipped_unsupported ?? 0}</strong></div>
                 <div class="${stats.pruned ? 'text-warning' : ''}">Pruned: <strong>${stats.pruned ?? 0}</strong></div>
+                <div class="${stats.prune_skipped_not_eligible ? 'text-warning' : ''}" title="${RepairManager.STAT_TITLES.prune_skipped_not_eligible}">Prune skipped: <strong>${stats.prune_skipped_not_eligible ?? 0}</strong></div>
                 <div class="${stats.regrabbed ? 'text-info' : ''}">Re-grabbed: <strong>${stats.regrabbed ?? 0}</strong></div>
-                <div class="${stats.repair_failed ? 'text-error' : ''}">Re-grab fail: <strong>${stats.repair_failed ?? 0}</strong></div>
+                <div class="${stats.regrab_failed ? 'text-error' : ''}" title="${RepairManager.STAT_TITLES.regrab_failed}">Re-grab fail: <strong>${stats.regrab_failed ?? 0}</strong></div>
+                <div class="${stats.regrab_skipped_no_arr_link ? 'text-warning' : ''}" title="${RepairManager.STAT_TITLES.regrab_skipped_no_arr_link}">Re-grab no arr: <strong>${stats.regrab_skipped_no_arr_link ?? 0}</strong></div>
             </div>
             ${run.error ? `<div class="mt-2 text-error text-xs">${this.escape(run.error)}</div>` : ''}
         `;
@@ -281,26 +296,127 @@ class RepairManager {
         }
     }
 
-    // fixBroken posts /repair/fix with a SINGLE component selected, over the
-    // whole broken set. component ∈ {repair, prune, regrab}.
-    async fixBroken(component) {
-        const meta = this.fixComponentMeta(component);
-        if (!confirm(`Run ${meta.label} on every currently broken entry?\n\n${meta.label} = ${meta.desc}.`)) return;
-        const btn = document.getElementById('actBrokenBtn');
-        btn?.classList.add('btn-disabled');
+    // ---- "Act on broken" (select-many) ----------------------------------
+
+    // selectedFixComponents returns the ticked components in canonical
+    // REPAIR → PRUNE → RE-GRAB order.
+    selectedFixComponents() {
+        return ['repair', 'prune', 'regrab'].filter((c) =>
+            !!document.querySelector(`#actBrokenModal [data-act-component="${c}"]`)?.checked);
+    }
+
+    openActBrokenModal() {
+        // The button is never inert: when the action is unavailable, say why
+        // instead of silently doing nothing.
+        if (this.actBrokenBlockedReason) {
+            this.toast(this.actBrokenBlockedReason, 'info');
+            return;
+        }
+        const modal = document.getElementById('actBrokenModal');
+        if (!modal) return;
+        document.querySelectorAll('#actBrokenModal [data-act-component]').forEach((cb) => {
+            cb.checked = false;
+        });
+        const count = document.getElementById('actBrokenTargetCount');
+        if (count) count.textContent = (this.latestStatus.health_counts || {}).broken || 0;
+        this.setActBrokenStep('picker');
+        if (typeof modal.showModal === 'function') {
+            modal.showModal();
+        } else {
+            modal.setAttribute('open', '');
+        }
+    }
+
+    setActBrokenStep(step) {
+        this.actBrokenStep = step === 'confirm' ? 'confirm' : 'picker';
+        const onConfirm = this.actBrokenStep === 'confirm';
+        document.getElementById('actBrokenPicker')?.classList.toggle('hidden', onConfirm);
+        document.getElementById('actBrokenConfirm')?.classList.toggle('hidden', !onConfirm);
+        const back = document.getElementById('actBrokenBackBtn');
+        if (back) back.textContent = onConfirm ? 'Back' : 'Cancel';
+        const apply = document.getElementById('actBrokenApplyBtn');
+        if (apply) {
+            apply.disabled = false;
+            apply.textContent = onConfirm
+                ? `Run ${this.selectedFixComponents().map((c) => this.fixComponentMeta(c).label).join(' + ')}`
+                : 'Continue';
+        }
+        if (!onConfirm) document.getElementById('actBrokenError')?.classList.add('hidden');
+    }
+
+    // actBrokenAdvance drives picker → confirm → send. Nothing is posted until
+    // the operator has seen the confirmation naming the exact components.
+    actBrokenAdvance() {
+        const components = this.selectedFixComponents();
+        const error = document.getElementById('actBrokenError');
+        if (!components.length) {
+            if (error) {
+                error.textContent = 'Pick at least one component to run.';
+                error.classList.remove('hidden');
+            }
+            return;
+        }
+        error?.classList.add('hidden');
+        if (this.actBrokenStep !== 'confirm') {
+            this.renderActBrokenConfirm(components);
+            this.setActBrokenStep('confirm');
+            return;
+        }
+        this.fixBroken(components);
+    }
+
+    // renderActBrokenConfirm names EXACTLY which components will run and calls
+    // out the destructive ones (PRUNE / RE-GRAB) before anything is sent.
+    renderActBrokenConfirm(components) {
+        const labels = components.map((c) => this.fixComponentMeta(c).label);
+        const target = document.getElementById('actBrokenConfirmComponents');
+        if (target) target.textContent = labels.join(' + ');
+        const detail = document.getElementById('actBrokenConfirmDetail');
+        if (!detail) return;
+        const broken = (this.latestStatus.health_counts || {}).broken || 0;
+        const destructive = components.filter((c) => c !== 'repair');
+        const rows = components.map((c) => {
+            const meta = this.fixComponentMeta(c);
+            return `<li><span class="font-semibold">${this.escape(meta.label)}</span> — ${this.escape(meta.desc)}</li>`;
+        }).join('');
+        detail.innerHTML = `
+            <p>Running on all <strong>${broken}</strong> currently broken entr${broken === 1 ? 'y' : 'ies'}:</p>
+            <ul class="list-disc list-inside mt-1 space-y-0.5">${rows}</ul>
+            ${destructive.length
+                ? `<p class="mt-2 font-semibold">${destructive.map((c) => this.fixComponentMeta(c).label).join(' and ')} delete${destructive.length === 1 ? 's' : ''} files. This cannot be undone.</p>`
+                : `<p class="mt-2 opacity-70">REPAIR is non-destructive — nothing is deleted.</p>`}
+        `;
+    }
+
+    // fixBroken posts /repair/fix ONCE for every selected component over the
+    // whole broken set. components ⊆ {repair, prune, regrab} and compose, so
+    // two ticked components mean one request with both flags true.
+    async fixBroken(components) {
+        const list = (Array.isArray(components) ? components : [components]).filter(Boolean);
+        if (!list.length) return;
+        const labels = list.map((c) => this.fixComponentMeta(c).label).join(' + ');
+        const apply = document.getElementById('actBrokenApplyBtn');
+        if (apply) apply.disabled = true;
         try {
             const res = await fetch(`${this.api}/repair/fix`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({actions: {[component]: true}}),
+                body: JSON.stringify({
+                    actions: {
+                        repair: list.includes('repair'),
+                        prune: list.includes('prune'),
+                        regrab: list.includes('regrab'),
+                    },
+                }),
             });
             const text = await res.text();
             if (!res.ok) throw new Error(text || `HTTP ${res.status}`);
-            this.toast(`${meta.label} started`, 'success');
+            document.getElementById('actBrokenModal')?.close?.();
+            this.toast(`${labels} started`, 'success');
             window.location.reload();
         } catch (e) {
-            this.toast(`${meta.label} failed: ${e.message}`, 'error');
-            btn?.classList.remove('btn-disabled');
+            this.toast(`${labels} failed: ${e.message}`, 'error');
+            if (apply) apply.disabled = false;
         }
     }
 
@@ -416,8 +532,21 @@ class RepairManager {
 
         const brokenCount = (status.health_counts || {}).broken || 0;
         this.updateBrokenCount(brokenCount);
+        // "Act on broken" availability. NOTE: do NOT use daisyUI's .btn-disabled
+        // here — it sets pointer-events:none, so the click never lands and the
+        // control is indistinguishable from a broken one. Keep it clickable and
+        // let the click explain itself via openActBrokenModal().
+        this.actBrokenBlockedReason = status.active_run
+            ? 'A repair run is already in progress — wait for it to finish before acting on broken entries.'
+            : (brokenCount === 0 ? 'Nothing to act on: there are no broken entries right now.' : null);
         const act = document.getElementById('actBrokenBtn');
-        if (act) act.classList.toggle('btn-disabled', !!status.active_run || brokenCount === 0);
+        if (act) {
+            const blocked = !!this.actBrokenBlockedReason;
+            act.setAttribute('aria-disabled', blocked ? 'true' : 'false');
+            act.classList.toggle('opacity-50', blocked);
+            act.classList.toggle('cursor-not-allowed', blocked);
+            act.title = this.actBrokenBlockedReason || 'Act on all currently broken entries';
+        }
         const clear = document.getElementById('clearStateBtn');
         if (clear) clear.disabled = !!status.active_run;
         const view = document.getElementById('viewBrokenBtn');
@@ -469,13 +598,21 @@ class RepairManager {
 
     renderRunStats(container, stats) {
         if (!container) return;
+        // Grouped by component: the outcome first, then that component's
+        // failures and its principled declines. A decline is not a failure, so
+        // it gets its own tile rather than being folded into the failure count.
         const fields = [
             ['candidates', 'Candidates'],
             ['probed', 'Checked'],
             ['broken', 'Broken'],
             ['reacquired', 'Repaired'],
+            ['repair_failed', 'Repair fail'],
+            ['repair_skipped_unsupported', 'Repair n/a'],
             ['pruned', 'Pruned'],
+            ['prune_skipped_not_eligible', 'Prune skipped'],
             ['regrabbed', 'Re-grabbed'],
+            ['regrab_failed', 'Re-grab fail'],
+            ['regrab_skipped_no_arr_link', 'Re-grab no arr'],
             ['deletions', 'Deletions'],
             ['deletion_cap_skipped', 'Cap-skipped'],
         ];
@@ -483,6 +620,8 @@ class RepairManager {
         for (const [k, label] of fields) {
             const el = document.createElement('div');
             el.className = 'bg-base-100 rounded p-2';
+            const title = RepairManager.STAT_TITLES[k];
+            if (title) el.setAttribute('title', title);
             el.innerHTML = `<div class="text-[10px] opacity-60 uppercase">${label}</div><div class="font-mono">${stats[k] || 0}</div>`;
             container.appendChild(el);
         }
@@ -599,6 +738,7 @@ class RepairManager {
             detail.innerHTML = `
                 <td colspan="9" class="bg-base-200/40 p-0">
                     <div class="p-4 space-y-2">
+                        ${this.renderEntryDiagnostics(h)}
                         ${this.renderBrokenFiles(h.broken_files || [])}
                     </div>
                 </td>
@@ -623,6 +763,26 @@ class RepairManager {
             });
         }
         this.renderBrokenPagination();
+    }
+
+    // renderEntryDiagnostics explains, per entry, why the last run's components
+    // did not fix it: last_repair_error is a REPAIR attempt that FAILED, while
+    // action_skips holds the per-component reason a component DECLINED to act
+    // (a decline is not a failure). Both are omitted entirely when absent, so
+    // the expanded row keeps its current shape for healthy-path entries.
+    renderEntryDiagnostics(h) {
+        const rows = [];
+        if (h.last_repair_error) {
+            rows.push(`<div><span class="font-semibold text-error">REPAIR failed:</span> ${this.escape(h.last_repair_error)}</div>`);
+        }
+        const skips = h.action_skips || {};
+        const labels = {repair: 'REPAIR', prune: 'PRUNE', regrab: 'RE-GRAB'};
+        for (const key of ['repair', 'prune', 'regrab']) {
+            if (!skips[key]) continue;
+            rows.push(`<div><span class="font-semibold text-warning">${labels[key]} declined:</span> ${this.escape(skips[key])}</div>`);
+        }
+        if (!rows.length) return '';
+        return `<div class="rounded bg-base-100 p-3 text-xs space-y-1">${rows.join('')}</div>`;
     }
 
     renderBrokenPagination() {
@@ -769,18 +929,35 @@ class RepairManager {
             const deletionsCell = capSkipped
                 ? `${deletions} <span class="text-warning" title="left un-deleted by the per-run cap">(+${capSkipped})</span>`
                 : `${deletions}`;
+            // Each component's failures and principled declines ride along in
+            // its own column, following the Deletions cell's "(+N)" precedent:
+            // a bare "Repaired: 0" cannot tell "REPAIR is broken" apart from
+            // "every dead entry was an nzb, which REPAIR cannot re-acquire".
+            const annotate = (key, cls, label) => {
+                const n = s[key] ?? 0;
+                if (!n) return '';
+                return ` <span class="${cls} text-xs whitespace-nowrap" title="${RepairManager.STAT_TITLES[key]}">(${label} ${n})</span>`;
+            };
+            const repairedCell = `${s.reacquired ?? 0}`
+                + annotate('repair_failed', 'text-error', 'fail')
+                + annotate('repair_skipped_unsupported', 'text-warning', 'n/a');
+            const prunedCell = `${s.pruned ?? 0}`
+                + annotate('prune_skipped_not_eligible', 'text-warning', 'skipped');
+            const regrabbedCell = `${s.regrabbed ?? 0}`
+                + annotate('regrab_failed', 'text-error', 'fail')
+                + annotate('regrab_skipped_no_arr_link', 'text-warning', 'no arr');
             tr.innerHTML = `
                 <td class="font-mono text-sm">${start ? start.toLocaleString() : '-'}</td>
-                <td>${run.trigger || '-'}</td>
+                <td>${this.escape(run.trigger || '-')}</td>
                 <td>${this.statusBadge(run.status)}</td>
                 <td>${s.probed ?? 0}</td>
                 <td class="${s.broken ? 'text-error font-medium' : ''}">${s.broken ?? 0}</td>
-                <td class="${s.reacquired ? 'text-success font-medium' : ''}">${s.reacquired ?? 0}</td>
-                <td class="${s.pruned ? 'text-warning font-medium' : ''}">${s.pruned ?? 0}</td>
-                <td class="${s.regrabbed ? 'text-info font-medium' : ''}">${s.regrabbed ?? 0}</td>
+                <td class="${s.reacquired ? 'text-success font-medium' : ''}">${repairedCell}</td>
+                <td class="${s.pruned ? 'text-warning font-medium' : ''}">${prunedCell}</td>
+                <td class="${s.regrabbed ? 'text-info font-medium' : ''}">${regrabbedCell}</td>
                 <td class="${deletions ? 'font-medium' : ''}">${deletionsCell}</td>
                 <td>${duration}</td>
-                <td class="text-xs text-error">${run.error || ''}</td>
+                <td class="text-xs text-error">${this.escape(run.error || '')}</td>
             `;
             tbody.appendChild(tr);
         }
@@ -793,7 +970,7 @@ class RepairManager {
             failed: 'badge-error',
             cancelled: 'badge-warning',
         }[status] || 'badge-ghost';
-        return `<span class="badge ${cls}">${status || 'unknown'}</span>`;
+        return `<span class="badge ${cls}">${this.escape(status || 'unknown')}</span>`;
     }
 
     formatDuration(ms) {
@@ -812,10 +989,37 @@ class RepairManager {
     }
 
     toast(message, type = 'info') {
+        // common.js exposes the shared toast as window.createToast; the older
+        // names are kept only as fallbacks. Without this the repair page's
+        // toasts silently went to console.log and the user saw nothing.
+        // Pass the message RAW: createToast escapes it itself now (it is the
+        // single place that escapes), and escaping here too would render
+        // literal `&lt;` artifacts to the user.
+        if (typeof window.createToast === 'function') return window.createToast(message, type);
         if (typeof window.toast === 'function') return window.toast(message, type);
         if (typeof window.showToast === 'function') return window.showToast(message, type);
         console.log(`[${type}]`, message);
     }
 }
+
+// Human-readable explanations for the failure / decline counters, shared by
+// every surface that renders run stats so the wording can never drift apart.
+//
+// The three *skipped* counters exist because a component that DECLINES to act
+// is otherwise indistinguishable from one that silently broke: a run reporting
+// "repaired: 0" reads as "REPAIR is broken" when the truth may be "REPAIR
+// correctly refused — every dead entry was an nzb, which cannot be
+// re-acquired". They are rendered as visible counts, not hidden behind a
+// tooltip; the tooltip only carries the longer explanation.
+//
+// These strings are static literals — they are interpolated into HTML
+// attributes and must stay free of quotes and markup.
+RepairManager.STAT_TITLES = {
+    repair_failed: 'REPAIR: re-acquire attempts that errored',
+    repair_skipped_unsupported: 'REPAIR declined: the entry protocol cannot be re-acquired (nzb entries can only be RE-GRABbed or PRUNEd)',
+    prune_skipped_not_eligible: 'PRUNE declined: only some files in the entry are broken, so deleting the whole entry would be wrong',
+    regrab_failed: 'RE-GRAB: arr-side failures (file delete / blocklist / search)',
+    regrab_skipped_no_arr_link: 'RE-GRAB declined: the entry has no resolved arr link to route through',
+};
 
 window.RepairManager = RepairManager;

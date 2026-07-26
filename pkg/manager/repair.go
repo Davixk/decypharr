@@ -177,13 +177,27 @@ func (a *ManualActions) any() bool {
 // resolveManualActions maps an explicit component selection + the legacy fix
 // flag to the per-component action set for a user-initiated fix. Precedence:
 //
-//   - sel names ≥1 component            → exactly those components (single-
+//   - sel is non-nil but names NO component → NOTHING runs. An all-false
+//     selection is an EXPLICIT "no components", the opposite of "unspecified".
+//   - sel names ≥1 component                → exactly those components (single-
 //     component invocation, e.g. PRUNE-only, works here).
-//   - sel is nil/empty but fix == true  → fall back to the CONFIGURED
+//   - sel is nil but fix == true            → fall back to the CONFIGURED
 //     REPAIR/PRUNE/RE-GRAB knobs (back-compat with the old fix:true clients) —
 //     NOT force-all, fixing the previous force-all footgun.
-//   - otherwise                         → CHECK-only (no action).
+//   - otherwise                             → CHECK-only (no action).
+//
+// The first rule is the root-cause fix for the all-false footgun. Gating on
+// sel.any() alone made an explicit all-false selection indistinguishable from a
+// nil one, so it fell through to the configured knobs and could run PRUNE /
+// RE-GRAB on a request that asked for nothing. The HTTP layer now rejects that
+// shape with a 400 before it ever reaches here, but the guard belongs at the
+// source: every non-HTTP caller of FixBroken / RecheckEntry / RecheckMedia gets
+// it too, and the two layers agree rather than conflict (both resolve an
+// explicit all-false selection to "do nothing").
 func (r *Repair) resolveManualActions(sel *ManualActions, fix bool) repairActions {
+	if sel != nil && !sel.any() {
+		return repairActions{}
+	}
 	if sel.any() {
 		return repairActions{repair: sel.Repair, prune: sel.Prune, regrab: sel.Regrab}
 	}
@@ -279,9 +293,13 @@ func (r *Repair) maxDeletionsPerRun() int {
 // progressive — entries past the cap stay broken in storage and are re-picked
 // next run, so nothing is lost.
 //
-// A nil budget, or one whose limit is <= 0, is unlimited. Single-item /
-// user-scoped paths (RecheckEntry, RecheckMedia) pass nil so a legitimate
-// single action is never blocked by the cap.
+// A nil budget, or one whose limit is <= 0, is unlimited. EVERY path that can
+// reach a destructive action now builds a real budget — the scheduled sweep,
+// FixBroken, the stop-schedule pass, RecheckMedia AND RecheckEntry. The manual
+// recheck paths used to pass nil, silently opting out of the only guard against
+// a mass-delete; a single-entry recheck is bounded anyway, so carrying the
+// budget costs it nothing while closing the bypass. Only an explicitly
+// configured negative max_deletions_per_run disables the cap.
 type repairDeletionBudget struct {
 	limit    int
 	used     atomic.Int64

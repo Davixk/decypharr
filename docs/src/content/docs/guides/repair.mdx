@@ -26,7 +26,7 @@ When an entry's file set changes, its fingerprint is invalidated and the entry i
 
 ### Sweeps
 
-A **sweep** is a single pass that selects candidate entries, probes them, and (when `auto_repair` is on) attempts to fix the broken ones. Sweeps are recorded as **runs** (history-only — you cannot create a run by hand).
+A **sweep** is a single pass that selects candidate entries, probes them, and applies whichever of the `repair` / `prune` / `regrab` components are enabled to the broken ones. Sweeps are recorded as **runs** (history-only — you cannot create a run by hand).
 
 A sweep does not scan your whole library every time. It selects only entries where:
 
@@ -53,7 +53,10 @@ You can force a recheck on any one entry from the Browse UI or the API. This wor
     "strategy": "per_entry",
     "recheck_interval": "168h",
     "arrs": [],
-    "auto_repair": true,
+    "repair": true,
+    "prune": false,
+    "regrab": false,
+    "max_deletions_per_run": 100,
     "skip_nzb_repair": false,
     "notify_on_complete": false,
     "nntp_connection_percent": 20,
@@ -71,11 +74,37 @@ You can force a recheck on any one entry from the Browse UI or the API. This wor
 | `strategy`                | `per_entry` (stop after first broken file in an entry) or `per_file` (probe all files).  | `per_entry` |
 | `recheck_interval`        | How long a healthy entry's check stays fresh before it becomes a candidate again.        | `168h`      |
 | `arrs`                    | Optional filter when `source=arr`. Empty list means all eligible Arrs.                   | `[]`        |
-| `auto_repair`             | When `true`, brokens are repaired in the same sweep. When `false`, the sweep is detect-only. | `false` |
+| `auto_repair`             | **DEPRECATED and ignored.** Kept only so older configs still load. See the caution below. | — |
+| `repair`                  | REPAIR component: re-acquire a dead item from the providers. Non-destructive.            | `true` (when unset) |
+| `prune`                   | PRUNE component: delete the item decypharr-side only (never calls the Arr). Destructive. | `false`     |
+| `regrab`                  | RE-GRAB component: Arr delete + blocklist + re-search. Destructive.                      | `false`     |
+| `max_deletions_per_run`   | Caps how many entries one run may destructively act on. `0`/unset → `100`; negative → unlimited. | `100` |
 | `skip_nzb_repair`         | Skip NZB / Usenet entries during scheduled sweeps.                                      | `false` |
 | `notify_on_complete`      | Send a notification when a sweep finishes.                                               | `false`     |
 | `nntp_connection_percent` | Percentage of NNTP connections the probe is allowed to use. Avoids starving downloads.   | `20`        |
 | `stop_schedule`           | Optional cron expression, clock time, or interval. If a repair sweep is still running when this fires, it's stopped early. Leave empty to always run to completion. | — |
+
+:::caution[`auto_repair` no longer controls anything]
+What a sweep *does* to a dead item is decided by three independent component knobs — `repair`
+(re-acquire), `prune` (delete decypharr-side only) and `regrab` (Arr delete + blocklist + search) —
+not by `auto_repair`, which the resolver ignores entirely. A sweep is detect-only (CHECK-only)
+exactly when all three are off; setting `auto_repair: false` does **not** make it detect-only.
+Nothing is deleted until you opt into `prune` and/or `regrab`. Full behavior, including how the
+manual endpoints select components, is in the [API reference](/reference/api).
+:::
+
+:::caution[REPAIR cannot fix nzb entries — only torrents]
+`repair` (re-acquire) applies to **torrent entries only**. Re-acquisition for usenet is not
+sound: re-parsing the staged NZB asks the same providers for the same message-ids, so it cannot
+resurrect a missing or payload-less article. A dead nzb entry is recoverable only via `regrab`
+(fetch a fresh NZB through the Arr) or `prune` (delete decypharr-side and let the Arr re-search).
+
+So a REPAIR-only configuration on an nzb-heavy library fixes **nothing** — and until now it did
+so silently. Every entry REPAIR declines for this reason is counted as
+`repair_skipped_unsupported` in the run stats (shown on the repair page as **Repair n/a**, and
+per entry in the expanded broken-entry row). If that number is high, turn on `prune` and/or
+`regrab` — or set `skip_nzb_repair` to stop sweeping nzb entries at all.
+:::
 
 ### Stop schedule
 
@@ -83,9 +112,9 @@ You can force a recheck on any one entry from the Browse UI or the API. This wor
 
 - The repair sweep is cancelled at the next firing of `stop_schedule`, mid-probe if necessary. Entries not yet probed are left as they were before this repair sweep (their existing health and `next_check_due_at` are untouched, so they're picked up again on the next scheduled run).
 - The run is recorded as `completed` (not `cancelled`), with `cancel_reason` noting it was stopped by schedule.
-- What happens to entries this repair sweep *did* manage to probe and found broken is controlled by `auto_repair`, same as any other repair sweep:
-  - `auto_repair: true` repairs them via the normal Arr delete + re-search flow.
-  - `auto_repair: false` leaves them recorded as broken without triggering Arr repair.
+- What happens to entries this repair sweep *did* manage to probe and found broken is controlled by the enabled components, same as any other repair sweep:
+  - any of `repair` / `prune` / `regrab` on → those components are applied to what was found broken.
+  - all three off → the entries are just recorded as broken; nothing is re-acquired or deleted.
 
 #### Multi-day coverage
 
@@ -118,7 +147,7 @@ If a full repair sweep would take 2 days at 9 hours/day but `recheck_interval` i
 2. Candidates are selected per the rules above.
 3. For each candidate, the entry is marked `repairing` and probed by a worker.
 4. The entry's health is updated with the probe outcome (`healthy` / `broken` / `unknown`), broken files, fingerprint, and timestamps.
-5. If `auto_repair` is on and the entry has Arr-known broken files, they are batched per Arr and submitted via delete + search. After the repair attempt, only those entries are re-probed.
+5. If `regrab` is on and the entry has Arr-known broken files, they are batched per Arr and submitted via delete + search. After the repair attempt, only those entries are re-probed.
 6. The run record's stats are updated live throughout, so the status panel reflects progress without needing to wait for completion.
 
 A failure to persist a single entry's health update is logged but never aborts the sweep.
@@ -138,9 +167,9 @@ A failure to persist a single entry's health update is logged but never aborts t
 | Method   | Path                                  | Purpose                                                                  |
 |----------|---------------------------------------|--------------------------------------------------------------------------|
 | `GET`    | `/api/repair/config`                  | Read current config.                                                     |
-| `PUT`    | `/api/repair/config`                  | Update config (validates cron, workers, source).                         |
+| `PUT`    | `/api/repair/config`                  | Update config. Merges: omitted keys keep their current values.           |
 | `GET`    | `/api/repair/status`                  | Active run summary, last completed run, and counts of entries by status. |
-| `POST`   | `/api/repair/run`                     | Trigger a sweep now. Body can include `ignore_last_checked`, `auto_repair`, `unrestrict_link`, and `protocol`. |
+| `POST`   | `/api/repair/run`                     | Trigger a sweep now. Body can include `ignore_last_checked`, `repair`, `prune`, `regrab`, `unrestrict_link`, and `protocol`. |
 | `POST`   | `/api/repair/stop`                    | Cancel the active run.                                                   |
 | `GET`    | `/api/repair/runs`                    | Run history.                                                             |
 | `GET`    | `/api/repair/runs/{id}`               | Run detail.                                                              |
@@ -227,7 +256,7 @@ Probes against debrid providers respect a separate rate limit so they don't star
 For Usenet probing, `nntp_connection_percent` (above) caps the share of NNTP connections the health checker uses.
 
 :::caution
-With `auto_repair: true`, a sweep deletes the broken Arr file records and triggers a search for replacements. Verification of those re-acquires happens later — the Arr import is asynchronous and the badge flips to `healthy` once the replacement file is in place.
+With `regrab: true`, a sweep deletes the broken Arr file records, blocklists the grab and triggers a search for replacements. Verification of those re-acquires happens later — the Arr import is asynchronous and the badge flips to `healthy` once the replacement file is in place. With `prune: true` the item is deleted decypharr-side only, and the Arr re-searches on its next disk scan.
 :::
 
 ## Troubleshooting
@@ -247,7 +276,7 @@ Increase `workers`, or raise `recheck_interval` so fewer entries become candidat
 
 ### Sweep is too aggressive
 
-Lower `workers`, lengthen `schedule`, or set `auto_repair: false` to run detect-only and review brokens before fixing.
+Lower `workers`, lengthen `schedule`, lower `max_deletions_per_run`, or turn all three of `repair` / `prune` / `regrab` off to run detect-only and review brokens before acting on them.
 
 ### One entry keeps flipping broken
 

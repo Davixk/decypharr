@@ -51,24 +51,52 @@ const (
 //
 //	CHECK   → Probed / Healthy / Broken / Unknown (detection only).
 //	REPAIR  → Reacquired: dead items re-acquired across providers.
+//	          RepairFailed: re-acquire attempts that were MADE and errored.
+//	          RepairSkippedUnsupported: dead items REPAIR structurally cannot
+//	          re-acquire (usenet has no re-insert analogue) or whose entry row
+//	          has vanished — attempts that were never made.
 //	PRUNE   → Pruned: entries deleted decypharr-side (no arr call).
+//	          PruneSkippedNotEligible: dead entries PRUNE DECLINED to delete
+//	          because they are not fully broken / carry no infohash.
 //	RE-GRAB → Regrabbed: arr file records deleted + blocklisted + re-searched;
-//	          RepairFailed counts arr file deletes that errored.
+//	          RegrabFailed counts arr file deletes that errored;
+//	          RegrabSkippedNoArrLink counts dead entries with no resolved arr
+//	          link, which RE-GRAB cannot route.
+//
+// The three *Skipped* counters exist because a component that DECLINES to act
+// is otherwise indistinguishable from a component that never ran: a run that
+// reports `pruned=0` with no skip counter reads as "PRUNE is broken" when the
+// truth may be "PRUNE correctly refused to delete 3 partially-broken entries".
+// Every non-action on an action path is counted here and given a per-entry
+// reason in EntryHealth.ActionSkips.
 //
 // Deletions is how many entries consumed a destructive-deletion slot this run
 // (PRUNE and/or RE-GRAB combined); DeletionCapSkipped is how many broken
 // entries were left un-deleted because the per-run cap was already exhausted.
+//
+// NOTE for UI/API consumers: RepairFailed (`repair_failed`) counts REPAIR
+// failures, matching its name. Arr-side RE-GRAB delete failures — which it
+// used to carry — now have their own RegrabFailed (`regrab_failed`), which is
+// the key the run logs already used for them.
 type RepairRunStats struct {
-	Candidates         int `json:"candidates"`
-	SkippedFresh       int `json:"skipped_fresh"`
-	Probed             int `json:"probed"`
-	Healthy            int `json:"healthy"`
-	Broken             int `json:"broken"`
-	Unknown            int `json:"unknown"`
-	Reacquired         int `json:"reacquired"`
-	Pruned             int `json:"pruned"`
-	Regrabbed          int `json:"regrabbed"`
-	RepairFailed       int `json:"repair_failed"`
+	Candidates   int `json:"candidates"`
+	SkippedFresh int `json:"skipped_fresh"`
+	Probed       int `json:"probed"`
+	Healthy      int `json:"healthy"`
+	Broken       int `json:"broken"`
+	Unknown      int `json:"unknown"`
+
+	Reacquired               int `json:"reacquired"`
+	RepairFailed             int `json:"repair_failed"`
+	RepairSkippedUnsupported int `json:"repair_skipped_unsupported"`
+
+	Pruned                  int `json:"pruned"`
+	PruneSkippedNotEligible int `json:"prune_skipped_not_eligible"`
+
+	Regrabbed              int `json:"regrabbed"`
+	RegrabFailed           int `json:"regrab_failed"`
+	RegrabSkippedNoArrLink int `json:"regrab_skipped_no_arr_link"`
+
 	Deletions          int `json:"deletions"`
 	DeletionCapSkipped int `json:"deletion_cap_skipped"`
 }
@@ -255,6 +283,26 @@ type EntryHealth struct {
 	BrokenFiles   []BrokenFile    `json:"broken_files,omitempty"`
 	FailureReason string          `json:"failure_reason,omitempty"`
 
+	// Structural marks a verdict the probe reached WITHOUT being able to
+	// change its mind on any future run: the entry-item lists no probeable
+	// file at all (empty, or every file soft-deleted), so there is nothing a
+	// probe could ever resolve. Such a verdict must not be re-probed every
+	// single run — see IsDue. It is cleared on any probe that DID reach files.
+	Structural bool `json:"structural,omitempty"`
+
+	// ActionSkips records, per component ("repair" / "prune" / "regrab"), why
+	// that component DECLINED to act on this entry on the most recent run that
+	// considered it. A decline is not a failure — PRUNE refusing to delete a
+	// partially-broken entry is correct — but it must be visible, otherwise a
+	// correct refusal is indistinguishable from a broken action path.
+	ActionSkips map[string]string `json:"action_skips,omitempty"`
+
+	// LastRepairError is why the most recent REPAIR (re-acquire) ATTEMPT
+	// failed. Paired with LastRepairAt, which is stamped whenever an attempt
+	// was MADE, so a failed repair and a never-attempted repair are
+	// distinguishable.
+	LastRepairError string `json:"last_repair_error,omitempty"`
+
 	Dirty       bool   `json:"dirty"`
 	DirtyReason string `json:"dirty_reason,omitempty"`
 
@@ -269,9 +317,38 @@ type EntryHealth struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// SetActionSkip records why a component declined to act on this entry, or
+// clears the entry for that component when reason is empty.
+func (h *EntryHealth) SetActionSkip(component, reason string) {
+	if h == nil || component == "" {
+		return
+	}
+	if reason == "" {
+		delete(h.ActionSkips, component)
+		if len(h.ActionSkips) == 0 {
+			h.ActionSkips = nil
+		}
+		return
+	}
+	if h.ActionSkips == nil {
+		h.ActionSkips = make(map[string]string, 3)
+	}
+	h.ActionSkips[component] = reason
+}
+
 // IsDue reports whether this entry should be visited by the next sweep, given a
 // recheck interval. Entries that have never been checked, that are dirty, or
 // whose last status was anything other than healthy/unsupported are always due.
+//
+// The one exception is a STRUCTURAL verdict (see EntryHealth.Structural): an
+// entry that lists no probeable file cannot produce a different answer no
+// matter how often it is re-probed. Treating it like any other non-healthy
+// status put it on a permanent every-run treadmill — it bypassed the freshness
+// skip, got stamped, returned the same verdict instantly, and no action could
+// ever touch it. Its file set is the only thing that can change the answer, and
+// every file-set mutation goes through MarkEntryDirty (handled above), so it is
+// safe to fall through to the plain staleness check and revisit it once per
+// recheck interval as a backstop rather than once per run.
 func (h *EntryHealth) IsDue(now time.Time, recheck time.Duration) bool {
 	if h == nil {
 		return true
@@ -285,8 +362,34 @@ func (h *EntryHealth) IsDue(now time.Time, recheck time.Duration) bool {
 	switch h.Status {
 	case HealthHealthy, HealthUnsupported:
 		// fall through to staleness check
-	default:
+	case HealthUnknown:
+		if h.Structural {
+			break // fall through to staleness check
+		}
+		// An INDETERMINATE verdict carries its own short retry deadline
+		// (NextCheckDueAt, set from repairIndeterminateRetry) precisely so it
+		// is re-examined soon WITHOUT being re-probed on every single run.
+		// That deadline was written by the probe and then never read by
+		// anything, so `unknown` in practice bypassed the freshness skip every
+		// run: probe, stamp, return the same non-verdict, forever. Honor it —
+		// but only when it is actually set, and only for `unknown`, so a blank
+		// or cleared record still falls through to always-due.
+		if h.NextCheckDueAt.IsZero() {
+			return true
+		}
+		if now.Before(h.NextCheckDueAt) {
+			return false
+		}
 		return true
+	default:
+		// broken / repairing / stale stay ALWAYS due unless the verdict is
+		// structural. A broken entry must be re-picked every run: that is what
+		// lets an entry skipped by the deletion cap get its action on the next
+		// run, and what makes a recovered entry flip back to healthy promptly.
+		if !h.Structural {
+			return true
+		}
+		// fall through to staleness check
 	}
 	if recheck <= 0 {
 		return false
@@ -306,7 +409,11 @@ func (s *Storage) SaveEntryHealth(state *EntryHealth) error {
 	}
 	// Index the status so CountEntryHealthByStatus can build its histogram
 	// straight from the in-memory index without decoding every record.
-	return s.repairState.Put(state.EntryName, data, &hybrid.EntryMeta{Status: string(state.Status)})
+	if err := s.repairState.Put(state.EntryName, data, &hybrid.EntryMeta{Status: string(state.Status)}); err != nil {
+		return err
+	}
+	s.invalidateHealthCounts()
+	return nil
 }
 
 func (s *Storage) GetEntryHealth(entryName string) (*EntryHealth, error) {
@@ -344,7 +451,11 @@ func (s *Storage) DeleteEntryHealth(entryName string) error {
 	if entryName == "" || !s.repairState.Exists(entryName) {
 		return nil
 	}
-	return s.repairState.Delete(entryName)
+	if err := s.repairState.Delete(entryName); err != nil {
+		return err
+	}
+	s.invalidateHealthCounts()
+	return nil
 }
 
 // ClearEntryHealthByStatuses deletes persisted repair health records whose
@@ -404,15 +515,30 @@ func (s *Storage) MarkEntryDirty(entryName string, protocol config.Protocol, rea
 	_ = s.SaveEntryHealth(state)
 }
 
-// healthCountsTTL bounds how often CountEntryHealthByStatus scans the entire
-// repair-state store. The histogram is consumed by the stats dashboard, so a
-// few seconds of staleness is acceptable; the alternative is a full scan +
-// JSON-unmarshal per call, which dominated heap churn at scale.
+// healthCountsTTL is a backstop only: the cache is invalidated eagerly by
+// invalidateHealthCounts on every repair-state mutation, so this bound just
+// caps how long a histogram can survive if some future write path forgets to
+// invalidate. Rebuilding is an in-memory index walk (no disk reads, no
+// JSON-unmarshal) once every record carries an indexed status.
 const healthCountsTTL = 30 * time.Second
 
+// invalidateHealthCounts drops the cached histogram. It MUST be called from
+// every path that mutates repair state (SaveEntryHealth / DeleteEntryHealth,
+// and therefore ClearEntryHealthByStatuses and MarkEntryDirty, which go
+// through them). Without it, GET /api/repair/status could report
+// health_counts.broken == 0 from a stale histogram while
+// GET /api/repair/health?status=broken — which reads live — still listed
+// broken entries, disabling the "act on broken" control for no visible reason.
+func (s *Storage) invalidateHealthCounts() {
+	s.healthCountsMu.Lock()
+	s.healthCounts = nil
+	s.healthCountsBuiltAt = time.Time{}
+	s.healthCountsMu.Unlock()
+}
+
 // CountEntryHealthByStatus returns a per-status histogram without loading full
-// EntryHealth payloads. The result is cached for healthCountsTTL and
-// invalidated whenever repair state mutates.
+// EntryHealth payloads. The result is cached until the next repair-state
+// mutation (see invalidateHealthCounts), with healthCountsTTL as a backstop.
 func (s *Storage) CountEntryHealthByStatus() map[HealthStatus]int {
 	s.healthCountsMu.Lock()
 	if s.healthCounts != nil && time.Since(s.healthCountsBuiltAt) < healthCountsTTL {

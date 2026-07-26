@@ -177,28 +177,50 @@ func (m *Manager) GetAccount(token string) (*Account, error) {
 	return acc, nil
 }
 
+// GetDownloadLink resolves a download link for file, falling back to the other
+// active accounts when the current one fails.
+//
+// When every account fails the error from the CURRENT account is returned
+// unwrapped, so its type survives the account-manager layer and callers can
+// still route on it (errors.Is(err, customerror.HosterUnavailableError),
+// customerror.TrafficExceededError, types.EmptyDownloadLinkError, ...).
+// Failures from the fallback accounts are logged, not returned: reporting a
+// secondary account's incidental error instead of the primary verdict would
+// make the failure class unpredictable for callers.
+//
+// This function previously swallowed the error and returned (dl, nil)
+// unconditionally, which collapsed every distinct failure mode — hoster gone,
+// rate limited, auth failure, traffic exhausted — into the single
+// indistinguishable symptom "empty download link".
 func (m *Manager) GetDownloadLink(id string, file *types.File, fetcher LinkFetcher) (types.DownloadLink, error) {
 	current := m.Current()
 	if current == nil {
 		return types.DownloadLink{}, fmt.Errorf("no active account for debrid %s", m.debrid)
 	}
 	dl, err := current.GetDownloadLink(id, file, fetcher)
-	if err != nil {
-		activeAccounts := m.Active()
-		for _, acc := range activeAccounts {
-			if acc.Token == current.Token {
-				continue
-			}
-			dl, err = acc.GetDownloadLink(id, file, fetcher)
-			if err != nil {
-				continue
-			} else {
-				// Successfully got link from another account. Just return it, no need to switch current account
-				return dl, nil
-			}
-		}
+	if err == nil {
+		return dl, nil
 	}
-	return dl, nil
+
+	// Current account failed; try the remaining active accounts before giving up.
+	for _, acc := range m.Active() {
+		if acc.Token == current.Token {
+			continue
+		}
+		fallbackLink, fallbackErr := acc.GetDownloadLink(id, file, fetcher)
+		if fallbackErr == nil {
+			// Successfully got link from another account. Just return it, no need to switch current account
+			return fallbackLink, nil
+		}
+		m.logger.Debug().
+			Err(fallbackErr).
+			Str("debrid", m.debrid).
+			Str("account_token", utils.Mask(acc.Token)).
+			Msg("Fallback account failed to resolve download link")
+	}
+
+	// Fallback exhausted. Surface the primary failure with its type intact.
+	return dl, err
 }
 
 func (m *Manager) StoreDownloadLink(downloadLink types.DownloadLink) {

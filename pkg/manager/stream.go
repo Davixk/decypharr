@@ -821,7 +821,7 @@ func (m *Manager) streamUsenet(ctx context.Context, entry *storage.Entry, filena
 	// The ready callback fires only after the exact generation-bound reader is
 	// acquired. Headers and bytes therefore come from the same retained handle.
 	err := m.usenet.StreamForGenerationReady(ctx, entry.InfoHash, entry.NZBGeneration, filename, start, end, writer, ready)
-	if err != nil && nntp.IsArticleNotFoundError(err) {
+	if err != nil && nntp.IsContentMissingError(err) {
 		if persistErr := m.markUsenetStreamFailureForGeneration(entry.InfoHash, entry.NZBGeneration, filename, err, true); persistErr != nil {
 			return errors.Join(err, fmt.Errorf("persist manager Usenet failure: %w", persistErr))
 		}

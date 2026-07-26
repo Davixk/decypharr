@@ -320,7 +320,15 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 
 		conn, connProvider, err := c.getAnyAvailableConnection(ctx, exclusions)
 		if err != nil {
-			lastErr = err
+			// Never let an acquire failure overwrite a definitive content
+			// verdict already collected from a provider. Excluding a provider
+			// after a 430 (or a no-payload article) can leave no eligible pool
+			// for the next round; reporting "no available connection" then
+			// would downgrade a real dead-content answer to an infrastructure
+			// error and hide it from the permanent-failure path.
+			if !IsContentMissingError(lastErr) {
+				lastErr = err
+			}
 			continue
 		}
 
@@ -443,6 +451,17 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				excludeForArticleNotFound(&exclusions, errorProvider)
 			case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
 				exclusions.excludeHost(errorProvider.Host)
+			case ErrorTypeYencDecode:
+				if !IsArticlePayloadMissingError(err) {
+					// Corruption/truncation: keep the historical fail-fast.
+					return err
+				}
+				// The article exists on this provider but carries no payload at
+				// all. Treat it exactly like a 430 for failover purposes: ask
+				// the remaining providers before anyone concludes the content is
+				// dead, so a single provider's stubbed copy cannot condemn a file
+				// another provider still serves.
+				excludeForArticleNotFound(&exclusions, errorProvider)
 			default:
 				// Non-retriable error, return immediately
 				return err

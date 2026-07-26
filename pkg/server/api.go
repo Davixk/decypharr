@@ -515,10 +515,16 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	currentConfig := config.Get()
 
-	// A top-level key absent from the posted JSON means "keep the current
-	// value"; only explicitly posted values (including empty ones such as
-	// "debrids": []) overwrite. Without this merge, a partial POST replaced
-	// every omitted section with its zero value and Save wiped it from disk.
+	// A key absent from the posted JSON means "keep the current value"; only
+	// explicitly posted values (including empty ones such as "debrids": [])
+	// overwrite. Without this merge, a partial POST replaced every omitted
+	// section with its zero value and Save wiped it from disk.
+	//
+	// The merge recurses INTO posted sections, so `{"repair":{"enabled":true}}`
+	// no longer replaces the whole repair block — which used to silently zero
+	// max_deletions_per_run (the destructive-action cap), stop_schedule, prune
+	// and regrab. Slices and maps are the exception: a posted array/object is
+	// the caller's complete list and replaces wholesale.
 	if err := newConfig.PreserveMissingSections(currentConfig, body); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to merge config update request")
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
@@ -588,9 +594,42 @@ func (s *Server) handleGetRepairConfig(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, config.Get().Repair, http.StatusOK)
 }
 
+// handleUpdateRepairConfig MERGES the posted object into the current repair
+// config: a key absent from the body keeps its current value, an explicitly
+// posted one (including an explicit zero/false) is applied.
+//
+// It used to assign the decoded body wholesale (`cfg.Repair = req`), so a
+// partial PUT silently reset every omitted safety knob —
+// max_deletions_per_run to 0, stop_schedule to "" (disabled), prune/regrab to
+// false — while returning 200. That was also inconsistent with POST
+// /api/config, which has merged via PreserveMissingSections since the config
+// wipe incident; PreserveMissingFields is the same mechanism applied to the
+// repair block.
+//
+// Validation below runs on the MERGED result, i.e. on what will actually be
+// saved, so a body that omits "schedule" while the stored schedule is valid is
+// accepted.
 func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxOptionalJSONBody))
+	if err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(string(body)) == "" {
+		http.Error(w, "Invalid request body: a JSON object is required", http.StatusBadRequest)
+		return
+	}
+
+	cfg := config.Get()
+	current := cfg.Repair
+
 	var req config.RepairConfig
-	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Fields the caller did not post keep their current values.
+	if err := req.PreserveMissingFields(current, body); err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -620,19 +659,21 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cfg := config.Get()
 	cfg.Repair = req
 	if err := cfg.Save(); err != nil {
+		cfg.Repair = current // don't leave the process running a config that isn't on disk
 		s.logger.Error().Err(err).Msg("Failed to save repair config")
 		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if svc := s.manager.Repair(); svc != nil {
-		if err := svc.ApplyConfig(); err != nil {
-			s.logger.Warn().Err(err).Msg("Failed to apply repair config")
-			http.Error(w, "Saved, but failed to apply: "+err.Error(), http.StatusInternalServerError)
-			return
+	if s.manager != nil {
+		if svc := s.manager.Repair(); svc != nil {
+			if err := svc.ApplyConfig(); err != nil {
+				s.logger.Warn().Err(err).Msg("Failed to apply repair config")
+				http.Error(w, "Saved, but failed to apply: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
@@ -648,6 +689,35 @@ func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, svc.Status(), http.StatusOK)
 }
 
+// maxOptionalJSONBody bounds how much of an optional request body is read
+// before it is rejected as malformed.
+const maxOptionalJSONBody = 1 << 20 // 1 MiB
+
+// decodeOptionalJSONBody decodes an OPTIONAL JSON request body into dst.
+//
+// An absent, empty, or whitespace-only body is accepted and leaves dst at its
+// zero value (these endpoints document "no body ⇒ defaults"). Anything else
+// MUST be well-formed JSON: a truncated document such as "{" surfaces from the
+// decoder as io.EOF / io.ErrUnexpectedEOF, and the previous
+// `err != nil && err != io.EOF` guard let exactly that case fall through to a
+// zero-value request. On the repair endpoints a zero-value request does not
+// mean "do nothing" — it means "act on EVERY broken entry with the configured
+// knobs" (handleFixBroken) or "run a full default sweep" (handleRunRepair), so
+// a typo'd body could launch real, potentially destructive work. Reject it.
+func decodeOptionalJSONBody(r *http.Request, dst any) error {
+	if r.Body == nil || r.ContentLength == 0 {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxOptionalJSONBody))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(raw)) == "" {
+		return nil
+	}
+	return json.ConfigDefault.Unmarshal(raw, dst)
+}
+
 func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IgnoreLastChecked bool   `json:"ignore_last_checked,omitempty"`
@@ -659,11 +729,9 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 		UnrestrictLink    bool   `json:"unrestrict_link,omitempty"`
 		Protocol          string `json:"protocol,omitempty"`
 	}
-	if r.Body != nil && r.ContentLength != 0 {
-		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-			return
-		}
+	if err := decodeOptionalJSONBody(r, &req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
 	}
 	ignoreLastChecked := req.IgnoreLastChecked || req.Force
 	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("ignore_last_checked"))) {
@@ -860,7 +928,7 @@ func (s *Server) handleRecheckMedia(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
 		return
 	}
-	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(req.Arr), strings.TrimSpace(req.MediaID), req.Actions.toManager(), req.Fix)
+	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(req.Arr), strings.TrimSpace(req.MediaID), req.Actions.toManager(), resolveLegacyFixFlag(req.Actions, req.Fix))
 	if err != nil {
 		status := http.StatusBadRequest
 		if strings.Contains(err.Error(), "already running") {
@@ -893,13 +961,11 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Actions *repairActionsBody `json:"actions,omitempty"`
 	}
-	if r.Body != nil && r.ContentLength != 0 {
-		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-			return
-		}
+	if err := decodeOptionalJSONBody(r, &req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
 	}
-	fix := r.URL.Query().Get("fix") == "true"
+	fix := resolveLegacyFixFlag(req.Actions, r.URL.Query().Get("fix") == "true")
 	svc := s.manager.Repair()
 	if svc == nil {
 		http.Error(w, "Repair service not available", http.StatusServiceUnavailable)
@@ -916,8 +982,10 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 // repairActionsBody is the per-component action selection accepted by the
 // manual fix endpoints. A nil *repairActionsBody (the "actions" key absent)
 // means "not specified" → the manager falls back to the configured
-// REPAIR/PRUNE/RE-GRAB knobs (never force-all). Present-but-all-false means
-// CHECK-only for the recheck endpoints.
+// REPAIR/PRUNE/RE-GRAB knobs (never force-all). Present-but-all-false is an
+// explicit "no components": CHECK-only on the recheck endpoints, and a 400 on
+// /api/repair/fix, which has nothing to do without a component. See
+// explicitNone.
 type repairActionsBody struct {
 	Repair bool `json:"repair"`
 	Prune  bool `json:"prune"`
@@ -931,23 +999,62 @@ func (b *repairActionsBody) toManager() *manager.ManualActions {
 	return &manager.ManualActions{Repair: b.Repair, Prune: b.Prune, Regrab: b.Regrab}
 }
 
+// explicitNone reports that the request carried an "actions" object naming NO
+// component — an explicit "do nothing". It is deliberately distinct from a nil
+// *repairActionsBody ("actions" absent), which means "unspecified" and falls
+// back to the configured knobs.
+//
+// The manager's resolveManualActions cannot tell the two apart (sel.any() is
+// false either way) and so honors the legacy fix flag for both. On
+// /api/repair/fix — where the manager passes fix=true unconditionally — that
+// turned an explicit all-false selection into a run of the operator's
+// configured REPAIR/PRUNE/RE-GRAB knobs: the exact opposite of what was asked,
+// and destructive if prune/regrab are on. Handlers must therefore never pass
+// fix=true when this is true.
+func (b *repairActionsBody) explicitNone() bool {
+	return b != nil && !b.Repair && !b.Prune && !b.Regrab
+}
+
+// resolveLegacyFixFlag decides what to pass as the manager's legacy fix flag.
+// An explicit all-false "actions" selection forces it off so the request
+// resolves to CHECK-only, matching POST /api/repair/run, where the equivalent
+// all-false JSON already yields CHECK-only. "actions" absent leaves the flag
+// untouched, preserving the documented "configured knobs" behavior.
+func resolveLegacyFixFlag(actions *repairActionsBody, fix bool) bool {
+	if actions.explicitNone() {
+		return false
+	}
+	return fix
+}
+
 // handleFixBroken acts on currently-broken entries WITHOUT reprobing. Body:
 // {"names": ["..."], "actions": {"repair":bool,"prune":bool,"regrab":bool}}.
 // Empty/missing names ⇒ act on every broken entry. A specified "actions" runs
 // exactly those components (single-component invocation supported, e.g.
 // PRUNE-only); omitting "actions" falls back to the configured
-// REPAIR/PRUNE/RE-GRAB knobs.
+// REPAIR/PRUNE/RE-GRAB knobs. An "actions" object naming NO component is an
+// explicit no-op and is rejected with 400 rather than silently promoted to the
+// configured knobs.
 func (s *Server) handleFixBroken(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Names   []string           `json:"names,omitempty"`
 		Actions *repairActionsBody `json:"actions,omitempty"`
 	}
-	// Body is optional; ignore decode errors for empty / missing bodies.
-	if r.Body != nil && r.ContentLength != 0 {
-		if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
-			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-			return
-		}
+	// Body is optional: absent ⇒ act on every broken entry with the configured
+	// knobs. A PRESENT but malformed body is rejected, never silently defaulted.
+	if err := decodeOptionalJSONBody(r, &req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// An "actions" object that is PRESENT but names no component is an explicit
+	// "do nothing". This endpoint only ever acts (it never re-probes) and the
+	// manager resolves it with fix=true unconditionally, so passing it through
+	// would run the configured knobs — possibly PRUNE/RE-GRAB — on every broken
+	// entry. Refuse it here, with the same message the manager uses when a
+	// selection resolves to no components.
+	if req.Actions.explicitNone() {
+		http.Error(w, "no repair action selected: enable REPAIR, PRUNE, or RE-GRAB", http.StatusBadRequest)
+		return
 	}
 	svc := s.manager.Repair()
 	if svc == nil {

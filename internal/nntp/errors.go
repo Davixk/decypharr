@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"syscall"
+
+	"github.com/sirrobot01/decypharr/internal/nntp/yenc"
 )
 
 // Error types for NNTP operations
@@ -270,6 +272,37 @@ func IsArticleNotFoundError(err error) bool {
 		return nntpErr.Type == ErrorTypeArticleNotFound
 	}
 	return false
+}
+
+// IsArticlePayloadMissingError reports whether err is the one yEnc decode
+// failure that proves the article carries NO binary payload: the decoder
+// reached the end of the article without ever finding a "=ybegin" header
+// (rapidyenc's exported sentinel, see yenc.ErrNoBinaryData).
+//
+// The provider answered the BODY command with a 222, so the message id exists —
+// it is a stub with no content. That is a definitive verdict about the content,
+// exactly like a 430, and must be distinguished from every OTHER yEnc failure
+// (truncation, missing "=yend" trailer, size or CRC mismatch), which are
+// corruption/transport symptoms that another attempt or another provider can
+// still resolve and must therefore stay transient.
+func IsArticlePayloadMissingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nntpErr *Error
+	if !errors.As(err, &nntpErr) || nntpErr.Type != ErrorTypeYencDecode {
+		return false
+	}
+	return yenc.IsNoBinaryData(nntpErr)
+}
+
+// IsContentMissingError reports whether err carries a definitive provider
+// verdict that the content is gone: either the article does not exist
+// (430/423) or it exists but decodes to no payload at all. Callers use it to
+// decide that a file is permanently dead; every other failure class is an
+// infrastructure or corruption symptom and must stay retryable.
+func IsContentMissingError(err error) bool {
+	return IsArticleNotFoundError(err) || IsArticlePayloadMissingError(err)
 }
 
 // IsInfrastructureError reports whether err represents a failure of the NNTP

@@ -61,11 +61,21 @@ jobs:
           node-version: '24'
           cache: npm
 
-      - name: Verify generated JavaScript
+      - name: Verify generated assets (CSS + JS)
         run: |
           npm ci
-          npm run minify-js
-          git diff --exit-code -- pkg/server/assets/build/js
+          npm run build
+          # The Dockerfile does not build assets — it copies the tree and
+          # `go build`s it — so whatever is committed under assets/build is
+          # exactly what the image serves. Diff the WHOLE directory (not just
+          # js/) and use `git status --porcelain` so untracked new outputs fail
+          # too; checking only build/js is how stale CSS shipped for 5 weeks.
+          if [ -n "$(git status --porcelain -- pkg/server/assets/build)" ]; then
+            echo "::error::Built assets are out of date — run 'npm run build' and commit pkg/server/assets/build."
+            git status --porcelain -- pkg/server/assets/build
+            git diff -- pkg/server/assets/build
+            exit 1
+          fi
 
   build:
     needs: validate

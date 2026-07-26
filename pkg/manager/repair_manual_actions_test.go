@@ -53,10 +53,18 @@ func TestResolveManualActionsPrecedence(t *testing.T) {
 		{"omitted_fix_false_check_only", nil, false,
 			config.RepairConfig{Prune: true},
 			repairActions{}},
-		// A present-but-empty selection is treated as "unspecified" → fix path.
-		{"present_all_false_falls_to_fix", &ManualActions{}, true,
+		// A PRESENT but all-false selection is an EXPLICIT "no components" and
+		// must run nothing — it is NOT "unspecified". This case previously
+		// pinned the opposite (it fell through to the fix path and ran the
+		// configured knobs), which is the all-false footgun: a request asking
+		// for nothing could run the operator's configured PRUNE/RE-GRAB. See
+		// TestExplicitAllFalseManualActionsRunsNothing.
+		{"present_all_false_is_explicit_none", &ManualActions{}, true,
 			config.RepairConfig{Repair: &off, Regrab: true},
-			repairActions{regrab: true}},
+			repairActions{}},
+		{"present_all_false_is_explicit_none_even_with_destructive_knobs", &ManualActions{}, true,
+			config.RepairConfig{Repair: &on, Prune: true, Regrab: true},
+			repairActions{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

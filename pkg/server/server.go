@@ -151,8 +151,12 @@ func New(mgr *manager.Manager) *Server {
 			})
 		})
 
-		//webhooks
-		r.Post("/webhooks/tautulli", s.handleTautulli)
+		// Webhooks. These are MUTATING endpoints (the Tautulli one can launch
+		// repair work, which may PRUNE/RE-GRAB per the configured knobs), so they
+		// are authenticated like every other mutating surface — see
+		// webhookRoutes/webhookAuthMiddleware in webhook.go. They were previously
+		// registered here, outside the auth group, and needed no credentials.
+		r.Mount("/webhooks", s.webhookRoutes())
 	})
 	s.router = r
 	return s

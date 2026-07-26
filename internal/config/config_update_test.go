@@ -226,3 +226,265 @@ func TestPreserveMissingSectionsFullPostUnchanged(t *testing.T) {
 		t.Fatalf("posted empty arrs did not clear: %+v", merged.Arrs)
 	}
 }
+
+// preserveNestedConfig is an operator config with every destructive-action
+// safeguard deliberately set, plus a *bool two levels deep
+// (mount.rclone.async_read) and slices/maps at both levels.
+func preserveNestedConfig() *Config {
+	return &Config{
+		LogLevel:       "info",
+		DownloadFolder: "/downloads",
+		Debrids:        []Debrid{{Name: "rd", Provider: "realdebrid", APIKey: "rd-key"}},
+		CustomFolders:  map[string]CustomFolders{"movies": {Filters: map[string]string{"a": "b"}}},
+		Repair: RepairConfig{
+			Enabled:            true,
+			Source:             RepairSourceManaged,
+			Schedule:           "0 3 * * *",
+			StopSchedule:       "06:00",
+			Workers:            3,
+			RecheckInterval:    "168h",
+			MaxDeletionsPerRun: 5,
+			Prune:              true,
+			Regrab:             true,
+			SkipNZBRepair:      true,
+			Repair:             boolPtr(false),
+			Arrs:               []string{"sonarr", "radarr"},
+		},
+		Mount: Mount{
+			Type:      MountTypeRclone,
+			MountPath: "/mnt",
+			Rclone: Rclone{
+				Enabled:      true,
+				Port:         "5572",
+				VfsCacheMode: "full",
+				Transfers:    8,
+				AsyncRead:    boolPtr(false),
+			},
+			DFS: DFS{ChunkSize: "10MB", CacheDir: "/cache"},
+		},
+	}
+}
+
+// mergePosted decodes body the way handleUpdateConfig does and applies the
+// merge against current, returning what would be saved.
+func mergePosted(t *testing.T, current *Config, body string) *Config {
+	t.Helper()
+	var updated Config
+	if err := json.Unmarshal([]byte(body), &updated); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	if err := updated.PreserveMissingSections(current, []byte(body)); err != nil {
+		t.Fatalf("PreserveMissingSections: %v", err)
+	}
+	return &updated
+}
+
+// TestPreserveMissingSectionsNestedPartialKeepsSafetyKnobs is the regression
+// test for the nested half of the wipe: the merge used to run at the TOP LEVEL
+// only, so posting {"repair":{"enabled":true}} replaced the whole repair block
+// and silently zeroed max_deletions_per_run (the destructive-action cap),
+// stop_schedule, prune and regrab.
+func TestPreserveMissingSectionsNestedPartialKeepsSafetyKnobs(t *testing.T) {
+	current := preserveNestedConfig()
+	got := mergePosted(t, current, `{"repair":{"enabled":true}}`)
+
+	if !got.Repair.Enabled {
+		t.Fatalf("posted repair.enabled not applied: %+v", got.Repair)
+	}
+	if got.Repair.MaxDeletionsPerRun != 5 {
+		t.Fatalf("nested partial POST wiped max_deletions_per_run: %d", got.Repair.MaxDeletionsPerRun)
+	}
+	if got.Repair.StopSchedule != "06:00" {
+		t.Fatalf("nested partial POST wiped stop_schedule: %q", got.Repair.StopSchedule)
+	}
+	if !got.Repair.Prune {
+		t.Fatalf("nested partial POST wiped prune")
+	}
+	if !got.Repair.Regrab {
+		t.Fatalf("nested partial POST wiped regrab")
+	}
+	if got.Repair.Schedule != "0 3 * * *" || got.Repair.Source != RepairSourceManaged ||
+		got.Repair.Workers != 3 || got.Repair.RecheckInterval != "168h" || !got.Repair.SkipNZBRepair {
+		t.Fatalf("nested partial POST wiped the remaining repair fields: %+v", got.Repair)
+	}
+	if got.Repair.Repair == nil || *got.Repair.Repair {
+		t.Fatalf("nested partial POST lost the repair:false tri-state: %v", got.Repair.Repair)
+	}
+	if len(got.Repair.Arrs) != 2 {
+		t.Fatalf("nested partial POST wiped repair.arrs: %+v", got.Repair.Arrs)
+	}
+	// Sibling top-level sections still behave as before.
+	if len(got.Debrids) != 1 || got.Debrids[0].APIKey != "rd-key" || got.DownloadFolder != "/downloads" {
+		t.Fatalf("omitted top-level sections were not preserved: %+v", got)
+	}
+}
+
+// TestPreserveMissingSectionsNestedExplicitValuesStillApply: inside a posted
+// section, presence of a key — even with a zero/false value — is a real
+// instruction and must overwrite. Losing this would make the cap unclearable.
+func TestPreserveMissingSectionsNestedExplicitValuesStillApply(t *testing.T) {
+	current := preserveNestedConfig()
+	got := mergePosted(t, current,
+		`{"repair":{"max_deletions_per_run":0,"stop_schedule":"","prune":false,"regrab":false,"workers":0}}`)
+
+	if got.Repair.MaxDeletionsPerRun != 0 {
+		t.Fatalf("explicit max_deletions_per_run:0 not applied: %d", got.Repair.MaxDeletionsPerRun)
+	}
+	if got.Repair.StopSchedule != "" {
+		t.Fatalf("explicit stop_schedule:\"\" not applied: %q", got.Repair.StopSchedule)
+	}
+	if got.Repair.Prune || got.Repair.Regrab {
+		t.Fatalf("explicit prune/regrab:false not applied: %+v", got.Repair)
+	}
+	if got.Repair.Workers != 0 {
+		t.Fatalf("explicit workers:0 not applied: %d", got.Repair.Workers)
+	}
+	if got.Repair.Schedule != "0 3 * * *" || !got.Repair.Enabled {
+		t.Fatalf("unmentioned repair fields were not preserved: %+v", got.Repair)
+	}
+}
+
+// TestPreserveMissingSectionsNestedBoolPointerTriState pins the *bool
+// tri-states reachable through a nested merge: repair.repair (one level deep)
+// and mount.rclone.async_read (two). Absent ⇒ keep the current pointer, nil
+// included; explicitly posted true/false ⇒ overwrite.
+func TestPreserveMissingSectionsNestedBoolPointerTriState(t *testing.T) {
+	tests := []struct {
+		name          string
+		currentRepair *bool
+		currentAsync  *bool
+		body          string
+		wantRepair    *bool
+		wantAsync     *bool
+	}{
+		{
+			name: "absent keeps explicit false", currentRepair: boolPtr(false), currentAsync: boolPtr(false),
+			body:       `{"repair":{"enabled":true},"mount":{"rclone":{"vfs_cache_mode":"off"}}}`,
+			wantRepair: boolPtr(false), wantAsync: boolPtr(false),
+		},
+		{
+			name: "absent keeps explicit true", currentRepair: boolPtr(true), currentAsync: boolPtr(true),
+			body:       `{"repair":{"enabled":true},"mount":{"rclone":{"vfs_cache_mode":"off"}}}`,
+			wantRepair: boolPtr(true), wantAsync: boolPtr(true),
+		},
+		{
+			name: "absent keeps nil (unset)", currentRepair: nil, currentAsync: nil,
+			body:       `{"repair":{"enabled":true},"mount":{"rclone":{"vfs_cache_mode":"off"}}}`,
+			wantRepair: nil, wantAsync: nil,
+		},
+		{
+			name: "explicit false overwrites unset", currentRepair: nil, currentAsync: nil,
+			body:       `{"repair":{"repair":false},"mount":{"rclone":{"async_read":false}}}`,
+			wantRepair: boolPtr(false), wantAsync: boolPtr(false),
+		},
+		{
+			name: "explicit true overwrites false", currentRepair: boolPtr(false), currentAsync: boolPtr(false),
+			body:       `{"repair":{"repair":true},"mount":{"rclone":{"async_read":true}}}`,
+			wantRepair: boolPtr(true), wantAsync: boolPtr(true),
+		},
+	}
+
+	check := func(t *testing.T, label string, got, want *bool) {
+		t.Helper()
+		switch {
+		case want == nil && got != nil:
+			t.Fatalf("%s = %v, want unset (nil)", label, *got)
+		case want != nil && (got == nil || *got != *want):
+			t.Fatalf("%s = %v, want %v", label, got, *want)
+		}
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			current := preserveNestedConfig()
+			current.Repair.Repair = test.currentRepair
+			current.Mount.Rclone.AsyncRead = test.currentAsync
+
+			got := mergePosted(t, current, test.body)
+			check(t, "repair.repair", got.Repair.Repair, test.wantRepair)
+			check(t, "mount.rclone.async_read", got.Mount.Rclone.AsyncRead, test.wantAsync)
+			if got.Repair.RepairEnabled() != (test.wantRepair == nil || *test.wantRepair) {
+				t.Fatalf("RepairEnabled() = %v for %v", got.Repair.RepairEnabled(), test.wantRepair)
+			}
+		})
+	}
+}
+
+// TestPreserveMissingSectionsNestedListsReplaceWholesale pins the chosen
+// slice/map semantics: an explicitly posted list REPLACES (index is not
+// identity, so element-merging would graft one entry's fields onto another);
+// an omitted one is preserved. Maps behave identically — an explicitly posted
+// object replaces key-for-key, it is not merged into the stored one.
+func TestPreserveMissingSectionsNestedListsReplaceWholesale(t *testing.T) {
+	current := preserveNestedConfig()
+
+	got := mergePosted(t, current, `{"repair":{"arrs":["radarr"]},"custom_folders":{"shows":{}}}`)
+	if len(got.Repair.Arrs) != 1 || got.Repair.Arrs[0] != "radarr" {
+		t.Fatalf("posted repair.arrs did not replace wholesale: %+v", got.Repair.Arrs)
+	}
+	if len(got.CustomFolders) != 1 {
+		t.Fatalf("posted custom_folders did not replace wholesale: %+v", got.CustomFolders)
+	}
+	if _, ok := got.CustomFolders["movies"]; ok {
+		t.Fatalf("posted custom_folders was key-merged instead of replaced: %+v", got.CustomFolders)
+	}
+	if got.Repair.MaxDeletionsPerRun != 5 {
+		t.Fatalf("a posted list must not disturb its siblings: %d", got.Repair.MaxDeletionsPerRun)
+	}
+
+	// Explicitly empty still clears; omitted still preserves.
+	cleared := mergePosted(t, current, `{"repair":{"arrs":[]},"custom_folders":{}}`)
+	if len(cleared.Repair.Arrs) != 0 || len(cleared.CustomFolders) != 0 {
+		t.Fatalf("explicitly empty lists did not clear: %+v / %+v", cleared.Repair.Arrs, cleared.CustomFolders)
+	}
+	kept := mergePosted(t, current, `{"repair":{"enabled":true}}`)
+	if len(kept.Repair.Arrs) != 2 || len(kept.CustomFolders) != 1 {
+		t.Fatalf("omitted lists were not preserved: %+v / %+v", kept.Repair.Arrs, kept.CustomFolders)
+	}
+}
+
+// TestPreserveMissingSectionsMergesArbitraryDepth: the merge is not special-cased
+// to "repair" — it applies at every struct level, e.g. mount.rclone.
+func TestPreserveMissingSectionsMergesArbitraryDepth(t *testing.T) {
+	current := preserveNestedConfig()
+	got := mergePosted(t, current, `{"mount":{"rclone":{"vfs_cache_mode":"off"}}}`)
+
+	if got.Mount.Rclone.VfsCacheMode != "off" {
+		t.Fatalf("posted mount.rclone.vfs_cache_mode not applied: %q", got.Mount.Rclone.VfsCacheMode)
+	}
+	if got.Mount.Rclone.Port != "5572" || got.Mount.Rclone.Transfers != 8 || !got.Mount.Rclone.Enabled {
+		t.Fatalf("sibling rclone fields were not preserved: %+v", got.Mount.Rclone)
+	}
+	if got.Mount.Type != MountTypeRclone || got.Mount.MountPath != "/mnt" {
+		t.Fatalf("parent mount fields were not preserved: %+v", got.Mount)
+	}
+	if got.Mount.DFS.ChunkSize != "10MB" || got.Mount.DFS.CacheDir != "/cache" {
+		t.Fatalf("sibling mount.dfs section was not preserved: %+v", got.Mount.DFS)
+	}
+	if got.Repair.MaxDeletionsPerRun != 5 {
+		t.Fatalf("an unrelated posted section wiped the deletion cap: %d", got.Repair.MaxDeletionsPerRun)
+	}
+}
+
+// TestPreserveMissingSectionsFullNestedPostUnchanged: a body that posts every
+// key of a section behaves exactly like a plain decode, i.e. the recursive merge
+// is a no-op for the web UI's full-config save.
+func TestPreserveMissingSectionsFullNestedPostUnchanged(t *testing.T) {
+	current := preserveNestedConfig()
+	body := `{"repair":{
+		"enabled": false, "source": "arr", "schedule": "@daily", "workers": 1,
+		"nntp_connection_percent": 30, "strategy": "per_entry", "recheck_interval": "24h",
+		"arrs": [], "auto_repair": false, "skip_nzb_repair": false,
+		"repair": true, "prune": false, "regrab": false,
+		"max_deletions_per_run": 10, "stop_schedule": ""
+	}}`
+
+	var plain Config
+	if err := json.Unmarshal([]byte(body), &plain); err != nil {
+		t.Fatalf("unmarshal body: %v", err)
+	}
+	got := mergePosted(t, current, body)
+	if !reflect.DeepEqual(plain.Repair, got.Repair) {
+		t.Fatalf("fully posted section changed by merge:\nplain:  %+v\nmerged: %+v", plain.Repair, got.Repair)
+	}
+}

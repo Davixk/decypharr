@@ -739,31 +739,35 @@ func (r *RealDebrid) GetFileDownloadLinks(t *types.Torrent) (map[string]types.Do
 	return links, nil
 }
 
+// CheckFile probes link availability with a three-way verdict:
+// nil (available), customerror.HosterUnavailableError (definitively gone, 404/410),
+// or types.ErrAvailabilityIndeterminate (unknown — 401/403/429/5xx, transport failure).
+// Anything that is not a clean 2xx or a definitive 404/410 must NOT score healthy:
+// an outage or a rate limit is not evidence that the file is fine.
 func (r *RealDebrid) CheckFile(ctx context.Context, infohash, link string) error {
-	formData := map[string]string{"link": link}
-
 	form := url.Values{}
-	for k, v := range formData {
-		form.Set(k, v)
-	}
+	form.Set("link", link)
 
-	req, err := http.NewRequest(http.MethodPost, r.Host+"/unrestrict/check", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.Host+"/unrestrict/check", strings.NewReader(form.Encode()))
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: realdebrid check: building request: %w", types.ErrAvailabilityIndeterminate, err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := r.repairClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: realdebrid check: transport error: %w", types.ErrAvailabilityIndeterminate, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return nil
+	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
 		return customerror.HosterUnavailableError
+	default:
+		return fmt.Errorf("%w: realdebrid check: HTTP status %d", types.ErrAvailabilityIndeterminate, resp.StatusCode)
 	}
-
-	return nil
 }
 
 func (r *RealDebrid) fetchDownloadLink(account *account.Account, id string, file *types.File) (types.DownloadLink, error) {
