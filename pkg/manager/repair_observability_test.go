@@ -488,6 +488,7 @@ func TestBrokenVerdictStaysAlwaysDue(t *testing.T) {
 
 	broken := &storage.EntryHealth{
 		Status:         storage.HealthBroken,
+		ProbeVersion:   storage.RepairProbeVersion,
 		LastCheckedAt:  now,
 		NextCheckDueAt: now.Add(recheck),
 	}
@@ -495,8 +496,16 @@ func TestBrokenVerdictStaysAlwaysDue(t *testing.T) {
 		t.Fatal("a broken entry is not due; the deletion-cap retry depends on it being re-picked every run")
 	}
 
-	// A healthy entry keeps its freshness skip.
-	healthy := &storage.EntryHealth{Status: storage.HealthHealthy, LastCheckedAt: now}
+	// A healthy entry keeps its freshness skip. ProbeVersion is set because the
+	// freshness skip is only offered to verdicts from the CURRENT probe — see
+	// storage.RepairProbeVersion. A record without it is one written by an older
+	// algorithm and is due on sight; TestStaleProbeVersionIsDueDespiteFreshness
+	// covers that case.
+	healthy := &storage.EntryHealth{
+		Status:        storage.HealthHealthy,
+		ProbeVersion:  storage.RepairProbeVersion,
+		LastCheckedAt: now,
+	}
 	if healthy.IsDue(now, recheck) {
 		t.Fatal("a freshly-probed healthy entry must be skipped as fresh")
 	}
@@ -512,8 +521,15 @@ func TestIndeterminateRetryDeadlineIsHonoured(t *testing.T) {
 	now := time.Now()
 	recheck := 7 * 24 * time.Hour
 
+	// Every record here carries the CURRENT ProbeVersion: the retry deadline is a
+	// property of a verdict, and only a verdict from the current probe algorithm
+	// is trusted enough for its deadline to gate anything (see
+	// storage.RepairProbeVersion). Without the stamp these records would be due
+	// on version alone and the assertions below would prove nothing about the
+	// deadline.
 	pending := &storage.EntryHealth{
 		Status:         storage.HealthUnknown,
+		ProbeVersion:   storage.RepairProbeVersion,
 		LastCheckedAt:  now,
 		NextCheckDueAt: now.Add(repairIndeterminateRetry),
 	}
@@ -524,9 +540,13 @@ func TestIndeterminateRetryDeadlineIsHonoured(t *testing.T) {
 		t.Fatal("an unknown entry is never re-probed after its retry deadline; unknown must not become a resting state")
 	}
 
-	// No deadline recorded (legacy record, or a cleared one) ⇒ always due, so
-	// the change can never make an entry invisible.
-	noDeadline := &storage.EntryHealth{Status: storage.HealthUnknown, LastCheckedAt: now}
+	// No deadline recorded (a cleared one) ⇒ always due, so the change can never
+	// make an entry invisible.
+	noDeadline := &storage.EntryHealth{
+		Status:        storage.HealthUnknown,
+		ProbeVersion:  storage.RepairProbeVersion,
+		LastCheckedAt: now,
+	}
 	if !noDeadline.IsDue(now, recheck) {
 		t.Fatal("an unknown entry with no retry deadline must stay always-due")
 	}
@@ -534,6 +554,7 @@ func TestIndeterminateRetryDeadlineIsHonoured(t *testing.T) {
 	// Dirty always wins.
 	dirty := &storage.EntryHealth{
 		Status:         storage.HealthUnknown,
+		ProbeVersion:   storage.RepairProbeVersion,
 		Dirty:          true,
 		LastCheckedAt:  now,
 		NextCheckDueAt: now.Add(repairIndeterminateRetry),

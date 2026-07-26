@@ -812,6 +812,21 @@ func (u *Usenet) checkNZBAvailability(ctx context.Context, nzb *storage.NZB) err
 // CheckFile probes the availability of a single NZB file. Connection use is
 // gated by the NNTP client's repair bank so concurrent probes don't starve
 // streaming traffic.
+//
+// Its error is a CLASSIFICATION, not just a failure report, because the caller
+// (the repair probe) may act destructively on it:
+//
+//   - a typed permanent article-missing error — the file is flagged IsDeleted in
+//     the durable meta. DEAD CONTENT. This is precisely the condition the serve
+//     path already answers 410 Gone for, which is why it must be typed here and
+//     not flattened into a generic error: the two paths have to agree.
+//   - ErrNZBNotFound (wrapped) — the segment map is missing from disk. Local
+//     bookkeeping loss, NOT a content verdict, and never actionable.
+//   - a plain error ("file has no Segments") — the file is genuinely absent from
+//     the meta or carries an empty segment list. Indeterminate; a different
+//     thing from a file the provider deleted.
+//   - UsenetSegmentMissingError / ErrAvailabilityIndeterminate — from the STAT
+//     sample itself, unchanged.
 func (u *Usenet) CheckFile(ctx context.Context, nzoID, filename string) error {
 	// Repair/availability probes only need a sample of one file's message ids.
 	// Decode just those (no numeric columns, no NZBSegment structs, no other
@@ -819,6 +834,13 @@ func (u *Usenet) CheckFile(ctx context.Context, nzoID, filename string) error {
 	samplePercent := config.Get().Usenet.AvailabilitySamplePercent
 	messageIDs, err := u.nzbStorage.SampleFileMessageIDs(nzoID, filename, samplePercent)
 	if err != nil {
+		if errors.Is(err, ErrFilePermanentlyFailed) {
+			// Same typed verdict prepareStreamFileResults hands the WebDAV layer
+			// for this exact flag, so "hidden from the listing" and "dead" are one
+			// statement rather than two paths that can drift apart.
+			return customerror.NewArticleNotFoundError(
+				fmt.Errorf("articles missing on provider for %q: %w", filename, err))
+		}
 		return fmt.Errorf("failed to sample file segments: %w", err)
 	}
 	if len(messageIDs) == 0 {

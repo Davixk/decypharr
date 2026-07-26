@@ -37,10 +37,17 @@ func (h *Handler) handlePropfind(current *manager.FileInfo, children []manager.F
 		preparedChildren = make([]manager.FileInfo, 0, len(batch))
 		for i := range batch {
 			if err := batchErrors[i]; err != nil {
-				var customErr *customerror.Error
-				if errors.As(err, &customErr) && customErr.StatusCode() == http.StatusGone {
+				if customerror.IsContentPermanentlyGone(err) {
 					// A permanently unavailable resource must not be advertised
 					// as healthy in a collection listing.
+					//
+					// THIS IS THE SAME PREDICATE THE REPAIR PROBE CONDEMNS A FILE
+					// WITH (isDeadContentVerdict -> IsContentPermanentlyGone). It
+					// was an inline 410 check here and a separate code switch
+					// there, and they drifted: this loop hid every child of an
+					// entry while the probe reported "no verdict" for the same
+					// files, so an entry serving an EMPTY directory to every
+					// client sat un-actioned. Keep them one call.
 					continue
 				}
 				h.writeMetadataError(w, err)

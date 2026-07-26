@@ -645,7 +645,16 @@ func decodeSegments(nzb *storage.NZB, counts []int, segMeta, msgIDs []byte) erro
 // only the sampled ids so the large decompressed buffer is freed immediately.
 // This is the low-memory path used by repair availability probes.
 //
-// It returns (nil, -1, nil) when the file is not found or has no segments.
+// It returns (nil, -1, nil) when the file is not found, (nil, 0, nil) when it
+// exists but has no segments, and (nil, -1, ErrFilePermanentlyFailed) when the
+// only file of that name is flagged IsDeleted.
+//
+// That last case used to be indistinguishable from "not found": the lookup
+// filtered on !IsDeleted, so a permanently-failed file returned the same silent
+// (nil, nil) as a typo. The serve path treats IsDeleted as a definitive 410 and
+// hides the child; the probe saw an unclassifiable non-answer and recorded
+// `unknown`. Reporting the deletion EXPLICITLY — rather than letting a caller
+// infer it from an absence — is what lets both sides reach the same verdict.
 func decodeFileMessageIDsSampled(data []byte, filename string, percent int) (ids []string, segCount int, err error) {
 	hc, _, mc, err := splitRegions(data)
 	if err != nil {
@@ -660,17 +669,27 @@ func decodeFileMessageIDsSampled(data []byte, filename string, percent int) (ids
 		return nil, 0, err
 	}
 
-	// Locate the requested (non-deleted) file and its segment range.
+	// Locate the requested (non-deleted) file and its segment range. A deleted
+	// namesake is REMEMBERED rather than silently skipped: if no live file of
+	// that name exists, the caller must be told the difference between "gone"
+	// and "never there".
 	target := -1
 	before := 0
+	deleted := false
 	for i := range nzb.Files {
-		if nzb.Files[i].Name == filename && !nzb.Files[i].IsDeleted {
-			target = i
-			break
+		if nzb.Files[i].Name == filename {
+			if !nzb.Files[i].IsDeleted {
+				target = i
+				break
+			}
+			deleted = true
 		}
 		before += counts[i]
 	}
 	if target == -1 {
+		if deleted {
+			return nil, -1, ErrFilePermanentlyFailed
+		}
 		return nil, -1, nil
 	}
 	c := counts[target]

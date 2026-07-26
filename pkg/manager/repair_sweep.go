@@ -52,6 +52,17 @@ const (
 	// verdict is re-examined. Far shorter than the recheck interval so
 	// `unknown` cannot become a permanent resting state.
 	repairIndeterminateRetry = 6 * time.Hour
+
+	// repairProbeVersion is the identity of the probe algorithm implemented in
+	// THIS file, stamped onto every verdict it writes so a verdict produced by an
+	// older algorithm can be recognised and re-probed rather than trusted.
+	//
+	// BUMP IT WHENEVER THE PROBE LOGIC BELOW CHANGES IN A WAY THAT COULD CHANGE A
+	// VERDICT — a new sentinel classified as dead, a different sample ladder, a
+	// path that stops failing open. The constant itself lives in pkg/storage
+	// because its READER, EntryHealth.IsDue, cannot import pkg/manager; bump it
+	// there (storage.RepairProbeVersion) and this alias follows.
+	repairProbeVersion = storage.RepairProbeVersion
 )
 
 // candidate is the unit of work for a sweep. One per entry-folder.
@@ -490,6 +501,9 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	h.BrokenCount = len(broken)
 	h.Fingerprint = storage.EntryItemRepairFingerprint(c.item)
 	h.LastCheckedAt = time.Now()
+	// Stamp WHICH algorithm reached this verdict, not just when. A future probe
+	// change bumps repairProbeVersion and this record becomes due on sight.
+	h.ProbeVersion = repairProbeVersion
 	h.NextCheckDueAt = h.LastCheckedAt.Add(r.verdictRecheckDelay(final))
 	h.Dirty = false
 	h.DirtyReason = ""
@@ -541,6 +555,7 @@ func (r *Repair) recordStructurallyEmptyEntry(h *storage.EntryHealth, item *stor
 	h.BrokenCount = 0
 	h.Fingerprint = storage.EntryItemRepairFingerprint(item)
 	h.LastCheckedAt = now
+	h.ProbeVersion = repairProbeVersion
 	h.LastFailedAt = now
 	h.FailureReason = reasonEntryHasNoFiles
 	// A structural verdict takes the FULL recheck interval, never the short
@@ -602,6 +617,11 @@ func (r *Repair) downgradeUnverifiableHealth(name string) {
 	h.ActiveRunID = ""
 	h.FailureReason = "entry_item_unreadable"
 	h.LastCheckedAt = time.Now()
+	// This IS a CHECK outcome from the current algorithm ("could not verify"),
+	// and it carries the short indeterminate retry. Stamping it is what lets that
+	// retry actually gate scheduling instead of the record staying permanently
+	// version-stale and re-attempted every single run.
+	h.ProbeVersion = repairProbeVersion
 	h.NextCheckDueAt = h.LastCheckedAt.Add(r.verdictRecheckDelay(storage.HealthUnknown))
 	r.saveHealth(h)
 }
@@ -685,14 +705,24 @@ func isDeadContentVerdict(err error) bool {
 	if errors.Is(err, customerror.HosterUnavailableError) || errors.Is(err, debridTypes.EmptyDownloadLinkError) {
 		return true
 	}
+	// One predicate, shared with the SERVE path. handlePropfind drops a child
+	// from a collection listing on exactly this condition; the probe condemns a
+	// file on exactly this condition. They were separate expressions once, and
+	// they drifted: PROPFIND hid every child of an entry while the probe recorded
+	// "no verdict" for the same files. See customerror.IsContentPermanentlyGone.
+	return customerror.IsContentPermanentlyGone(err)
+}
+
+// deadContentReason names WHICH definitive verdict condemned a file, so the
+// stored failure_reason distinguishes "the provider says the articles are gone"
+// from "the hoster says the content is gone" without an operator having to
+// re-run anything.
+func deadContentReason(err error, fallback string) string {
 	var custom *customerror.Error
-	if errors.As(err, &custom) {
-		switch custom.Code {
-		case "usenet_article_missing", "usenet_segment_missing", "debrid_content_gone":
-			return true
-		}
+	if errors.As(err, &custom) && custom.Code != "" {
+		return custom.Code
 	}
-	return false
+	return fallback
 }
 
 // countingWriter counts payload bytes without retaining them. Probe reads must
@@ -755,16 +785,48 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 		// The STAT sample passed. That only proves the message ids exist; it
 		// moved ZERO bytes, so it cannot see a post that is present but carries
 		// no decodable payload. Fall through to the byte-level verification.
-	case errors.Is(err, customerror.UsenetSegmentMissingError):
-		res.broken = true
-		res.reason = "usenet_segment_missing"
+	case errors.Is(err, usenet.ErrNZBNotFound):
+		// THE SEGMENT MAP IS GONE FROM DISK — decypharr lost its own index, which
+		// says NOTHING about whether the content is still on the providers.
+		//
+		// This is checked FIRST and given its own reason on purpose. It used to
+		// fall through to `usenet_probe_error`, sharing a single reason code with
+		// the genuinely-dead case below; separating them is the whole point. A
+		// lost index must never be able to masquerade as dead content, because
+		// dead content is deletable and a missing local file is not a reason to
+		// delete anything. Non-actionable: rolls up to `unknown`.
+		res.reason = "usenet_meta_missing"
 		return res
 	case errors.Is(err, usenet.ErrAvailabilityIndeterminate):
 		// The substrate failed, the content did not. Neither healthy nor broken
 		// — rolls up to `unknown`, which no destructive component acts on.
+		//
+		// ORDERED AHEAD OF THE DEAD-CONTENT CASES DELIBERATELY. The two are
+		// disjoint today (classifyAvailability formats the underlying error with
+		// %v, not %w, so an indeterminate never wraps a typed content verdict),
+		// but if that ever changes the SAFE outcome must be the one that wins by
+		// default. Mis-reading a collapsed substrate as dead content deletes data;
+		// mis-reading dead content as indeterminate only delays a cleanup.
 		res.reason = "usenet_probe_indeterminate"
 		return res
+	case errors.Is(err, customerror.UsenetSegmentMissingError):
+		res.broken = true
+		res.reason = "usenet_segment_missing"
+		return res
+	case isDeadContentVerdict(err):
+		// A DEFINITIVE statement that the content is gone — today, the durable
+		// IsDeleted flag, which only a 430/423 or a zero-payload article can set.
+		// The serve path already answers 410 Gone and hides this file from its
+		// parent listing; before this case existed the probe called the identical
+		// condition `usenet_probe_error` and left the entry non-actionable, so an
+		// entry that served an EMPTY directory to every client was recorded as
+		// "could not reach a verdict" rather than dead.
+		res.broken = true
+		res.reason = deadContentReason(err, "usenet_content_missing")
+		return res
 	default:
+		// Everything unclassified — including a file with a genuinely empty
+		// segment list — stays here: never healthy, never broken.
 		res.reason = "usenet_probe_error"
 		return res
 	}

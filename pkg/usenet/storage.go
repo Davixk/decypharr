@@ -34,7 +34,30 @@ const (
 // retrying it against the replacement would corrupt the new lifecycle.
 var (
 	ErrStaleNZBGeneration = errors.New("stale NZB generation")
-	ErrNZBNotFound        = errors.New("NZB not found")
+
+	// ErrNZBNotFound means the durable NZB META FILE is not on disk. It is a
+	// statement about decypharr's OWN bookkeeping — the segment map is lost —
+	// and carries NO verdict whatsoever about whether the content still exists
+	// on the providers. It must never be classified as dead content, because a
+	// dead verdict is destructive-eligible under PRUNE and losing a local index
+	// file is not a reason to delete anything.
+	ErrNZBNotFound = errors.New("NZB not found")
+
+	// ErrFilePermanentlyFailed means the named file EXISTS in the durable NZB
+	// meta and is flagged IsDeleted: articles definitively missing on the
+	// provider. It is the one and only in-meta condition that is a genuine
+	// content verdict.
+	//
+	// IsDeleted has exactly one writer —
+	// markFilePermanentlyFailedWithLifecycleHeld — reachable only through
+	// recordPermanentArticleFailureForGeneration, whose two call sites are both
+	// gated on nntp.IsContentMissingError / nntp.IsArticleNotFoundError. Those
+	// classify ONLY a 430/423 or an article that decoded to no yEnc payload at
+	// all; internal/nntp explicitly excludes connection, timeout, server-busy,
+	// authentication, permission and no-available-connection failures. A
+	// provider outage therefore cannot set this flag, which is what makes the
+	// subset safe to act on.
+	ErrFilePermanentlyFailed = errors.New("usenet file permanently failed: articles missing on provider")
 )
 
 func newNZBGeneration() string { return uuid.NewString() }
@@ -646,8 +669,22 @@ func (s *NZBStorage) HasSegmentedFiles(id string) (bool, error) {
 // used by availability/repair probes. For v2 blobs it decodes only that file's
 // sampled ids (no numeric columns, no NZBSegment allocation, no other files),
 // which keeps repair sweeps from holding full segment maps in memory. Legacy
-// proto files fall back to a full decode. A nil slice with nil error means the
-// file was not found or has no segments.
+// proto files fall back to a full decode.
+//
+// Three outcomes must stay DISTINGUISHABLE, because they mean three different
+// things to a probe that can trigger deletion:
+//
+//   - (nil, ErrNZBNotFound)          — the segment map is gone from disk. Says
+//     NOTHING about the content. Non-actionable.
+//   - (nil, ErrFilePermanentlyFailed) — the file is flagged IsDeleted: a
+//     definitive provider verdict that its articles are missing. Dead content.
+//   - (nil, nil)                      — the file is absent from the meta, or is
+//     present with an empty segment list. No verdict either way.
+//
+// The third case used to swallow the second: the lookup filtered deleted files
+// out, so a permanently-failed file returned a silent (nil, nil) and the probe
+// could only report `usenet_probe_error`, while the serve path was already
+// answering 410 Gone for the very same file.
 func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -663,6 +700,9 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 
 	if isCodecV2(data) {
 		ids, _, err := decodeFileMessageIDsSampled(data, filename, percent)
+		if errors.Is(err, ErrFilePermanentlyFailed) {
+			return nil, fmt.Errorf("%w: %s/%s", ErrFilePermanentlyFailed, id, filename)
+		}
 		return ids, err
 	}
 
@@ -672,7 +712,15 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 		return nil, err
 	}
 	f := nzb.GetFileByName(filename)
-	if f == nil || len(f.Segments) == 0 {
+	if f == nil {
+		// GetFileByName skips deleted files, so an absence here is ambiguous.
+		// Resolve it against the raw file list instead of inferring.
+		if nzbFileMarkedDeleted(nzb, filename) {
+			return nil, fmt.Errorf("%w: %s/%s", ErrFilePermanentlyFailed, id, filename)
+		}
+		return nil, nil
+	}
+	if len(f.Segments) == 0 {
 		return nil, nil
 	}
 	want := sampleIndices(len(f.Segments), percent)
@@ -681,6 +729,26 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 		ids = append(ids, f.Segments[idx].MessageID)
 	}
 	return ids, nil
+}
+
+// nzbFileMarkedDeleted reports whether filename is present in the meta and
+// EVERY entry of that name is flagged IsDeleted. A live namesake wins: the file
+// is only "permanently failed" when nothing of that name can still be served.
+func nzbFileMarkedDeleted(nzb *storage.NZB, filename string) bool {
+	if nzb == nil {
+		return false
+	}
+	found := false
+	for i := range nzb.Files {
+		if nzb.Files[i].Name != filename {
+			continue
+		}
+		if !nzb.Files[i].IsDeleted {
+			return false
+		}
+		found = true
+	}
+	return found
 }
 
 // decodeNZB decodes a meta blob, supporting both the v2 codec and legacy

@@ -223,6 +223,46 @@ func (s *Storage) ClearRepairRuns() error {
 	return nil
 }
 
+// RepairProbeVersion identifies WHICH CHECK PROBE ALGORITHM produced a stored
+// verdict. It is stamped onto every health record the probe writes
+// (EntryHealth.ProbeVersion) and read back by EntryHealth.IsDue.
+//
+// BUMP THIS WHENEVER PROBE LOGIC CHANGES IN A WAY THAT COULD CHANGE A VERDICT.
+//
+// That is the whole rule, and it is the point of the constant: a verdict is only
+// as trustworthy as the algorithm that produced it, so a record written by an
+// older algorithm is treated as DUE regardless of its NextCheckDueAt. Without
+// this, correcting the probe leaves the corrected build gated behind its
+// predecessor's mistakes — a library of stale `healthy` verdicts, each carrying
+// a next_check_due_at up to a full recheck interval away, that the new probe is
+// not allowed to re-examine. That happened in production: the run immediately
+// after a probe fix reported candidates=0, probed=0, skipped_fresh=47627.
+//
+// Versioning the verdict rather than clearing the timestamps makes that failure
+// mode structurally impossible for every FUTURE probe change too, with no
+// one-shot migration to write and remember.
+//
+// History:
+//
+//	0 (field absent) — every verdict written before verdict versioning existed.
+//	                   Includes the metadata-level probe that moved ZERO bytes
+//	                   and reported `healthy` for content that was 100%
+//	                   unreadable. NEVER trusted; always re-probed.
+//	1               — byte-verifying probe: real payload transferred at multiple
+//	                  sampled offsets, three-way healthy/broken/unknown verdict
+//	                  discipline, bad-marked entries condemned outright.
+//	2               — usenet dead-content classification. A file flagged
+//	                  IsDeleted in the durable NZB meta (a flag only a definitive
+//	                  430/423 or a zero-payload article can set) now reaches
+//	                  `broken` instead of the catch-all `usenet_probe_error`, and
+//	                  a MISSING SEGMENT MAP (ErrNZBNotFound) is split out to its
+//	                  own non-actionable `usenet_meta_missing`. Version 1 funnelled
+//	                  both into one reason and acted on neither, which is how
+//	                  entries that served an EMPTY directory over WebDAV — the
+//	                  serve path already answering 410 Gone for every child —
+//	                  recorded `unknown` with file_count 1 and sat un-actioned.
+const RepairProbeVersion = 2
+
 // HealthStatus is the rolled-up state of an entry as seen by the repair system.
 type HealthStatus string
 
@@ -282,6 +322,22 @@ type EntryHealth struct {
 	BrokenCount   int             `json:"broken_count"`
 	BrokenFiles   []BrokenFile    `json:"broken_files,omitempty"`
 	FailureReason string          `json:"failure_reason,omitempty"`
+
+	// ProbeVersion is the RepairProbeVersion of the CHECK probe that produced
+	// this verdict. Stamped by every probe write; read by IsDue, which treats
+	// anything below the current RepairProbeVersion as due for re-probing no
+	// matter what NextCheckDueAt says.
+	//
+	// ON-DISK COMPATIBILITY: repair state is stored as an opaque JSON blob, so
+	// this is an additive field in both directions. A record written before this
+	// field existed simply omits the key and decodes to 0 — the "ancient /
+	// unknown algorithm" sentinel, which is exactly the treatment it needs. An
+	// older build reading a record written by this one ignores the unknown key
+	// (its own decoder is not strict) and, if it rewrites the record, drops the
+	// key back to absent — which this build then reads as 0 and re-probes. Every
+	// ambiguity therefore resolves toward re-probing, never toward trusting an
+	// unverified verdict.
+	ProbeVersion int `json:"probe_version,omitempty"`
 
 	// Structural marks a verdict the probe reached WITHOUT being able to
 	// change its mind on any future run: the entry-item lists no probeable
@@ -349,6 +405,11 @@ func (h *EntryHealth) SetActionSkip(component, reason string) {
 // every file-set mutation goes through MarkEntryDirty (handled above), so it is
 // safe to fall through to the plain staleness check and revisit it once per
 // recheck interval as a backstop rather than once per run.
+//
+// The other exception is a verdict produced by an OLDER PROBE ALGORITHM (see
+// RepairProbeVersion): its freshness is meaningless because its correctness is
+// unknown, so it is due immediately regardless of NextCheckDueAt or how
+// recently it was checked.
 func (h *EntryHealth) IsDue(now time.Time, recheck time.Duration) bool {
 	if h == nil {
 		return true
@@ -357,6 +418,16 @@ func (h *EntryHealth) IsDue(now time.Time, recheck time.Duration) bool {
 		return true
 	}
 	if h.LastCheckedAt.IsZero() {
+		return true
+	}
+	// A verdict is only as good as the probe that produced it. Anything stamped
+	// below the current algorithm — including every record written before this
+	// field existed, which decodes to 0 — is UNTRUSTWORTHY, not merely stale, so
+	// no freshness deadline it carries may suppress a re-probe. This check sits
+	// ahead of the status switch deliberately: `healthy` is precisely the status
+	// whose stale verdicts are most dangerous and most likely to be shielded by a
+	// week-long next_check_due_at.
+	if h.ProbeVersion < RepairProbeVersion {
 		return true
 	}
 	switch h.Status {

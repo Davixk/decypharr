@@ -145,6 +145,55 @@ func NewArticleNotFoundError(err error) *Error {
 	}).Permanent()
 }
 
+// IsContentPermanentlyGone reports whether err is a DEFINITIVE, durable
+// statement that the bytes behind a resource no longer exist — as opposed to a
+// failure of the machinery that was asked about them.
+//
+// This is the SINGLE predicate shared by the two sides that must never disagree:
+//
+//   - the SERVE path (WebDAV PROPFIND), which drops such a child from a
+//     collection listing rather than advertising a resource every read of which
+//     will fail; and
+//   - the REPAIR probe, which classifies such a file as broken — a verdict that
+//     is destructive-eligible under PRUNE.
+//
+// They drifted once, and the drift is exactly the production bug this exists to
+// prevent: PROPFIND hid every child of an entry (410 Gone) while the probe
+// recorded "could not reach a verdict" for the very same files, so an entry that
+// served an EMPTY directory to every client sat forever in a non-actionable
+// state. One predicate, two callers, no room to disagree again.
+//
+// Membership is deliberately narrow. Only errors that CARRY A CONTENT VERDICT
+// qualify:
+//
+//   - usenet_article_missing — a 430/423 from the provider, or the durable
+//     IsDeleted flag that only such a verdict can set.
+//   - usenet_segment_missing — sampled segments definitively absent on every
+//     configured provider.
+//   - debrid_content_gone    — the hoster answered 404/410 for the content.
+//   - any other PERMANENT error carrying HTTP 410 Gone.
+//
+// Everything else is excluded on purpose: authentication (401), permission,
+// rate limiting (429), 5xx, timeouts, connection failures, "no connection could
+// be acquired", cancellations, invalid-metadata errors, and a MISSING SEGMENT
+// MAP (usenet.ErrNZBNotFound). Those describe a broken substrate or lost local
+// bookkeeping — they say nothing whatsoever about whether the content is alive,
+// and treating any of them as gone would condemn a library on an outage.
+func IsContentPermanentlyGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	var e *Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	switch e.Code {
+	case "usenet_article_missing", "usenet_segment_missing", "debrid_content_gone":
+		return true
+	}
+	return e.permanent && e.statusCode == http.StatusGone
+}
+
 // NewContentGoneError is the debrid analog of NewArticleNotFoundError: the
 // download link resolved but the upstream reports the content is definitively
 // gone (HTTP 404/410). It carries a permanent 410 so the WebDAV layer maps it

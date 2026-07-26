@@ -475,6 +475,127 @@ func TestManualRecheckMediaHonoursDeletionCap(t *testing.T) {
 	}
 }
 
+// TestProbeStampsCurrentProbeVersion closes the loop between the probe and the
+// scheduler at the level the production failure actually happened.
+//
+// Deploying the corrected probe produced: candidates=0, probed=0,
+// skipped_fresh=47627. Every record carried a next_check_due_at written by the
+// OLD probe — the one that moved zero bytes and failed open — so the corrected
+// probe was not allowed to re-examine the library for up to a full recheck
+// interval. This drives the whole path: a pre-versioning record must survive
+// filterDueCandidates (the function that computes skipped_fresh), and the probe
+// that then runs must stamp its own algorithm identity so the NEXT sweep can
+// legitimately skip it as fresh.
+func TestProbeStampsCurrentProbeVersion(t *testing.T) {
+	m, r, _, _ := newRepairCapFixture(t, 0)
+
+	const name = "VersionedMovie"
+	seedBrokenEntry(t, m, "version-stamp", name)
+
+	// The production shape: healthy, probed "seconds ago" by the old probe, and
+	// parked a full recheck interval out. ProbeVersion is deliberately left at
+	// its zero value — that is what a record written before this field existed
+	// decodes to.
+	recheck := r.recheckInterval()
+	stale := &storage.EntryHealth{
+		EntryName:      name,
+		Protocol:       config.ProtocolTorrent,
+		Status:         storage.HealthHealthy,
+		FileCount:      1,
+		LastCheckedAt:  time.Now(),
+		LastOKAt:       time.Now(),
+		NextCheckDueAt: time.Now().Add(recheck),
+	}
+	if err := m.storage.SaveEntryHealth(stale); err != nil {
+		t.Fatalf("SaveEntryHealth: %v", err)
+	}
+
+	item, err := m.storage.GetEntryItem(name)
+	if err != nil || item == nil {
+		t.Fatalf("GetEntryItem(%s): %v", name, err)
+	}
+	c := &candidate{name: name, item: item}
+
+	// The sweep's own selection must pick it up, and must NOT count it as fresh.
+	due, skippedFresh := r.filterDueCandidates(map[string]*candidate{name: c}, false)
+	if _, ok := due[name]; !ok {
+		t.Fatalf("an entry whose verdict came from an older probe was not selected; skipped_fresh=%d", skippedFresh)
+	}
+	if skippedFresh != 0 {
+		t.Fatalf("skipped_fresh = %d, want 0 — a pre-versioning verdict must never suppress a re-probe", skippedFresh)
+	}
+
+	h, _ := r.probeEntry(context.Background(), "run-version-stamp", c, newHealCache(), RepairRunOptions{}, false)
+	if h == nil {
+		t.Fatal("probeEntry returned nil; it must record a verdict")
+	}
+	if h.ProbeVersion != repairProbeVersion {
+		t.Fatalf("probeEntry wrote ProbeVersion = %d, want %d; an unstamped verdict is re-probed forever", h.ProbeVersion, repairProbeVersion)
+	}
+
+	saved, err := m.storage.GetEntryHealth(name)
+	if err != nil || saved == nil {
+		t.Fatalf("GetEntryHealth: %v", err)
+	}
+	if saved.ProbeVersion != storage.RepairProbeVersion {
+		t.Fatalf("persisted ProbeVersion = %d, want %d", saved.ProbeVersion, storage.RepairProbeVersion)
+	}
+
+	// And the sweep AFTER this one must be allowed to skip it again on
+	// freshness — otherwise the change trades a suppressed sweep for a permanent
+	// full-library re-probe. (This entry probes broken, which is always-due by
+	// design, so assert on a healthy record carrying the stamp the probe wrote.)
+	saved.Status = storage.HealthHealthy
+	saved.Structural = false
+	if saved.IsDue(time.Now(), recheck) {
+		t.Fatal("a freshly-stamped healthy verdict is still due; freshness must keep working at the current version")
+	}
+}
+
+// TestStructuralProbeStampsCurrentProbeVersion covers the other verdict-writing
+// path: an entry-item that lists no probeable file never reaches probeFiles, so
+// it needs its own stamp or it would be re-probed on every single run forever.
+func TestStructuralProbeStampsCurrentProbeVersion(t *testing.T) {
+	_, r := newProbeFixture(t, nil)
+	c := &candidate{name: "EmptyRelease", item: &storage.EntryItem{Name: "EmptyRelease", Files: map[string]*storage.File{}}}
+
+	h, _ := r.probeEntry(context.Background(), "run-structural-version", c, newHealCache(), RepairRunOptions{}, false)
+	if h == nil {
+		t.Fatal("probeEntry returned nil for a readable zero-file entry")
+	}
+	if h.ProbeVersion != repairProbeVersion {
+		t.Fatalf("structural verdict wrote ProbeVersion = %d, want %d", h.ProbeVersion, repairProbeVersion)
+	}
+}
+
+// TestDowngradeUnverifiableHealthStampsCurrentProbeVersion covers the third
+// verdict-writing path. It is a CHECK outcome from the current algorithm ("could
+// not verify"), and it carries the short indeterminate retry — leaving it
+// unstamped would make that retry unreachable and re-attempt the entry every run.
+func TestDowngradeUnverifiableHealthStampsCurrentProbeVersion(t *testing.T) {
+	m, r := newProbeFixture(t, nil)
+	if err := m.storage.SaveEntryHealth(&storage.EntryHealth{
+		EntryName: "Unloadable",
+		Status:    storage.HealthHealthy,
+		LastOKAt:  time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatalf("SaveEntryHealth: %v", err)
+	}
+
+	r.downgradeUnverifiableHealth("Unloadable")
+
+	got, err := m.storage.GetEntryHealth("Unloadable")
+	if err != nil || got == nil {
+		t.Fatalf("GetEntryHealth: %v", err)
+	}
+	if got.ProbeVersion != repairProbeVersion {
+		t.Fatalf("downgrade wrote ProbeVersion = %d, want %d", got.ProbeVersion, repairProbeVersion)
+	}
+	if got.IsDue(time.Now(), r.recheckInterval()) {
+		t.Fatal("a freshly-stamped unverifiable verdict is due immediately; its short retry deadline must gate it")
+	}
+}
+
 // TestRecheckEntryCarriesDeletionBudget pins that the single-entry manual path
 // now runs under a real budget (it used to pass nil, silently opting out of the
 // only mass-delete guard) without that budget blocking its one legitimate

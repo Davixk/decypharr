@@ -230,6 +230,14 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 		var infos []FileInfo
 		seen := make(map[string]struct{})
 		err := m.storage.ForEachMeta(func(meta *storage.EntryMetaInfo) error {
+			if meta.Name == "" {
+				// Internal bookkeeping rows (e.g. __migration_status__) are stored
+				// in the same index with nil metadata, so they decode to a blank
+				// Name. ForEachMeta does not filter them the way ForEach/List do,
+				// and a blank-named child both claims the seen[""] slot and
+				// advertises an unopenable directory on the mount.
+				return nil
+			}
 			if _, ok := seen[meta.Name]; ok {
 				return nil
 			}
@@ -248,7 +256,7 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 		if err != nil {
 			return nil, nil
 		}
-		return currentDir, infos
+		return currentDir, m.reconcileAllFolderChildren(infos, seen)
 	case EntryTorrentFolder:
 		// This returns all torrents - using metadata-only iteration
 		var infos []FileInfo
@@ -363,6 +371,100 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 		// Custom folder
 		return currentDir, m.getCustomFolderChildren(group)
 	}
+}
+
+// reconcileAllFolderChildren makes the `__all__` listing advertise every entry
+// that is actually NAVIGABLE, and reports every listed name that is not.
+//
+// THE BUG IT FIXES. The listing and the folder it links to derive their names
+// from the same function, storage.Entry.GetFolder(), at two different times:
+//
+//   - the LISTING name is IndexEntry.Name — computed once, at the entry's last
+//     Put, and then frozen on disk. Nothing recomputes it: the metadata
+//     migration self-selects out for any row that already carries a Protocol.
+//   - the NAVIGABLE name is the entryItems key — re-derived live, and rebuilt
+//     for every entry on every boot by reconcileEntryItemsAtStartup.
+//
+// GetFolder() reads the process-global config.FolderNaming, so it is not a pure
+// function of the stored entry. Change that setting (or an entry's Name) without
+// re-Putting the entry and the two permanently disagree: `filename` keeps a
+// media extension, `filename_no_ext` strips it. Observed in production on 9
+// entries — the listing advertised `<name>.mkv`, which resolves to nothing
+// (PROPFIND 207 with zero children, /api/browse "Torrent not found"), while the
+// real, byte-serving `<name>` was never emitted at all. rclone mirrors the
+// listing faithfully, so Plex and the *arrs saw an empty phantom directory where
+// working content lived.
+//
+// THE FIX IS PURELY ADDITIVE. Every entryItems key missing from the listing is
+// appended; nothing that is advertised today is removed. That matters twice
+// over: it cannot rename an on-mount path (these names ALREADY resolve — they
+// are the keys the mount, the API and the repair sweep have always used), and a
+// freshly-added entry whose derived row lags briefly cannot be hidden by it.
+//
+// Phantoms are counted and logged rather than dropped, so the affected set is
+// enumerable without guessing. Dropping them is a separate decision.
+//
+// THIS IS A VISIBILITY FIX AND NOTHING ELSE. Listing membership is never
+// consulted by any health verdict: the repair sweep enumerates entryItems keys
+// directly (enumerateManagedCandidates), so no entry can be classified broken —
+// and therefore pruned — for being absent here. These 9 entries are alive and
+// serve full range reads; the listing was the only thing wrong with them.
+func (m *Manager) reconcileAllFolderChildren(infos []FileInfo, listed map[string]struct{}) []FileInfo {
+	navigable := m.storage.GetEntryItems()
+	if len(navigable) == 0 {
+		return infos
+	}
+
+	var restored []string
+	for name := range navigable {
+		if _, ok := listed[name]; ok {
+			continue
+		}
+		item, err := m.storage.GetEntryItem(name)
+		if err != nil || item == nil || len(item.Files) == 0 {
+			continue
+		}
+		info := FileInfo{
+			name:      name,
+			size:      item.GetSize(),
+			isDir:     true,
+			canDelete: true,
+		}
+		for _, f := range item.Files {
+			if f == nil || f.Deleted {
+				continue
+			}
+			info.infohash = f.InfoHash
+			info.modTime = f.AddedOn
+			break
+		}
+		if info.infohash == "" {
+			// Every file soft-deleted: nothing to navigate to.
+			continue
+		}
+		infos = append(infos, info)
+		restored = append(restored, name)
+	}
+
+	phantoms := 0
+	for name := range listed {
+		if _, ok := navigable[name]; !ok {
+			phantoms++
+		}
+	}
+
+	if len(restored) > 0 || phantoms > 0 {
+		event := m.logger.Warn().
+			Int("restored", len(restored)).
+			Int("phantom_names", phantoms).
+			Int("listed", len(listed)).
+			Int("navigable", len(navigable))
+		if len(restored) > 0 {
+			event = event.Strs("restored_entries", restored[:min(len(restored), 50)])
+		}
+		event.Msg("__all__ listing disagreed with the navigable entry set; servable entries restored to the listing")
+	}
+	return infos
 }
 
 func (m *Manager) getTorrentChildren(name string) (*FileInfo, []FileInfo) {

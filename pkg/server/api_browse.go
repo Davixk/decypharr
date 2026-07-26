@@ -41,6 +41,57 @@ type BrowseResponse struct {
 	ParentDir  string        `json:"parent_dir,omitempty"`
 }
 
+const (
+	// browseDefaultLimit is the page size used when the caller does not ask for
+	// one (or asks for a nonsensical one).
+	browseDefaultLimit = 50
+
+	// browseMaxLimit is the largest page a caller may request.
+	//
+	// It was 100, and — far worse — exceeding it SILENTLY RESET the page size to
+	// browseDefaultLimit instead of clamping. Asking for more therefore returned
+	// FEWER: `limit=5000` yielded 50 rows, the same as asking for nothing, with
+	// nothing in the response to say the request had been overridden. /api/browse
+	// is the only unfiltered view of the entry set, so that behaviour made it
+	// useless for enumerating a library — which is exactly what it was reached
+	// for while measuring the blast radius of a listing bug.
+	//
+	// Now: out-of-range values CLAMP. The response already reports the effective
+	// Limit alongside Total and TotalPages, so a caller can always tell what it
+	// actually got and page the remainder deterministically.
+	browseMaxLimit = 1000
+)
+
+// browsePageParams parses page/limit identically for every browse handler.
+// Three copies of this arithmetic drifted apart once already; one function is
+// the fix.
+func browsePageParams(r *http.Request) (page, limit int) {
+	page, _ = strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+
+	limit, _ = strconv.Atoi(r.URL.Query().Get("limit"))
+	switch {
+	case limit < 1:
+		limit = browseDefaultLimit
+	case limit > browseMaxLimit:
+		limit = browseMaxLimit
+	}
+	return page, limit
+}
+
+// paginateBrowseEntries returns the requested page and the total page count.
+func paginateBrowseEntries(entries []BrowseEntry, page, limit int) ([]BrowseEntry, int) {
+	total := len(entries)
+	totalPages := (total + limit - 1) / limit
+	offset := (page - 1) * limit
+	if offset >= total {
+		return []BrowseEntry{}, totalPages
+	}
+	return entries[offset:min(offset+limit, total)], totalPages
+}
+
 func getBrowseSortParams(r *http.Request) (string, string) {
 	sortBy := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort_by")))
 	sortOrder := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort_order")))
@@ -104,15 +155,7 @@ func sortBrowseEntries(entries []BrowseEntry, sortBy, sortOrder string) {
 
 // handleBrowseMount returns subdirectories under a mount (__all__, __bad__, etc.)
 func (s *Server) handleBrowseMount(w http.ResponseWriter, r *http.Request) {
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
-
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit < 1 || limit > 100 {
-		limit = 50
-	}
+	page, limit := browsePageParams(r)
 	sortBy, sortOrder := getBrowseSortParams(r)
 
 	children := s.manager.GetEntries()
@@ -131,22 +174,11 @@ func (s *Server) handleBrowseMount(w http.ResponseWriter, r *http.Request) {
 	}
 	sortBrowseEntries(entries, sortBy, sortOrder)
 
-	// Apply pagination
-	total := len(entries)
-	totalPages := (total + limit - 1) / limit
-	offset := (page - 1) * limit
-
-	var paginatedEntries []BrowseEntry
-	if offset < total {
-		end := min(offset+limit, total)
-		paginatedEntries = entries[offset:end]
-	} else {
-		paginatedEntries = []BrowseEntry{}
-	}
+	paginatedEntries, totalPages := paginateBrowseEntries(entries, page, limit)
 
 	utils.JSONResponse(w, BrowseResponse{
 		Entries:    paginatedEntries,
-		Total:      total,
+		Total:      len(entries),
 		Page:       page,
 		Limit:      limit,
 		TotalPages: totalPages,
@@ -158,15 +190,7 @@ func (s *Server) handleBrowseMount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleBrowseGroup(w http.ResponseWriter, r *http.Request) {
 	group := utils.PathUnescape(chi.URLParam(r, "group"))
 
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
-
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit < 1 || limit > 100 {
-		limit = 50
-	}
+	page, limit := browsePageParams(r)
 	sortBy, sortOrder := getBrowseSortParams(r)
 
 	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
@@ -204,22 +228,11 @@ func (s *Server) handleBrowseGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	sortBrowseEntries(entries, sortBy, sortOrder)
 
-	// Apply pagination
-	total := len(entries)
-	totalPages := (total + limit - 1) / limit
-	offset := (page - 1) * limit
-
-	var paginatedEntries []BrowseEntry
-	if offset < total {
-		end := min(offset+limit, total)
-		paginatedEntries = entries[offset:end]
-	} else {
-		paginatedEntries = []BrowseEntry{}
-	}
+	paginatedEntries, totalPages := paginateBrowseEntries(entries, page, limit)
 
 	utils.JSONResponse(w, BrowseResponse{
 		Entries:    paginatedEntries,
-		Total:      total,
+		Total:      len(entries),
 		Page:       page,
 		Limit:      limit,
 		TotalPages: totalPages,
@@ -233,15 +246,7 @@ func (s *Server) handleBrowseTorrentFiles(w http.ResponseWriter, r *http.Request
 	group := utils.PathUnescape(chi.URLParam(r, "group"))
 	torrent := utils.PathUnescape(chi.URLParam(r, "torrent"))
 
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
-	}
-
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if limit < 1 || limit > 100 {
-		limit = 50
-	}
+	page, limit := browsePageParams(r)
 	sortBy, sortOrder := getBrowseSortParams(r)
 
 	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
@@ -275,18 +280,7 @@ func (s *Server) handleBrowseTorrentFiles(w http.ResponseWriter, r *http.Request
 	}
 	sortBrowseEntries(entries, sortBy, sortOrder)
 
-	// Apply pagination
-	total := len(entries)
-	totalPages := (total + limit - 1) / limit
-	offset := (page - 1) * limit
-
-	var paginatedEntries []BrowseEntry
-	if offset < total {
-		end := min(offset+limit, total)
-		paginatedEntries = entries[offset:end]
-	} else {
-		paginatedEntries = []BrowseEntry{}
-	}
+	paginatedEntries, totalPages := paginateBrowseEntries(entries, page, limit)
 
 	parentPath := "/" + group
 
@@ -294,7 +288,7 @@ func (s *Server) handleBrowseTorrentFiles(w http.ResponseWriter, r *http.Request
 
 	response := BrowseResponse{
 		Entries:    paginatedEntries,
-		Total:      total,
+		Total:      len(entries),
 		Page:       page,
 		Limit:      limit,
 		TotalPages: totalPages,
