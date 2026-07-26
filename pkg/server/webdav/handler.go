@@ -75,12 +75,19 @@ func (h *Handler) Routes() chi.Router {
 	// takes effect without rebuilding the router (no restart).
 	r.Use(h.authMiddleware)
 
+	h.registerRoutes(r)
+	return r
+}
+
+// registerRoutes installs the resource routes on r. Split out from Routes so the
+// exact production route table can be driven directly in tests, without the
+// readiness gate that only a fully started Manager can open.
+func (h *Handler) registerRoutes(r chi.Router) {
 	r.HandleFunc("/", h.handleRoot)
 	r.HandleFunc("/{group}", h.handleGroup)
 	r.HandleFunc("/{group}/{torrent}", h.handleTorrentFolder)
 	r.HandleFunc("/{group}/{torrent}/{file}", h.handleTorrentFile)
 	r.HandleFunc("/stream/{group}/{torrent}/{file}", h.handleTorrentFile)
-	return r
 }
 
 func (h *Handler) IsDisabled() bool {

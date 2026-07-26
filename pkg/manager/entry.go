@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,6 +21,8 @@ const (
 	EntryBadFolder     string = "__bad__"
 	EntryTorrentFolder string = "torrents"
 	EntryNZBFolder     string = "nzbs"
+	// EntryVersionFile is the only non-directory node at the mount root.
+	EntryVersionFile string = "version.txt"
 )
 
 var (
@@ -129,7 +132,7 @@ func (m *Manager) GetEntries() []FileInfo {
 	// will hang/short-read waiting for bytes the backend never produces.
 	versionContent := []byte(version.GetInfo().String() + "\n")
 	subDirs = append(subDirs, FileInfo{
-		name:    "version.txt",
+		name:    EntryVersionFile,
 		isDir:   false,
 		modTime: now,
 		size:    int64(len(versionContent)),
@@ -142,17 +145,71 @@ func (m *Manager) GetEntryChildren(group string) (*FileInfo, []FileInfo) {
 	return m.entry.Get(group)
 }
 
+// isEntryGroup reports whether `group` names a REAL top-level node, i.e. one of
+// the names GetEntries() actually advertises at the mount root:
+//
+//   - the four built-in folders __all__, __bad__, torrents, nzbs
+//   - one folder per configured debrid client
+//   - every configured custom folder
+//   - the version.txt metadata file
+//
+// The set is deliberately read from the same three sources GetEntries() emits
+// from, so the root listing and the per-name lookup cannot disagree about what
+// exists.
+//
+// WHY THIS EXISTS. GetEntryNode used to synthesise a directory node for ANY
+// name, so a one-segment PROPFIND on a group that does not exist answered
+// `207 Multi-Status` with a self-entry and no children — byte-for-byte
+// indistinguishable from a real but empty group. The same nonexistent name one
+// level deeper has always returned 404 correctly. That gap is not cosmetic: an
+// operator probing a suspected-missing path read "the directory exists and is
+// empty" off an authoritative-looking 207 and an investigation went the wrong
+// way for a while. A wrong answer that looks valid is worse than an error.
+//
+// This is a MEMBERSHIP test and nothing else. A real group holding no entries
+// still resolves and still lists zero children — telling "real and empty" apart
+// from "does not exist" is the entire point, and collapsing them the other way
+// would hide legitimately empty groups.
+//
+// Nothing here is evidence about content. Group membership never reaches a
+// repair/health verdict; the sweep enumerates entryItems keys directly.
+func (m *Manager) isEntryGroup(group string) bool {
+	switch group {
+	case EntryAllFolder, EntryBadFolder, EntryTorrentFolder, EntryNZBFolder, EntryVersionFile:
+		return true
+	}
+	// Per-provider folders. m.clients is replaced wholesale on a config reload,
+	// so a provider folder can legitimately appear or disappear while the process
+	// runs — which is why the answer is recomputed per lookup and a negative one
+	// is never written to the entry cache.
+	if m.clients != nil {
+		if _, ok := m.clients.Load(group); ok {
+			return true
+		}
+	}
+	if m.customFolders != nil && slices.Contains(m.customFolders.folders, group) {
+		return true
+	}
+	return false
+}
+
 // GetEntryNode returns only a top-level virtual node. Unlike GetEntryChildren
 // it never refreshes or allocates the node's child cache, which keeps WebDAV
 // Depth:0 metadata requests O(1). Most nodes are directories; version.txt is
 // the local metadata file exposed at the mount root.
+//
+// It returns nil for a name that is not a real top-level node, so the WebDAV
+// handler answers 404 rather than rendering an empty collection for it.
 func (m *Manager) GetEntryNode(group string) *FileInfo {
+	if !m.isEntryGroup(group) {
+		return nil
+	}
 	info := &FileInfo{
 		name:    group,
 		modTime: utils.Now(),
 		isDir:   true,
 	}
-	if group == "version.txt" {
+	if group == EntryVersionFile {
 		info.content = []byte(version.GetInfo().String() + "\n")
 		info.size = int64(len(info.content))
 		info.isDir = false
@@ -266,6 +323,13 @@ func (m *Manager) GetTorrentFile(torrentName, fileName string) (*FileInfo, error
 // Uses metadata-only iteration (no disk reads, no protobuf deserialization)
 func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 	currentDir := m.GetEntryNode(group)
+	if currentDir == nil {
+		// Not a real top-level name. Resolving it to nothing is what makes
+		// PROPFIND and /api/browse answer 404 here, exactly as they already do
+		// for a nonexistent name one level deeper. A real-but-empty group still
+		// gets a node from GetEntryNode and falls through to list zero children.
+		return nil, nil
+	}
 	switch group {
 	case EntryAllFolder:
 		// This returns all entries - using metadata-only iteration (no disk reads)
@@ -377,40 +441,44 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 			return nil, nil
 		}
 		return currentDir, infos
-	case "version.txt":
+	case EntryVersionFile:
 		currentDir.content = []byte(version.GetInfo().String() + "\n")
 		currentDir.size = int64(len(currentDir.content))
 		currentDir.isDir = false
 		return currentDir, nil
 	default:
 		// Per-provider folder if the name matches a configured client
-		if _, ok := m.clients.Load(group); ok {
-			var infos []FileInfo
-			seen := make(map[string]struct{})
-			err := m.storage.ForEachMeta(func(meta *storage.EntryMetaInfo) error {
-				if meta.Provider == group {
-					if _, ok := seen[meta.Name]; ok {
-						return nil
+		if m.clients != nil {
+			if _, ok := m.clients.Load(group); ok {
+				var infos []FileInfo
+				seen := make(map[string]struct{})
+				err := m.storage.ForEachMeta(func(meta *storage.EntryMetaInfo) error {
+					if meta.Provider == group {
+						if _, ok := seen[meta.Name]; ok {
+							return nil
+						}
+						seen[meta.Name] = struct{}{}
+						infos = append(infos, FileInfo{
+							infohash:     meta.InfoHash,
+							name:         meta.Name,
+							size:         meta.Size,
+							modTime:      meta.AddedOn,
+							isDir:        true,
+							activeDebrid: meta.Provider,
+							canDelete:    true,
+						})
 					}
-					seen[meta.Name] = struct{}{}
-					infos = append(infos, FileInfo{
-						infohash:     meta.InfoHash,
-						name:         meta.Name,
-						size:         meta.Size,
-						modTime:      meta.AddedOn,
-						isDir:        true,
-						activeDebrid: meta.Provider,
-						canDelete:    true,
-					})
+					return nil
+				})
+				if err != nil {
+					return nil, nil
 				}
-				return nil
-			})
-			if err != nil {
-				return nil, nil
+				return currentDir, infos
 			}
-			return currentDir, infos
 		}
-		// Custom folder
+		// Custom folder. isEntryGroup already established membership, so the
+		// only way to reach here is a configured folder — one whose filters match
+		// nothing simply lists zero children.
 		return currentDir, m.getCustomFolderChildren(group)
 	}
 }

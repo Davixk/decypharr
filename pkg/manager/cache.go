@@ -51,19 +51,30 @@ func (e *EntryCache) refreshEntry(name string) EntryCacheItem {
 // _refreshEntry computes an entry's listing and caches it — but ONLY when the
 // computation actually produced one.
 //
-// A nil `current` is never a fact; it is the failure return of both producers.
-// getTorrentChildren returns (nil, nil) when storage.GetEntryItem ERRORS, and
-// getEntryChildren returns (nil, nil) when ForEachMeta ERRORS. Both are
-// transient I/O outcomes. Caching one used to PIN the entry permanently: the
-// map has no TTL and is cleared only by a global EntryCache.Refresh(), so a
-// single unlucky read made every later PROPFIND answer "not found" from cache
-// while /api/browse, the repair sweep and direct reads all still saw the entry
-// perfectly well.
+// A nil `current` is NEVER something to cache, and it arrives for two different
+// reasons:
+//
+//   - TRANSIENT FAILURE. getTorrentChildren returns (nil, nil) when
+//     storage.GetEntryItem ERRORS, and getEntryChildren returns (nil, nil) when
+//     ForEachMeta ERRORS. Both are I/O outcomes, not facts.
+//   - ABSENCE. The requested name does not exist: no entry resolves it
+//     (getTorrentChildren), or it is not one of the real top-level groups
+//     (getEntryChildren -> isEntryGroup). True right now, but not durable —
+//     an entry gets added, a config reload registers a custom folder or a
+//     debrid client.
+//
+// Caching either used to PIN the name permanently: the map has no TTL and is
+// cleared only by a global EntryCache.Refresh(), so a single unlucky read made
+// every later PROPFIND answer "not found" from cache while /api/browse, the
+// repair sweep and direct reads all still saw the entry perfectly well. An
+// absence cached as if it were a successful lookup is the same failure wearing
+// the opposite sign: it makes a transient miss sticky.
 //
 // Not storing negatives removes the pin outright, which is the smallest change
 // that can. The cost is bounded: singleflight still collapses concurrent misses
 // onto one computation, and the recomputation for the negative cases is a single
-// GetEntryItem / ForEachMeta pass.
+// GetEntryItem / ForEachMeta pass — or, for an unknown group, a handful of map
+// lookups that never touch storage at all.
 //
 // SCOPE, stated plainly: this is defensive hardening. It is NOT the cause of
 // entries missing from the `__all__` parent listing — those return a valid 207
@@ -81,9 +92,13 @@ func (e *EntryCache) _refreshEntry(name string) EntryCacheItem {
 	return e.store(name, EntryCacheItem{current: current, children: children})
 }
 
-// store caches item unless it is a negative result. It always returns item, so
-// the caller still serves this lookup's answer — the miss is not cached, not
-// suppressed.
+// store caches item unless it is a negative result — a failed lookup and an
+// absent name are both `current == nil` and both stay out of the map. It always
+// returns item, so the caller still serves this lookup's answer: the miss is not
+// cached, not suppressed.
+//
+// A REAL group holding no entries is NOT a negative: it has a node, so it is
+// cached and served as a 207 with zero children, exactly as before.
 func (e *EntryCache) store(name string, item EntryCacheItem) EntryCacheItem {
 	if item.current == nil {
 		return item
