@@ -487,6 +487,57 @@ Brokens then sit in the Browse UI with their reason; you can fire **Recheck heal
      'http://localhost:8282/api/repair/health/My.Show.S01/check'
    ```
 
+## Mount and Deploy Issues
+
+### Readers stuck in uninterruptible sleep (D-state) on the mount
+
+Symptom: `ffprobe`, Plex scanners, or \*arr import processes accumulate in
+uninterruptible sleep (`D` state in `ps`) reading files through an rclone/FUSE
+mount backed by decypharr. Counts grow steadily and the processes cannot be
+killed, not even with `SIGKILL`.
+
+Diagnose by taking rclone **out of the path** — read the same file directly from
+decypharr's WebDAV port:
+
+```bash
+curl -sv -r 0-1000000 -o /dev/null \
+  'http://localhost:8282/webdav/__all__/<entry>/<file>'
+```
+
+Interpret the result:
+
+- **`206` with `Content-Length` but zero bytes transferred** (curl exits 18,
+  `CURLE_PARTIAL_FILE`): the server promised bytes it could not deliver. The
+  client keeps re-requesting and never receives an I/O error. This was fixed by
+  validating the first bytes of a range *before* committing response headers —
+  upgrade if you are on an older build.
+- **A prompt `4xx`/`5xx`**: the server is failing correctly. Note that `5xx` is
+  *retryable*, so rclone will retry it rather than surfacing `EIO`; a permanent
+  condition should return `410 Gone` instead.
+- **A genuine hang**: the read really is stalled. Check `usenet.read_timeout`
+  and `debrid_read_timeout`.
+
+A file can serve its beginning perfectly and be dead in the middle, so a single
+read at offset 0 proves little. Sample several offsets across the file before
+concluding it is healthy.
+
+:::caution[The first deploy onto an already-wedged host is awkward]
+Docker cannot stop a container that holds processes in uninterruptible sleep —
+`docker stop` fails with `tried to kill container, but did not receive an exit
+event`, because `SIGKILL` cannot be delivered to a task blocked in the kernel.
+
+This is circular: the wedge prevents you from stopping media consumers, and
+stopping consumers first is the safe way to swap decypharr. If you hit it:
+
+1. Proceed with the consumer still running.
+2. Swap decypharr. The restart errors its in-flight dead reads.
+3. Those errors release the blocked readers, and the pending `stop` completes on
+   its own.
+
+Once running a build that fails dead reads promptly, this is self-correcting and
+subsequent deploys behave normally.
+:::
+
 ## Debugging
 
 ### Enable debug logging
