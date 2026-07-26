@@ -50,7 +50,10 @@ func (s *Server) WebRoutes() http.Handler {
 
 			// Repair / health-checker operations
 			r.Get("/repair/config", s.handleGetRepairConfig)
-			r.Put("/repair/config", s.handleUpdateRepairConfig)
+			// PATCH = partial update (absent keys preserved).
+			// PUT   = full replacement (absent keys revert to their zero value).
+			r.Patch("/repair/config", s.handlePatchRepairConfig)
+			r.Put("/repair/config", s.handleReplaceRepairConfig)
 			r.Get("/repair/status", s.handleRepairStatus)
 			r.Post("/repair/run", s.handleRunRepair)
 			r.Post("/repair/stop", s.handleStopRepair)
@@ -87,7 +90,10 @@ func (s *Server) WebRoutes() http.Handler {
 
 			// Config/Auth
 			r.Get("/config", s.handleGetConfig)
-			r.Post("/config", s.handleUpdateConfig)
+			// PATCH = partial update (absent keys preserved).
+			// PUT   = full replacement (absent keys revert to their zero value).
+			r.Patch("/config", s.handlePatchConfig)
+			r.Put("/config", s.handleReplaceConfig)
 			r.Post("/mount/cache/cleanup", s.handleRunMountCacheCleanup)
 			r.Post("/mount/cache/purge", s.handlePurgeMountCache)
 			r.Post("/refresh-token", s.handleRefreshAPIToken)

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -498,16 +499,48 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, response, http.StatusOK)
 }
 
-func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	// Decode the incoming config update
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.logger.Error().Err(err).Msg("Failed to read config update request")
-		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
+// configUpdateMode selects how a submitted document is combined with the stored
+// resource. It is the ONLY difference between the verbs: every config-writing
+// handler funnels through one implementation and passes one of these, so merge
+// and replace can never drift into two divergent code paths.
+type configUpdateMode int
+
+const (
+	// mergeUpdate is PATCH: the body is a PARTIAL document. A key absent from
+	// it keeps its current value at every nesting level; a key that is present
+	// — including an explicit zero/false/empty — is applied. Arrays and maps
+	// are not element-merged: a posted list is the caller's complete list and
+	// replaces wholesale, an absent one is preserved.
+	mergeUpdate configUpdateMode = iota
+	// replaceUpdate is PUT: the body is the COMPLETE document. Whatever the
+	// caller omitted reverts to its zero/default value — that is what PUT
+	// means, and the handler does not quietly soften it. See
+	// applyRepairConfigUpdate for why clearing the destructive-action knobs
+	// this way is safe: their zero values are the conservative defaults.
+	replaceUpdate
+)
+
+// handlePatchConfig serves PATCH /api/config: a partial update. Fields absent
+// from the body are PRESERVED.
+func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
+	s.applyConfigUpdate(w, r, mergeUpdate)
+}
+
+// handleReplaceConfig serves PUT /api/config: a full replacement. Fields absent
+// from the body revert to their zero/default value.
+func (s *Server) handleReplaceConfig(w http.ResponseWriter, r *http.Request) {
+	s.applyConfigUpdate(w, r, replaceUpdate)
+}
+
+// applyConfigUpdate is the single implementation behind PATCH and PUT
+// /api/config. Only the merge step below depends on mode; everything after it —
+// the preserved auth fields, the Arr filtering, Save (which applies defaults)
+// and the restart-vs-live decision — is identical for every verb, so a replace
+// can never bypass a check a merge performs.
+func (s *Server) applyConfigUpdate(w http.ResponseWriter, r *http.Request, mode configUpdateMode) {
 	var newConfig config.Config
-	if err := json.Unmarshal(body, &newConfig); err != nil {
+	body, err := readRequiredJSONBody(r, &newConfig)
+	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to decode config update request")
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
@@ -515,21 +548,27 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 
 	currentConfig := config.Get()
 
-	// A key absent from the posted JSON means "keep the current value"; only
-	// explicitly posted values (including empty ones such as "debrids": [])
-	// overwrite. Without this merge, a partial POST replaced every omitted
-	// section with its zero value and Save wiped it from disk.
-	//
-	// The merge recurses INTO posted sections, so `{"repair":{"enabled":true}}`
-	// no longer replaces the whole repair block — which used to silently zero
-	// max_deletions_per_run (the destructive-action cap), stop_schedule, prune
-	// and regrab. Slices and maps are the exception: a posted array/object is
-	// the caller's complete list and replaces wholesale.
-	if err := newConfig.PreserveMissingSections(currentConfig, body); err != nil {
-		s.logger.Error().Err(err).Msg("Failed to merge config update request")
-		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
+	if mode == mergeUpdate {
+		// PATCH: a key absent from the body means "keep the current value";
+		// only explicitly submitted values (including empty ones such as
+		// "debrids": []) overwrite. Without this merge, a partial update
+		// replaced every omitted section with its zero value and Save wiped it
+		// from disk.
+		//
+		// The merge recurses INTO submitted sections, so
+		// `{"repair":{"enabled":true}}` does not replace the whole repair block
+		// — which would silently zero max_deletions_per_run (the
+		// destructive-action cap), stop_schedule, prune and regrab. Slices and
+		// maps are the exception: a submitted array/object is the caller's
+		// complete list and replaces wholesale.
+		if err := newConfig.PreserveMissingSections(currentConfig, body); err != nil {
+			s.logger.Error().Err(err).Msg("Failed to merge config update request")
+			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
+	// PUT skips the merge entirely: the decoded document IS the new config, so
+	// every key the caller left out is already at its zero value here.
 
 	// Basic validation
 	if newConfig.BindAddress == "" {
@@ -594,45 +633,62 @@ func (s *Server) handleGetRepairConfig(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, config.Get().Repair, http.StatusOK)
 }
 
-// handleUpdateRepairConfig MERGES the posted object into the current repair
-// config: a key absent from the body keeps its current value, an explicitly
-// posted one (including an explicit zero/false) is applied.
+// handlePatchRepairConfig serves PATCH /api/repair/config: a partial update.
+// A key absent from the body keeps its current value; an explicitly submitted
+// one (including an explicit zero/false/empty) is applied.
+func (s *Server) handlePatchRepairConfig(w http.ResponseWriter, r *http.Request) {
+	s.applyRepairConfigUpdate(w, r, mergeUpdate)
+}
+
+// handleReplaceRepairConfig serves PUT /api/repair/config: a full replacement.
+// The submitted document IS the new repair config, so every key the caller
+// omitted reverts to its zero value.
 //
-// It used to assign the decoded body wholesale (`cfg.Repair = req`), so a
-// partial PUT silently reset every omitted safety knob —
-// max_deletions_per_run to 0, stop_schedule to "" (disabled), prune/regrab to
-// false — while returning 200. That was also inconsistent with POST
-// /api/config, which has merged via PreserveMissingSections since the config
-// wipe incident; PreserveMissingFields is the same mechanism applied to the
-// repair block.
+// PUT used to merge, which was a lie: a client that PUT a partial document
+// reasonably expects the omitted fields to be cleared, and silently preserving
+// them made PUT indistinguishable from PATCH. The merge behaviour now lives on
+// PATCH, where it belongs.
 //
-// Validation below runs on the MERGED result, i.e. on what will actually be
-// saved, so a body that omits "schedule" while the stored schedule is valid is
-// accepted.
-func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxOptionalJSONBody))
+// Clearing by omission is safe here BECAUSE the destructive-action knobs are
+// designed so their zero value is the conservative one: max_deletions_per_run 0
+// resolves to the default cap of 100 (never unlimited — that is -1),
+// prune/regrab false means "delete nothing", repair nil resolves to true
+// (re-acquire, non-destructive) and stop_schedule "" only means the sweep runs
+// to completion. A replace therefore cannot produce a MORE destructive config
+// than the caller asked for, and it runs the same validation the merge path
+// does — see applyRepairConfigUpdate.
+func (s *Server) handleReplaceRepairConfig(w http.ResponseWriter, r *http.Request) {
+	s.applyRepairConfigUpdate(w, r, replaceUpdate)
+}
+
+// applyRepairConfigUpdate is the single implementation behind PATCH and PUT
+// /api/repair/config. Only the merge step depends on mode; the validation below
+// then runs on the RESULTING document either way — i.e. on what will actually
+// be saved — so a PATCH that omits "schedule" while the stored schedule is
+// valid is accepted, and a PUT that omits it while enabling repair is rejected
+// with 400 rather than saving a config that cannot schedule.
+func (s *Server) applyRepairConfigUpdate(w http.ResponseWriter, r *http.Request, mode configUpdateMode) {
+	var req config.RepairConfig
+	body, err := readRequiredJSONBody(r, &req)
 	if err != nil {
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if strings.TrimSpace(string(body)) == "" {
-		http.Error(w, "Invalid request body: a JSON object is required", http.StatusBadRequest)
 		return
 	}
 
 	cfg := config.Get()
 	current := cfg.Repair
 
-	var req config.RepairConfig
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
+	if mode == mergeUpdate {
+		// Fields the caller did not submit keep their current values. The
+		// Repair *bool tri-state is preserved exactly: an absent "repair" key
+		// keeps the current pointer (nil included).
+		if err := req.PreserveMissingFields(current, body); err != nil {
+			http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
-	// Fields the caller did not post keep their current values.
-	if err := req.PreserveMissingFields(current, body); err != nil {
-		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
+	// replaceUpdate keeps the decoded document as-is: omitted keys are already
+	// at their zero value, and Repair is nil (unset ⇒ defaults to true).
 
 	if req.Enabled {
 		if strings.TrimSpace(req.Schedule) == "" {
@@ -689,9 +745,19 @@ func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, svc.Status(), http.StatusOK)
 }
 
-// maxOptionalJSONBody bounds how much of an optional request body is read
-// before it is rejected as malformed.
+// maxOptionalJSONBody bounds how much of a request body is read before it is
+// rejected as malformed. It applies to optional and required bodies alike.
 const maxOptionalJSONBody = 1 << 20 // 1 MiB
+
+// readBoundedJSONBody reads at most maxOptionalJSONBody bytes of r.Body. It is
+// the one place both the optional and the required decoder get their bytes, so
+// they cannot drift apart on the limit.
+func readBoundedJSONBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	return io.ReadAll(io.LimitReader(r.Body, maxOptionalJSONBody))
+}
 
 // decodeOptionalJSONBody decodes an OPTIONAL JSON request body into dst.
 //
@@ -708,7 +774,7 @@ func decodeOptionalJSONBody(r *http.Request, dst any) error {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxOptionalJSONBody))
+	raw, err := readBoundedJSONBody(r)
 	if err != nil {
 		return err
 	}
@@ -716,6 +782,31 @@ func decodeOptionalJSONBody(r *http.Request, dst any) error {
 		return nil
 	}
 	return json.ConfigDefault.Unmarshal(raw, dst)
+}
+
+// readRequiredJSONBody is decodeOptionalJSONBody's REQUIRED twin, used by the
+// config-writing endpoints. It decodes into dst and also returns the raw bytes,
+// which the merge step needs: key PRESENCE (not the decoded value) is what
+// separates "leave this field alone" from "clear it", and that information is
+// gone once the body has been decoded into a struct.
+//
+// Unlike the optional decoder, an absent/empty/whitespace-only body is an error
+// here: on a config endpoint a zero-value document is not "do nothing", it is
+// "replace the whole config with zeros". A present-but-malformed body is
+// rejected for the same reason it is on the optional path — it must never be
+// silently downgraded to defaults.
+func readRequiredJSONBody(r *http.Request, dst any) ([]byte, error) {
+	raw, err := readBoundedJSONBody(r)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(string(raw)) == "" {
+		return nil, errors.New("a JSON object is required")
+	}
+	if err := json.ConfigDefault.Unmarshal(raw, dst); err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {

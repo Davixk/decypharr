@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -36,6 +37,16 @@ type Storage struct {
 	healthCountsMu      sync.Mutex
 	healthCounts        map[HealthStatus]int
 	healthCountsBuiltAt time.Time
+
+	// Reverse index for legacy folder-name resolution; see items.go.
+	// entryItemAliasGen is bumped whenever the entryItems KEY SET changes, which
+	// is the only thing that can invalidate the index (a value-only update to an
+	// existing key cannot).
+	entryItemAliasGen  atomic.Uint64
+	entryItemAliasMu   sync.Mutex
+	entryItemAliases   map[string]map[string]struct{}
+	entryItemAliasesAt uint64
+	entryItemAliasesOK bool
 }
 
 type keyedLockPool struct {

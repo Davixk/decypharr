@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 	"google.golang.org/protobuf/proto"
 )
@@ -101,6 +102,7 @@ func (s *Storage) writeEntryItemProjectionLocked(name string, projection *entryI
 			if err := s.entryItems.Delete(name); err != nil {
 				return false, fmt.Errorf("delete stale entry item %s: %w", name, err)
 			}
+			s.invalidateEntryItemAliases()
 		}
 		if err := s.DeleteEntryHealth(name); err != nil {
 			return oldPresent, fmt.Errorf("delete stale entry health %s: %w", name, err)
@@ -116,6 +118,9 @@ func (s *Storage) writeEntryItemProjectionLocked(name string, projection *entryI
 	}
 	if err := s.entryItems.Put(name, data, nil); err != nil {
 		return false, fmt.Errorf("write rebuilt entry item %s: %w", name, err)
+	}
+	if !oldPresent {
+		s.invalidateEntryItemAliases()
 	}
 
 	changed := !oldPresent || !oldReadable || oldItem == nil ||
@@ -345,6 +350,7 @@ func (s *Storage) UpdateItem(item *EntryItem) error {
 	if existing, err := s.GetEntryItem(item.Name); err == nil {
 		oldFingerprint = EntryItemRepairFingerprint(existing)
 	}
+	created := !s.entryItems.Exists(item.Name)
 
 	pb := EntryItemToProto(item)
 	data, err := proto.Marshal(pb)
@@ -353,6 +359,9 @@ func (s *Storage) UpdateItem(item *EntryItem) error {
 	}
 	if err := s.entryItems.Put(item.Name, data, nil); err != nil {
 		return err
+	}
+	if created {
+		s.invalidateEntryItemAliases()
 	}
 	if oldFingerprint != EntryItemRepairFingerprint(item) {
 		s.MarkEntryDirty(item.Name, "", "entry_item_changed")
@@ -386,4 +395,175 @@ func (s *Storage) ForEachEntryItem(fn func(*EntryItem) error) error {
 		}
 		return fn(ProtoToEntryItem(&pb))
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Legacy folder-name aliases
+// ---------------------------------------------------------------------------
+//
+// An entry's folder name is DERIVED, not stored: Entry.GetFolder() runs
+// GetTorrentFolder(config.Get().FolderNaming, entry) every time it is called.
+// Two of those derivations differ only by a media extension —
+//
+//	filename         -> path.Clean(entry.Name)
+//	filename_no_ext  -> path.Clean(utils.RemoveExtension(entry.Name))
+//
+// — and the entryItems key set is re-derived under the CURRENT setting on every
+// boot (reconcileEntryItemsAtStartup). Change the setting and every key moves.
+//
+// Nothing else moves with them. The *arr symlinks on disk, and the frozen
+// IndexEntry.Name snapshots the `__all__` listing is built from, still carry the
+// name produced by the OLD setting. Those names now match no key, so every
+// lookup that goes through entryItems — GetEntryInfo, getTorrentChildren,
+// GetTorrentFile — misses, and the library dangles even though the content is
+// present and serves bytes under the new name.
+//
+// LegacyEntryItemName closes that gap WITHOUT moving anything: it maps the old
+// name onto the live key on the MISS path only, so both names address the same
+// entry and the same children. It is deliberately not a fuzzy match — it only
+// follows the exact alternate derivation, in whichever direction the setting
+// moved, and it never invents an entry that does not exist.
+//
+// It is also deliberately NOT wired into GetEntryItem: the repair sweep resolves
+// through GetEntryItem, and it must keep seeing exactly the key set it
+// enumerates. Nothing here may ever influence a health verdict.
+//
+// SCOPE, stated exactly. The relation it follows is between NAMES, not between a
+// name and one entry's history: `<liveKey>.<anyMediaExt>` resolves to
+// `<liveKey>`. That is the correct generalisation rather than a looseness —
+// under a strip-extension naming several DIFFERENT source names collapse onto
+// one folder (`X.mkv` and `X.mp4` both project to `X`, and their files are
+// merged into a single row), so there is no single historical name to check
+// against, and checking one would break exactly the merged case. What it never
+// does is invent an entry: the target must already be a live, serving key, and a
+// name with no live counterpart under either derivation resolves to nothing.
+
+// EntryItemAliases returns a resolver that amortises the reverse index over many
+// names. Callers that resolve a whole set in one pass (the `__all__` listing
+// rebuild) take it once, so the index is built at most once for the pass instead
+// of risking a rebuild per name.
+//
+// The resolver is NOT goroutine-safe and is meant to live inside one call.
+func (s *Storage) EntryItemAliases() *EntryItemAliasResolver {
+	return &EntryItemAliasResolver{storage: s}
+}
+
+// EntryItemAliasResolver resolves legacy folder names against one snapshot of
+// the reverse index. The zero value is unusable; take one from EntryItemAliases.
+type EntryItemAliasResolver struct {
+	storage *Storage
+	index   map[string]map[string]struct{}
+	built   bool
+}
+
+// aliasIndex builds the reverse index on FIRST need and not before. Under a
+// strip-extension FolderNaming — the setting that produced the production
+// breakage — every legacy name carries an extension and resolves by direction 1,
+// so a whole listing rebuild can classify thousands of names without ever
+// touching the index.
+func (r *EntryItemAliasResolver) aliasIndex() map[string]map[string]struct{} {
+	if !r.built {
+		r.index = r.storage.entryItemAliasIndex()
+		r.built = true
+	}
+	return r.index
+}
+
+// LegacyEntryItemName resolves a folder name that no live entryItems key matches
+// onto the key that serves the SAME entry under the other FolderNaming
+// derivation. Callers MUST have already missed on the exact name; this function
+// deliberately does not re-probe it.
+//
+// The second return is false whenever no exact alternate derivation resolves —
+// which is every name that belongs to no entry at all.
+func (s *Storage) LegacyEntryItemName(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	return (&EntryItemAliasResolver{storage: s}).Resolve(name)
+}
+
+// Resolve applies the rule described above, building the reverse index only if
+// the name actually needs it.
+func (r *EntryItemAliasResolver) Resolve(name string) (string, bool) {
+	if r.storage == nil || name == "" {
+		return "", false
+	}
+
+	// Direction 1 — the request KEEPS a media extension and the live key strips
+	// it (`filename` -> `filename_no_ext`). The live key is an exact string
+	// derivation of the request, so this costs one O(1) index probe and no walk.
+	// A request that carries a media extension has exactly ONE alternate
+	// derivation; if that one is absent, anything further would be a guess.
+	if stripped := utils.RemoveExtension(name); stripped != name {
+		if r.storage.entryItems.Exists(stripped) {
+			return stripped, true
+		}
+		return "", false
+	}
+
+	// Direction 2 — the request STRIPS the extension and the live key keeps it
+	// (`filename_no_ext` -> `filename`). The extension cannot be reconstructed
+	// from the request, so this direction is the only one that needs the reverse
+	// index.
+	keys := r.aliasIndex()[name]
+	if len(keys) != 1 {
+		// 0: no live key derives to this name — it belongs to no entry.
+		// >1: several do (`X.mkv` and `X.mp4` both strip to `X`) and choosing
+		// between them would be a guess, so refuse rather than serve the wrong
+		// entry's children under this name.
+		return "", false
+	}
+	for key := range keys {
+		return key, true
+	}
+	return "", false
+}
+
+// entryItemAliasIndex returns { RemoveExtension(liveKey) -> set of live keys },
+// restricted to keys that actually carry a media extension. Under a
+// strip-extension FolderNaming (where no live key has one) it is empty, which is
+// exactly right: direction 2 cannot apply there.
+//
+// The map is rebuilt only when the entryItems key set has changed since the last
+// build, and every published map is immutable, so readers may hold one across a
+// rebuild.
+func (s *Storage) entryItemAliasIndex() map[string]map[string]struct{} {
+	generation := s.entryItemAliasGen.Load()
+
+	s.entryItemAliasMu.Lock()
+	defer s.entryItemAliasMu.Unlock()
+	if s.entryItemAliasesOK && s.entryItemAliasesAt == generation {
+		return s.entryItemAliases
+	}
+
+	index := make(map[string]map[string]struct{})
+	// ForEachMeta reads the in-memory key index only — no disk reads, no
+	// protobuf decoding.
+	_ = s.entryItems.ForEachMeta(func(key string, _ *hybrid.IndexEntry) error {
+		stripped := utils.RemoveExtension(key)
+		if stripped == key {
+			return nil
+		}
+		bucket := index[stripped]
+		if bucket == nil {
+			bucket = make(map[string]struct{}, 1)
+			index[stripped] = bucket
+		}
+		bucket[key] = struct{}{}
+		return nil
+	})
+
+	s.entryItemAliases = index
+	s.entryItemAliasesAt = generation
+	s.entryItemAliasesOK = true
+	return index
+}
+
+// invalidateEntryItemAliases marks the reverse index stale. Call it ONLY where
+// the entryItems key set changes — a value-only rewrite of an existing key
+// cannot change any alias, and invalidating on those would rebuild the index on
+// every download progress update.
+func (s *Storage) invalidateEntryItemAliases() {
+	s.entryItemAliasGen.Add(1)
 }

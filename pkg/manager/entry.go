@@ -172,9 +172,46 @@ func (m *Manager) GetTorrentEntry(torrentName string) (*FileInfo, error) {
 	return current, nil
 }
 
+// resolveEntryItem loads the folder row that serves `name`, following a legacy
+// folder-name alias when — and only when — `name` matches no live entryItems key.
+//
+// A FolderNaming change re-derives every entryItems key (`filename` keeps a
+// media extension, `filename_no_ext` strips it) but moves nothing else: the
+// *arr symlinks on disk and the frozen IndexEntry.Name snapshots the `__all__`
+// listing is built from still carry the OLD name. Resolving the alias here makes
+// the old name address the same entry, and therefore the same children, as the
+// new one — additively, with no rename and no data movement.
+//
+// EVERY name-addressed read path in the manager goes through this one function,
+// so enumeration (getTorrentChildren), directory metadata (GetEntryInfo) and
+// file reads (GetTorrentFile) can never disagree about which names resolve.
+//
+// The exact-name lookup is attempted FIRST and unchanged, so a live name costs
+// exactly what it did before: one store Get. The alias work is on the miss path
+// only. storage.GetEntryItem itself is deliberately left alone — the repair
+// sweep resolves through it and must keep seeing exactly the key set it
+// enumerates.
+func (m *Manager) resolveEntryItem(name string) (*storage.EntryItem, error) {
+	item, err := m.storage.GetEntryItem(name)
+	if err == nil {
+		return item, nil
+	}
+	alias, ok := m.storage.LegacyEntryItemName(name)
+	if !ok {
+		return nil, err
+	}
+	aliased, aliasErr := m.storage.GetEntryItem(alias)
+	if aliasErr != nil {
+		// The alias raced a delete. Report the original miss; inventing a
+		// different error here would only obscure which name was asked for.
+		return nil, err
+	}
+	return aliased, nil
+}
+
 // GetEntryInfo returns a FileInfo for a torrent/entry by name - O(1) lookup
 func (m *Manager) GetEntryInfo(name string) (*FileInfo, error) {
-	entry, err := m.storage.GetEntryItem(name)
+	entry, err := m.resolveEntryItem(name)
 	if err != nil {
 		return nil, fmt.Errorf("entry %s not found", name)
 	}
@@ -189,8 +226,13 @@ func (m *Manager) GetEntryInfo(name string) (*FileInfo, error) {
 	}
 
 	return &FileInfo{
-		infohash:  infohash,
-		name:      entry.Name,
+		infohash: infohash,
+		// The REQUESTED name, not entry.Name. For a live name the two are
+		// identical (the entryItems key is always written as the item's Name);
+		// for a legacy alias this keeps the node's displayname matching the href
+		// the client asked for, so the directory does not appear to rename
+		// itself mid-listing.
+		name:      name,
 		size:      entry.Size,
 		modTime:   modTime,
 		isDir:     true,
@@ -199,7 +241,7 @@ func (m *Manager) GetEntryInfo(name string) (*FileInfo, error) {
 }
 
 func (m *Manager) GetTorrentFile(torrentName, fileName string) (*FileInfo, error) {
-	entry, err := m.storage.GetEntryItem(torrentName)
+	entry, err := m.resolveEntryItem(torrentName)
 	if err != nil {
 		return nil, fmt.Errorf("torrent %s not found", torrentName)
 	}
@@ -402,7 +444,11 @@ func (m *Manager) getEntryChildren(group string) (*FileInfo, []FileInfo) {
 // freshly-added entry whose derived row lags briefly cannot be hidden by it.
 //
 // Phantoms are counted and logged rather than dropped, so the affected set is
-// enumerable without guessing. Dropping them is a separate decision.
+// enumerable without guessing. Dropping them is a separate decision — and one
+// that must not be taken lightly, because the legacy names among them are
+// exactly the names existing *arr symlinks point at. Those are now navigable
+// through resolveEntryItem's alias, so they are counted separately (aliased_names)
+// from names that resolve to nothing at all (phantom_names).
 //
 // THIS IS A VISIBILITY FIX AND NOTHING ELSE. Listing membership is never
 // consulted by any health verdict: the repair sweep enumerates entryItems keys
@@ -446,30 +492,54 @@ func (m *Manager) reconcileAllFolderChildren(infos []FileInfo, listed map[string
 		restored = append(restored, name)
 	}
 
+	// Split the names that are advertised but not navigable into the two very
+	// different things they actually are. A name that resolves through a legacy
+	// folder-name alias is fully usable — it enumerates and serves the same
+	// entry as the live name — and counting it as a phantom made the gauge read
+	// as thousands of broken directories when none of them were broken. One
+	// alias snapshot covers the whole loop, so this adds no index walk per name.
+	aliases := m.storage.EntryItemAliases()
 	phantoms := 0
+	aliased := 0
 	for name := range listed {
-		if _, ok := navigable[name]; !ok {
-			phantoms++
+		if _, ok := navigable[name]; ok {
+			continue
 		}
+		if _, ok := aliases.Resolve(name); ok {
+			aliased++
+			continue
+		}
+		phantoms++
 	}
 
-	if len(restored) > 0 || phantoms > 0 {
-		event := m.logger.Warn().
+	if len(restored) > 0 || phantoms > 0 || aliased > 0 {
+		// Counts at Warn: one greppable line per listing rebuild. `restored` is
+		// the EXACT number of entries that would otherwise be invisible on the
+		// mount. `aliased` is the number of advertised legacy names that resolve
+		// onto a live entry through the alternate FolderNaming derivation — the
+		// names *arr symlinks written under the old setting still point at.
+		// Both stay non-zero until the frozen IndexEntry.Name snapshots are
+		// rewritten, so read them as standing gauges, not one-shot events.
+		// `phantom_names` is what is left: advertised, not navigable, and not
+		// resolvable under any derivation.
+		m.logger.Warn().
 			Int("restored", len(restored)).
+			Int("aliased_names", aliased).
 			Int("phantom_names", phantoms).
 			Int("listed", len(listed)).
-			Int("navigable", len(navigable))
-		if len(restored) > 0 {
-			event = event.Strs("restored_entries", restored[:min(len(restored), 50)])
-		}
-		event.Msg("__all__ listing disagreed with the navigable entry set; servable entries restored to the listing")
+			Int("navigable", len(navigable)).
+			Msg("__all__ listing disagreed with the navigable entry set; servable entries restored to the listing")
+		// Names at Debug: thousands of release names is several KB, which does
+		// not belong on a line that repeats on every entry-cache refresh.
+		m.logger.Debug().Strs("restored_entries", restored).Msg("__all__ entries restored to the listing")
 	}
 	return infos
 }
 
 func (m *Manager) getTorrentChildren(name string) (*FileInfo, []FileInfo) {
-	// Find the torrent by folder name
-	entry, err := m.storage.GetEntryItem(name)
+	// Find the torrent by folder name, following a legacy folder-name alias on
+	// the miss path so an old name enumerates the SAME children as the live one.
+	entry, err := m.resolveEntryItem(name)
 	if err != nil || entry == nil {
 		return nil, nil
 	}
@@ -479,11 +549,14 @@ func (m *Manager) getTorrentChildren(name string) (*FileInfo, []FileInfo) {
 	size := int64(0)
 	for _, file := range entry.Files {
 		infos = append(infos, FileInfo{
-			infohash:  file.InfoHash,
-			name:      file.Name,
-			size:      file.Size,
-			modTime:   file.AddedOn,
-			isDir:     false,
+			infohash: file.InfoHash,
+			name:     file.Name,
+			size:     file.Size,
+			modTime:  file.AddedOn,
+			isDir:    false,
+			// The LIVE key, never the requested alias: parent is what every
+			// mutation path (RemoveTorrentFile, COPY/MOVE) keys off, and those
+			// must address the row that actually exists.
 			parent:    entry.Name,
 			canDelete: true,
 			byteRange: file.ByteRange,
@@ -495,7 +568,9 @@ func (m *Manager) getTorrentChildren(name string) (*FileInfo, []FileInfo) {
 	}
 
 	currentDir := &FileInfo{
-		name:    entry.Name,
+		// The REQUESTED name, so the self-entry of a PROPFIND keeps the href the
+		// client asked for. Identical to entry.Name for every live name.
+		name:    name,
 		size:    size,
 		modTime: infos[0].modTime,
 		isDir:   true,

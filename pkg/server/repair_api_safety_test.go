@@ -51,14 +51,25 @@ func setupRepairConfigTest(t *testing.T, fixture string) string {
 	return cfgFile
 }
 
+// patchRepairConfig exercises PATCH /api/repair/config — the partial update.
+// A bare Server is enough: the handler only needs config.Get(), and the manager
+// lookup is nil-guarded.
+func patchRepairConfig(t *testing.T, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	s := &Server{}
+	req := httptest.NewRequest(http.MethodPatch, "/api/repair/config", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handlePatchRepairConfig(rec, req)
+	return rec
+}
+
+// putRepairConfig exercises PUT /api/repair/config — the full replacement.
 func putRepairConfig(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	// A bare Server is enough: the handler only needs config.Get(), and the
-	// manager lookup is nil-guarded.
 	s := &Server{}
 	req := httptest.NewRequest(http.MethodPut, "/api/repair/config", strings.NewReader(body))
 	rec := httptest.NewRecorder()
-	s.handleUpdateRepairConfig(rec, req)
+	s.handleReplaceRepairConfig(rec, req)
 	return rec
 }
 
@@ -75,12 +86,62 @@ func readSavedRepairConfig(t *testing.T, cfgFile string) config.RepairConfig {
 	return saved.Repair
 }
 
-// TestUpdateRepairConfigPartialPutPreservesSafetyKnobs is the regression test
-// for the silent safety-knob reset: PUT /api/repair/config assigned the decoded
-// body wholesale, so a partial PUT reset max_deletions_per_run to 0,
+// TestPatchRepairConfigPartialPreservesSafetyKnobs is the regression test for
+// the silent safety-knob reset: the update handler assigned the decoded body
+// wholesale, so a partial update reset max_deletions_per_run to 0,
 // stop_schedule to "" (stop schedule disabled) and prune/regrab to false while
-// answering 200.
-func TestUpdateRepairConfigPartialPutPreservesSafetyKnobs(t *testing.T) {
+// answering 200. Preserving them is PATCH's contract.
+func TestPatchRepairConfigPartialPreservesSafetyKnobs(t *testing.T) {
+	cfgFile := setupRepairConfigTest(t, repairFixtureJSON)
+
+	rec := patchRepairConfig(t, `{"workers":8}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	for _, got := range []config.RepairConfig{config.Get().Repair, readSavedRepairConfig(t, cfgFile)} {
+		if got.Workers != 8 {
+			t.Fatalf("submitted workers not applied: %+v", got)
+		}
+		if got.MaxDeletionsPerRun != 5 {
+			t.Fatalf("partial PATCH wiped max_deletions_per_run: %d", got.MaxDeletionsPerRun)
+		}
+		if got.StopSchedule != "06:00" {
+			t.Fatalf("partial PATCH wiped stop_schedule: %q", got.StopSchedule)
+		}
+		if !got.Prune {
+			t.Fatalf("partial PATCH wiped prune")
+		}
+		if got.Regrab {
+			t.Fatalf("partial PATCH turned regrab on")
+		}
+		if !got.Enabled || got.Schedule != "0 3 * * *" || got.Source != config.RepairSourceManaged {
+			t.Fatalf("partial PATCH wiped scheduling fields: %+v", got)
+		}
+		if !got.SkipNZBRepair || len(got.Arrs) != 1 || got.Arrs[0] != "sonarr" {
+			t.Fatalf("partial PATCH wiped the remaining fields: %+v", got)
+		}
+		// Repair *bool tri-state: the fixture's explicit false must survive.
+		if got.Repair == nil || *got.Repair {
+			t.Fatalf("partial PATCH lost the explicit repair:false tri-state: %v", got.Repair)
+		}
+		if got.RepairEnabled() {
+			t.Fatalf("RepairEnabled() = true after a partial PATCH that never mentioned repair")
+		}
+	}
+}
+
+// TestPutRepairConfigPartialClearsOmittedFields is PUT's honest contract: the
+// submitted document IS the repair config, so everything the caller omitted
+// reverts to its zero value — the safety knobs included. This is deliberate and
+// must stay visible: a PUT of `{"workers":8}` DOES clear a configured deletion
+// cap and stop schedule.
+//
+// It is nonetheless safe by construction, because each knob's zero value is the
+// conservative one: max_deletions_per_run 0 resolves to the default cap of 100
+// (unlimited is -1), prune/regrab false delete nothing, and the repair
+// tri-state back at nil resolves to true (re-acquire, non-destructive).
+func TestPutRepairConfigPartialClearsOmittedFields(t *testing.T) {
 	cfgFile := setupRepairConfigTest(t, repairFixtureJSON)
 
 	rec := putRepairConfig(t, `{"workers":8}`)
@@ -90,42 +151,65 @@ func TestUpdateRepairConfigPartialPutPreservesSafetyKnobs(t *testing.T) {
 
 	for _, got := range []config.RepairConfig{config.Get().Repair, readSavedRepairConfig(t, cfgFile)} {
 		if got.Workers != 8 {
-			t.Fatalf("posted workers not applied: %+v", got)
+			t.Fatalf("submitted workers not applied: %+v", got)
 		}
-		if got.MaxDeletionsPerRun != 5 {
-			t.Fatalf("partial PUT wiped max_deletions_per_run: %d", got.MaxDeletionsPerRun)
+		if got.MaxDeletionsPerRun != 0 {
+			t.Fatalf("PUT must clear max_deletions_per_run (0 ⇒ default cap 100): %d", got.MaxDeletionsPerRun)
 		}
-		if got.StopSchedule != "06:00" {
-			t.Fatalf("partial PUT wiped stop_schedule: %q", got.StopSchedule)
+		if got.StopSchedule != "" {
+			t.Fatalf("PUT must clear stop_schedule: %q", got.StopSchedule)
 		}
-		if !got.Prune {
-			t.Fatalf("partial PUT wiped prune")
+		if got.Prune || got.Regrab {
+			t.Fatalf("PUT must clear prune/regrab (⇒ delete nothing): %+v", got)
 		}
-		if got.Regrab {
-			t.Fatalf("partial PUT turned regrab on")
+		if got.Enabled || got.Schedule != "" || got.SkipNZBRepair || len(got.Arrs) != 0 {
+			t.Fatalf("PUT must clear every omitted field: %+v", got)
 		}
-		if !got.Enabled || got.Schedule != "0 3 * * *" || got.Source != config.RepairSourceManaged {
-			t.Fatalf("partial PUT wiped scheduling fields: %+v", got)
+		// Fields that HAVE a default revert to it (not to the stored value):
+		// the fixture's source=managed is gone, replaced by the default arr.
+		if got.Source != config.RepairSourceArr || got.RecheckInterval != "168h" {
+			t.Fatalf("PUT kept stored values instead of reverting to defaults: %+v", got)
 		}
-		if !got.SkipNZBRepair || len(got.Arrs) != 1 || got.Arrs[0] != "sonarr" {
-			t.Fatalf("partial PUT wiped the remaining fields: %+v", got)
+		if got.Repair != nil {
+			t.Fatalf("PUT must clear the repair tri-state to nil (⇒ defaults true): %v", *got.Repair)
 		}
-		// Repair *bool tri-state: the fixture's explicit false must survive.
-		if got.Repair == nil || *got.Repair {
-			t.Fatalf("partial PUT lost the explicit repair:false tri-state: %v", got.Repair)
-		}
-		if got.RepairEnabled() {
-			t.Fatalf("RepairEnabled() = true after a partial PUT that never mentioned repair")
+		if !got.RepairEnabled() {
+			t.Fatal("a cleared repair tri-state must resolve to true (re-acquire, non-destructive)")
 		}
 	}
 }
 
-// TestUpdateRepairConfigExplicitValuesStillApply: presence of a key, even with
-// a zero/false value, is a real instruction and must overwrite.
-func TestUpdateRepairConfigExplicitValuesStillApply(t *testing.T) {
+// TestPutRepairConfigRejectsAnInvalidReplacement: PUT runs the SAME validation
+// the merge path does, on the resulting document. A replacement that enables
+// repair without carrying a schedule is therefore a 400, not a saved config
+// that can never schedule — and the stored config is left untouched.
+func TestPutRepairConfigRejectsAnInvalidReplacement(t *testing.T) {
 	cfgFile := setupRepairConfigTest(t, repairFixtureJSON)
 
-	rec := putRepairConfig(t, `{"max_deletions_per_run":0,"stop_schedule":"","prune":false,"regrab":true}`)
+	rec := putRepairConfig(t, `{"enabled":true}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (a replacement that enables repair must carry a schedule): %s",
+			rec.Code, rec.Body.String())
+	}
+	for _, got := range []config.RepairConfig{config.Get().Repair, readSavedRepairConfig(t, cfgFile)} {
+		if got.Schedule != "0 3 * * *" || got.MaxDeletionsPerRun != 5 {
+			t.Fatalf("a rejected PUT still mutated the repair config: %+v", got)
+		}
+	}
+
+	// The same replacement WITH a schedule is accepted.
+	setupRepairConfigTest(t, repairFixtureJSON)
+	if rec := putRepairConfig(t, `{"enabled":true,"schedule":"@daily"}`); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPatchRepairConfigExplicitValuesStillApply: presence of a key, even with
+// a zero/false value, is a real instruction and must overwrite.
+func TestPatchRepairConfigExplicitValuesStillApply(t *testing.T) {
+	cfgFile := setupRepairConfigTest(t, repairFixtureJSON)
+
+	rec := patchRepairConfig(t, `{"max_deletions_per_run":0,"stop_schedule":"","prune":false,"regrab":true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
@@ -149,10 +233,10 @@ func TestUpdateRepairConfigExplicitValuesStillApply(t *testing.T) {
 	}
 }
 
-// TestUpdateRepairConfigRepairTriState pins every transition of the Repair
-// *bool: nil (unset ⇒ defaults true), explicit true and explicit false, each
-// preserved when omitted and overwritten when posted.
-func TestUpdateRepairConfigRepairTriState(t *testing.T) {
+// TestPatchRepairConfigRepairTriState pins every transition of the Repair
+// *bool under PATCH: nil (unset ⇒ defaults true), explicit true and explicit
+// false, each preserved when omitted and overwritten when submitted.
+func TestPatchRepairConfigRepairTriState(t *testing.T) {
 	tests := []struct {
 		name    string
 		current string // "repair" fragment in the stored config, "" = key absent
@@ -163,8 +247,54 @@ func TestUpdateRepairConfigRepairTriState(t *testing.T) {
 		{name: "absent stays unset", current: ``, body: `{"workers":4}`, wantPtr: nil, wantEff: true},
 		{name: "explicit false survives omission", current: `"repair": false,`, body: `{"workers":4}`, wantPtr: boolPtrTest(false), wantEff: false},
 		{name: "explicit true survives omission", current: `"repair": true,`, body: `{"workers":4}`, wantPtr: boolPtrTest(true), wantEff: true},
-		{name: "posted false overwrites unset", current: ``, body: `{"repair":false}`, wantPtr: boolPtrTest(false), wantEff: false},
-		{name: "posted true overwrites false", current: `"repair": false,`, body: `{"repair":true}`, wantPtr: boolPtrTest(true), wantEff: true},
+		{name: "submitted false overwrites unset", current: ``, body: `{"repair":false}`, wantPtr: boolPtrTest(false), wantEff: false},
+		{name: "submitted true overwrites false", current: `"repair": false,`, body: `{"repair":true}`, wantPtr: boolPtrTest(true), wantEff: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := `{"log_level":"info","download_folder":"/downloads","repair":{"enabled":true,"schedule":"0 3 * * *",` +
+				tc.current + `"max_deletions_per_run":5}}`
+			cfgFile := setupRepairConfigTest(t, fixture)
+
+			rec := patchRepairConfig(t, tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+
+			for _, got := range []config.RepairConfig{config.Get().Repair, readSavedRepairConfig(t, cfgFile)} {
+				switch {
+				case tc.wantPtr == nil && got.Repair != nil:
+					t.Fatalf("repair tri-state = %v, want unset (nil)", *got.Repair)
+				case tc.wantPtr != nil && (got.Repair == nil || *got.Repair != *tc.wantPtr):
+					t.Fatalf("repair tri-state = %v, want %v", got.Repair, *tc.wantPtr)
+				}
+				if got.RepairEnabled() != tc.wantEff {
+					t.Fatalf("RepairEnabled() = %v, want %v", got.RepairEnabled(), tc.wantEff)
+				}
+				if got.MaxDeletionsPerRun != 5 {
+					t.Fatalf("max_deletions_per_run lost: %d", got.MaxDeletionsPerRun)
+				}
+			}
+		})
+	}
+}
+
+// TestPutRepairConfigRepairTriState is the same matrix under PUT: an omitted
+// "repair" key is not preserved, it goes back to nil (unset ⇒ defaults true).
+// Only an explicitly submitted value survives a replacement.
+func TestPutRepairConfigRepairTriState(t *testing.T) {
+	tests := []struct {
+		name    string
+		current string // "repair" fragment in the stored config, "" = key absent
+		body    string
+		wantPtr *bool
+		wantEff bool
+	}{
+		{name: "omitted clears explicit false", current: `"repair": false,`, body: `{"workers":4}`, wantPtr: nil, wantEff: true},
+		{name: "omitted clears explicit true", current: `"repair": true,`, body: `{"workers":4}`, wantPtr: nil, wantEff: true},
+		{name: "submitted false applies", current: ``, body: `{"repair":false}`, wantPtr: boolPtrTest(false), wantEff: false},
+		{name: "submitted true applies", current: `"repair": false,`, body: `{"repair":true}`, wantPtr: boolPtrTest(true), wantEff: true},
 	}
 
 	for _, tc := range tests {
@@ -188,8 +318,9 @@ func TestUpdateRepairConfigRepairTriState(t *testing.T) {
 				if got.RepairEnabled() != tc.wantEff {
 					t.Fatalf("RepairEnabled() = %v, want %v", got.RepairEnabled(), tc.wantEff)
 				}
-				if got.MaxDeletionsPerRun != 5 {
-					t.Fatalf("max_deletions_per_run lost: %d", got.MaxDeletionsPerRun)
+				// The cap was never submitted, so a replacement clears it.
+				if got.MaxDeletionsPerRun != 0 {
+					t.Fatalf("PUT must clear the omitted cap: %d", got.MaxDeletionsPerRun)
 				}
 			}
 		})
@@ -198,35 +329,46 @@ func TestUpdateRepairConfigRepairTriState(t *testing.T) {
 
 func boolPtrTest(v bool) *bool { return &v }
 
-// TestUpdateRepairConfigRejectsEmptyAndMalformedBody: the merge must not turn a
-// missing or broken body into "keep everything, return 200" silently — those are
-// client errors.
+// TestUpdateRepairConfigRejectsEmptyAndMalformedBody: neither verb may turn a
+// missing or broken body into a silent 200 — those are client errors. Under PUT
+// a zero-value document would additionally wipe the whole repair block.
 func TestUpdateRepairConfigRejectsEmptyAndMalformedBody(t *testing.T) {
-	for _, body := range []string{``, `   `, `{`, `not json`} {
-		t.Run("body="+body, func(t *testing.T) {
-			setupRepairConfigTest(t, repairFixtureJSON)
-			if rec := putRepairConfig(t, body); rec.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400 for body %q", rec.Code, body)
-			}
-		})
+	for _, tc := range []struct {
+		name string
+		do   func(*testing.T, string) *httptest.ResponseRecorder
+	}{
+		{"patch", patchRepairConfig},
+		{"put", putRepairConfig},
+	} {
+		for _, body := range []string{``, `   `, `{`, `{"arrs":[`, `not json`} {
+			t.Run(tc.name+" body="+body, func(t *testing.T) {
+				cfgFile := setupRepairConfigTest(t, repairFixtureJSON)
+				if rec := tc.do(t, body); rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400 for body %q", rec.Code, body)
+				}
+				if got := readSavedRepairConfig(t, cfgFile); got.MaxDeletionsPerRun != 5 {
+					t.Fatalf("a rejected body still rewrote the repair config: %+v", got)
+				}
+			})
+		}
 	}
 }
 
-// TestUpdateRepairConfigValidatesMergedResult: validation sees the merged
+// TestPatchRepairConfigValidatesMergedResult: validation sees the merged
 // config, so a body that only flips "enabled" is accepted when the stored
-// schedule is valid, and a posted invalid schedule is still rejected.
-func TestUpdateRepairConfigValidatesMergedResult(t *testing.T) {
+// schedule is valid, and a submitted invalid schedule is still rejected.
+func TestPatchRepairConfigValidatesMergedResult(t *testing.T) {
 	setupRepairConfigTest(t, repairFixtureJSON)
-	if rec := putRepairConfig(t, `{"enabled":true}`); rec.Code != http.StatusOK {
+	if rec := patchRepairConfig(t, `{"enabled":true}`); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (stored schedule is valid): %s", rec.Code, rec.Body.String())
 	}
 
 	setupRepairConfigTest(t, repairFixtureJSON)
-	if rec := putRepairConfig(t, `{"schedule":"not a schedule"}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400 for an invalid posted schedule", rec.Code)
+	if rec := patchRepairConfig(t, `{"schedule":"not a schedule"}`); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for an invalid submitted schedule", rec.Code)
 	}
 	if got := config.Get().Repair.Schedule; got != "0 3 * * *" {
-		t.Fatalf("rejected PUT still mutated the live schedule: %q", got)
+		t.Fatalf("rejected PATCH still mutated the live schedule: %q", got)
 	}
 }
 

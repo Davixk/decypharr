@@ -167,7 +167,8 @@ A failure to persist a single entry's health update is logged but never aborts t
 | Method   | Path                                  | Purpose                                                                  |
 |----------|---------------------------------------|--------------------------------------------------------------------------|
 | `GET`    | `/api/repair/config`                  | Read current config.                                                     |
-| `PUT`    | `/api/repair/config`                  | Update config. Merges: omitted keys keep their current values.           |
+| `PATCH`  | `/api/repair/config`                  | Partial update. Omitted keys keep their current values.                  |
+| `PUT`    | `/api/repair/config`                  | Full replacement. **Omitted keys are cleared** — `max_deletions_per_run`, `stop_schedule`, `prune` and `regrab` included. |
 | `GET`    | `/api/repair/status`                  | Active run summary, last completed run, and counts of entries by status. |
 | `POST`   | `/api/repair/run`                     | Trigger a sweep now. Body can include `ignore_last_checked`, `repair`, `prune`, `regrab`, `unrestrict_link`, and `protocol`. |
 | `POST`   | `/api/repair/stop`                    | Cancel the active run.                                                   |
@@ -180,6 +181,19 @@ A failure to persist a single entry's health update is logged but never aborts t
 | `POST`   | `/api/repair/recheck/media`           | Recheck a single Arr media item. Body: `{arr, media_id, fix}`. Repairs run through Arr. |
 
 ### Examples
+
+Change one setting without disturbing the rest — use `PATCH`:
+
+```bash
+curl -X PATCH http://localhost:8282/api/repair/config \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"max_deletions_per_run":25}'
+```
+
+The same body sent with `PUT` would *also* clear `stop_schedule`, `prune`, `regrab`, `arrs` and the
+`repair` tri-state, and turn the sweep off — `PUT` replaces the whole block with what you sent.
+Reach for it only when you are submitting a complete repair config.
 
 Run a sweep now:
 

@@ -240,16 +240,21 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	run.Stats.Candidates = len(due)
 	run.Stats.SkippedFresh = skipped
 
-	// Order candidates oldest-checked-first (never-checked entries sort
-	// first, since their LastCheckedAt is the zero time). This is what makes
-	// a StopSchedule-truncated repair sweep make guaranteed forward progress: any
-	// entry probed today moves to the back of the queue (its LastCheckedAt
-	// becomes "now"), so tomorrow's truncated repair sweep naturally picks up where
-	// today's left off instead of re-rolling a random subset of `due`.
+	// Order candidates by sweep tier, then oldest-checked-first WITHIN each tier
+	// (see sweepTier): entries with no usable verdict, then broken, then routine
+	// re-verification of everything already known healthy. A sweep is far more
+	// likely to be truncated than to finish — a full pass is ~13 hours at the
+	// probe rate — so the first minutes must spend themselves on the ~129 entries
+	// that carry information, not on 60 arbitrary healthy ones.
+	//
+	// Forward progress is unchanged, just per-tier: any entry probed today gets
+	// LastCheckedAt = now and moves to the back of its own tier, so tomorrow's
+	// truncated sweep picks up where today's left off instead of re-rolling a
+	// random subset of `due`.
 	//
 	// This slice also doubles as the candidate list considered by this run,
 	// used to scope a stop-schedule repair pass.
-	names := r.orderCandidatesByLastChecked(due)
+	names := r.orderCandidatesBySweepPriority(due)
 
 	run.Stage = storage.RepairStageProbing
 	r.saveRun(run)
@@ -352,11 +357,11 @@ func detachedRepairContext(runCtx, parentCtx context.Context) context.Context {
 // concurrency. Each entry then probes its own files internally with at most
 // repairFilesPerEntry concurrency, so total file probes in flight = workers × 2.
 //
-// names gives the iteration order (see orderCandidatesByLastChecked):
-// g.Go is called in this order, so with N workers the oldest-checked N
-// candidates start first. If the run is cut short by a StopSchedule, the
-// candidates that didn't get a chance to start remain oldest-first for the
-// next repair sweep.
+// names gives the iteration order (see orderCandidatesBySweepPriority): g.Go is
+// called in this order, so with N workers the N highest-priority candidates —
+// no-verdict first, then broken, oldest-checked-first within each tier — start
+// first. If the run is cut short by a StopSchedule, the candidates that didn't
+// get a chance to start retain that same order for the next repair sweep.
 //
 // The pipeline is folded into the per-entry pass. Per dead item, components are
 // independent and knob-gated:
@@ -1944,34 +1949,145 @@ func (r *Repair) filterDueCandidates(in map[string]*candidate, ignoreLastChecked
 	return out, skipped
 }
 
-// orderCandidatesByLastChecked returns the names of `due` sorted by
-// EntryHealth.LastCheckedAt ascending - entries never checked (zero time)
-// sort first, then least-recently-checked, etc. Ties (e.g. multiple
-// never-checked entries) break on name for a stable, deterministic order
-// across runs.
+// sweepTier ranks a due candidate by how much PROBING IT RIGHT NOW is worth.
+// Candidates are probed tier by tier; the oldest-checked-first ordering the
+// sweep has always used applies WITHIN a tier rather than across the whole set.
 //
-// This ordering is what lets a StopSchedule-truncated repair sweep make guaranteed
-// forward progress across days: probing an entry updates its LastCheckedAt
-// immediately, so it sorts to the back of tomorrow's queue.
-func (r *Repair) orderCandidatesByLastChecked(due map[string]*candidate) []string {
-	type ordered struct {
-		name          string
-		lastCheckedAt time.Time
+// WHY THIS IS NOT ONE SORT KEY — the asymmetry, measured in production over a
+// ~47,600-entry library:
+//
+//	fleet                                        healthy 47,543 · unknown 117 · broken 12
+//	probe rate (multi-offset byte verification)   ~1 entry/sec
+//	a full pass over every candidate              ≈ 13 HOURS
+//	the 129 entries carrying no usable verdict    ≈ 2 MINUTES
+//
+// A single global oldest-LastCheckedAt-first sort — which is exactly what this
+// used to be — does guarantee forward progress, and that property is worth
+// keeping. But it buries those 2 minutes of actionable work at the back of a
+// 13-hour queue, and it does so for a reason that gets WORSE the more attention
+// an operator pays: examining an entry stamps its LastCheckedAt, and anything
+// recently touched sorts to the rear. Force-rechecking 128 `unknown` entries
+// pushed all 128 to the very end of a 47,672-entry queue. The ordering actively
+// punished investigation.
+//
+// Run 0f97fa65 is the bill for that: started 06:59:02, cut by a stop schedule at
+// 07:00:00, probed 60 of 47,672 — 60 arbitrary healthy entries, zero actionable
+// work, and not one of the 129 entries anybody was waiting on. Those same 58
+// seconds spent tier-first would have cleared most of the actionable backlog.
+// Wall-clock stopping and candidate ordering are one feature, not two: a stop is
+// only safe if the ordering front-loads what matters.
+//
+// DO NOT "simplify" this back into a single sort key.
+type sweepTier int
+
+const (
+	// tierNoVerdict — NO USABLE VERDICT EXISTS. Either the entry was never
+	// checked at all, or its stored status is not a verdict: `unknown` (this
+	// run could not tell — a provider 429, an auth failure, a stalled
+	// substrate), `repairing` (a record abandoned mid-probe by an interrupted
+	// run), `stale`, or an empty/unrecognised status. Highest information gain
+	// per probe: every one of these converts a non-answer into an answer, and
+	// there are ~100 of them against ~47,500 settled entries.
+	tierNoVerdict sweepTier = iota
+
+	// tierBroken — `broken`. A verdict exists and it is ACTIONABLE NOW: this is
+	// the only tier where REPAIR / PRUNE / RE-GRAB have anything to do. It sits
+	// behind tierNoVerdict only because an entry with no verdict may turn out to
+	// be broken too, and finding that out is what makes it actionable.
+	tierBroken
+
+	// tierRoutine — everything else: `healthy`, plus `unsupported`, which
+	// EntryHealth.IsDue deliberately groups with healthy. Routine
+	// re-verification of entries that already carry a usable verdict. This tier
+	// IS the 13 hours, and it is the only one that is safe to leave unfinished
+	// when a stop schedule fires.
+	tierRoutine
+)
+
+// sweepTierFor classifies one health record into its probe tier.
+//
+// A nil record (no health row at all) and a record whose LastCheckedAt is zero
+// are BOTH tierNoVerdict: "never probed" is the strongest form of "no usable
+// verdict", and it must not fall through to tierRoutine on the strength of a
+// status field no probe ever wrote. This check therefore comes FIRST, ahead of
+// the status switch.
+func sweepTierFor(h *storage.EntryHealth) sweepTier {
+	if h == nil || h.LastCheckedAt.IsZero() {
+		return tierNoVerdict
 	}
-	items := make([]ordered, 0, len(due))
-	for name := range due {
-		var lastCheckedAt time.Time
-		if h, _ := r.manager.storage.GetEntryHealth(name); h != nil {
-			lastCheckedAt = h.LastCheckedAt
-		}
-		items = append(items, ordered{name: name, lastCheckedAt: lastCheckedAt})
+	switch h.Status {
+	case storage.HealthBroken:
+		return tierBroken
+	case storage.HealthHealthy, storage.HealthUnsupported:
+		return tierRoutine
+	default:
+		// storage.HealthUnknown, storage.HealthRepairing, storage.HealthStale,
+		// "" and any status added later. Defaulting an UNRECOGNISED status to
+		// tierNoVerdict is deliberate: a status this function does not know is,
+		// by definition, not a verdict it can trust.
+		return tierNoVerdict
 	}
+}
+
+// sweepCandidate is one entry's sort key. tier is computed ONCE per candidate,
+// outside the comparator.
+type sweepCandidate struct {
+	name          string
+	tier          sweepTier
+	lastCheckedAt time.Time
+}
+
+// sortSweepCandidates imposes the probe order in place: tier ascending, then
+// LastCheckedAt ascending (oldest first — never-checked entries carry the zero
+// time and lead their tier), then name ascending.
+//
+// The name tiebreak is what makes the order TOTAL rather than merely sorted:
+// names are the keys of the candidate map, so they are unique, so no two
+// elements ever compare equal and an unstable sort.Slice still yields exactly
+// one possible permutation. Identical input therefore produces identical output
+// no matter what order Go's map iteration handed the elements over in.
+func sortSweepCandidates(items []sweepCandidate) {
 	sort.Slice(items, func(i, j int) bool {
-		if !items[i].lastCheckedAt.Equal(items[j].lastCheckedAt) {
-			return items[i].lastCheckedAt.Before(items[j].lastCheckedAt)
+		a, b := &items[i], &items[j]
+		if a.tier != b.tier {
+			return a.tier < b.tier
 		}
-		return items[i].name < items[j].name
+		if !a.lastCheckedAt.Equal(b.lastCheckedAt) {
+			return a.lastCheckedAt.Before(b.lastCheckedAt)
+		}
+		return a.name < b.name
 	})
+}
+
+// orderCandidatesBySweepPriority returns the names of `due` in probe order: by
+// sweepTier first, then oldest-LastCheckedAt-first within each tier, then name.
+//
+// It is PURELY A PERMUTATION of `due` — every candidate goes in and every
+// candidate comes out. It decides nothing about which entries are candidates,
+// which are due, what verdict they get, or which components run on them.
+//
+// The forward-progress property the previous global oldest-first ordering
+// existed for is preserved, just per-tier: probing an entry stamps
+// LastCheckedAt = now, so it sorts to the back of ITS OWN tier for the next run,
+// and a run cut short by a StopSchedule resumes at the head of the highest tier
+// that still has work rather than re-treading the head it already probed.
+//
+// Cost at library scale: one GetEntryHealth per candidate (the read the previous
+// ordering already performed, unchanged) plus one O(n log n) sort over a flat
+// slice of {string, int, time.Time} — at ~47,600 entries that is ~2 MB in a
+// single allocation and log₂n ≈ 16 comparisons per element, i.e. milliseconds
+// against a 13-hour probe pass.
+func (r *Repair) orderCandidatesBySweepPriority(due map[string]*candidate) []string {
+	items := make([]sweepCandidate, 0, len(due))
+	for name := range due {
+		h, _ := r.manager.storage.GetEntryHealth(name)
+		item := sweepCandidate{name: name, tier: sweepTierFor(h)}
+		if h != nil {
+			item.lastCheckedAt = h.LastCheckedAt
+		}
+		items = append(items, item)
+	}
+	sortSweepCandidates(items)
 	out := make([]string, len(items))
 	for i, it := range items {
 		out[i] = it.name

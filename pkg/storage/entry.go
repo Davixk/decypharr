@@ -615,6 +615,7 @@ func (s *Storage) updateEntryItem(entry *Entry) {
 	}
 	oldFingerprint := EntryItemRepairFingerprint(item)
 
+	created := item == nil
 	if item == nil {
 		item = &EntryItem{Name: name, Files: make(map[string]*File)}
 	}
@@ -630,6 +631,12 @@ func (s *Storage) updateEntryItem(entry *Entry) {
 	if err := s.entryItems.Put(name, data, nil); err != nil {
 		s.markEntryItemFailure(entry, "write", err)
 		return
+	}
+	if created {
+		// Only a NEW key can change an alias. The far more common in-place
+		// rewrite of an existing folder row leaves the reverse index valid, and
+		// invalidating on those would rebuild it on every progress update.
+		s.invalidateEntryItemAliases()
 	}
 	if oldFingerprint != newFingerprint {
 		s.MarkEntryDirty(name, entry.Protocol, "entry_item_changed")

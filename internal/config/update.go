@@ -8,22 +8,26 @@ import (
 )
 
 // PreserveMissingSections restores, from src, every configuration field whose
-// JSON key is absent from the posted body. It is the merge step behind POST
-// /api/config: that handler decodes the body into a zero Config, so any section
-// the caller omitted would otherwise become its zero value and the subsequent
-// Save would erase it from disk (a partial POST without "debrids" wiped every
-// configured provider, api keys included).
+// JSON key is absent from the submitted body. It is the merge step behind PATCH
+// /api/config — and ONLY that verb: the handler decodes the body into a zero
+// Config, so any section the caller omitted would otherwise become its zero
+// value and the subsequent Save would erase it from disk (a partial update
+// without "debrids" wiped every configured provider, api keys included).
 //
-// The merge is RECURSIVE: it applies inside posted sections too, not only at
-// the top level. Posting `{"repair":{"enabled":true}}` used to replace the
+// PUT /api/config deliberately does NOT call this: a full replacement means the
+// omitted fields revert to their zero value, and softening that would make PUT
+// indistinguishable from PATCH.
+//
+// The merge is RECURSIVE: it applies inside submitted sections too, not only at
+// the top level. Submitting `{"repair":{"enabled":true}}` used to replace the
 // WHOLE repair block, silently zeroing max_deletions_per_run (the
 // destructive-action cap), stop_schedule, prune and regrab; now only "enabled"
 // changes and the unmentioned knobs keep their stored values.
 //
 // Key presence is what separates "leave it alone" from "clear it": a key absent
-// from body keeps the current value, while an explicitly posted empty value
+// from body keeps the current value, while an explicitly submitted empty value
 // (`"debrids": []`, `"download_folder": ""`, `"repair":{"prune":false}`) still
-// overwrites. Bodies that post every key (the web UI's full-config save) are
+// overwrites. Bodies that carry every key (the web UI's full-config save) are
 // unaffected because nothing is missing.
 //
 // Fields tagged `json:"-"` (e.g. Auth) are never copied here; the API handler
@@ -34,16 +38,20 @@ func (c *Config) PreserveMissingSections(src *Config, body []byte) error {
 }
 
 // PreserveMissingFields is the RepairConfig-level equivalent of
-// PreserveMissingSections, and exists for the same reason: PUT
-// /api/repair/config decodes the posted body into a zero RepairConfig, so
-// before this merge every key the caller omitted was silently reset —
+// PreserveMissingSections, and exists for the same reason: PATCH
+// /api/repair/config decodes the submitted body into a zero RepairConfig, so
+// without this merge every key the caller omitted would be silently reset —
 // max_deletions_per_run to 0, stop_schedule to "" (stop schedule disabled),
-// prune/regrab to false. A UI or script that PUT a partial repair config
-// therefore wiped the operator's destructive-action cap without saying so.
+// prune/regrab to false — which is not what a PARTIAL update promises.
+//
+// PUT /api/repair/config does not call this. There, clearing the omitted fields
+// IS the contract, and it is safe because each knob's zero value is the
+// conservative one (cap 0 ⇒ the default 100, prune/regrab false ⇒ delete
+// nothing, repair nil ⇒ re-acquire).
 //
 // The Repair *bool tri-state is preserved exactly: an absent "repair" key keeps
 // the current pointer (which may itself be nil, i.e. unset ⇒ defaults true),
-// while an explicitly posted true/false overwrites it.
+// while an explicitly submitted true/false overwrites it.
 func (r *RepairConfig) PreserveMissingFields(src RepairConfig, body []byte) error {
 	return preserveMissingFields(reflect.ValueOf(r).Elem(), reflect.ValueOf(src), body)
 }
@@ -71,7 +79,7 @@ func preserveMissingFields(dst, from reflect.Value, body []byte) error {
 //
 //   - struct (and pointer-to-struct): recursed into, so a partially posted
 //     section keeps the fields it did not mention. This is what protects
-//     repair.max_deletions_per_run from a `{"repair":{"enabled":true}}` POST.
+//     repair.max_deletions_per_run from a `{"repair":{"enabled":true}}` PATCH.
 //   - slice/array (debrids, arrs, usenet.providers, repair.arrs, …): NOT
 //     element-merged. A posted array is the caller's complete list and REPLACES
 //     the stored one wholesale (index is not identity — element-merging would

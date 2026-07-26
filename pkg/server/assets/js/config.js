@@ -1138,8 +1138,17 @@ class ConfigManager {
                 throw new Error(validation.errors.join('\n'));
             }
 
+            // PATCH, not PUT: collectFormData() builds a complete FORM, not a
+            // complete config document. It never sends use_auth,
+            // enable_webdav_auth, allow_samples, skip_multi_season, categories,
+            // retries, skip_auto_move, discord_webhook_url, callback_url, the
+            // deprecated qbittorrent/rclone blocks or repair.auto_repair —
+            // fields an operator can still have set in config.json. A PUT would
+            // honestly clear every one of them, which is not what pressing Save
+            // on a settings form means. PATCH says what this request is: apply
+            // the fields this form owns, leave the rest alone.
             const response = await window.decypharrUtils.fetcher('/api/config', {
-                method: 'POST',
+                method: 'PATCH',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(config)
             });

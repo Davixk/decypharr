@@ -8,7 +8,7 @@ import (
 // TestRequiresRestartMaxActiveDownloads pins the restart classification of
 // max_active_downloads: the manager sizes its worker pool and action gate
 // from it once at construction, so a change must route config saves through
-// the restart branch (handleUpdateConfig) instead of the silent live-apply.
+// the restart branch (applyConfigUpdate) instead of the silent live-apply.
 func TestRequiresRestartMaxActiveDownloads(t *testing.T) {
 	current := &Config{}
 	current.setDefaults()

@@ -12,11 +12,11 @@ import (
 func boolPtr(value bool) *bool { return &value }
 
 // TestDebridDownloadUncachedSaveRoundTrip reproduces the production bug where
-// POST /api/config with debrids[].download_uncached=false returned 200 but the
-// key was stripped from disk (bool + omitempty), and any later save re-stripped
-// a hand-edited false. With *bool, explicit values survive save round-trips
-// while an absent key stays absent and resolves to the historical default
-// (false).
+// a config update carrying debrids[].download_uncached=false returned 200 but
+// the key was stripped from disk (bool + omitempty), and any later save
+// re-stripped a hand-edited false. With *bool, explicit values survive save
+// round-trips while an absent key stays absent and resolves to the historical
+// default (false).
 func TestDebridDownloadUncachedSaveRoundTrip(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -33,12 +33,12 @@ func TestDebridDownloadUncachedSaveRoundTrip(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			SetConfigPath(t.TempDir())
 
-			// Simulate the API handler's decode of a POST body.
+			// Simulate the API handler's decode of an update body.
 			body := `{"debrids":[{"name":"rd","provider":"realdebrid","api_key":"secret",` +
 				test.fragment + `"rate_limit":"250/minute"}]}`
 			var cfg Config
 			if err := json.Unmarshal([]byte(body), &cfg); err != nil {
-				t.Fatalf("unmarshal POST body: %v", err)
+				t.Fatalf("unmarshal update body: %v", err)
 			}
 			if err := cfg.Save(); err != nil {
 				t.Fatalf("save config: %v", err)
@@ -106,7 +106,7 @@ func preserveBaseConfig() *Config {
 }
 
 // TestPreserveMissingSectionsKeepsOmittedSections covers the production data
-// loss: a POST without the "debrids" key must not wipe configured providers
+// loss: an update without the "debrids" key must not wipe configured providers
 // (api keys included) or any other omitted section.
 func TestPreserveMissingSectionsKeepsOmittedSections(t *testing.T) {
 	current := preserveBaseConfig()
@@ -168,10 +168,10 @@ func TestPreserveMissingSectionsExplicitEmptyStillClears(t *testing.T) {
 	}
 }
 
-// TestPreserveMissingSectionsFullPostUnchanged: a body that posts every
+// TestPreserveMissingSectionsFullPatchUnchanged: a body that carries every
 // top-level key (the web UI's full-config save) must decode identically with
 // and without the merge step.
-func TestPreserveMissingSectionsFullPostUnchanged(t *testing.T) {
+func TestPreserveMissingSectionsFullPatchUnchanged(t *testing.T) {
 	current := preserveBaseConfig()
 	body := []byte(`{
 		"log_level": "trace",
@@ -214,7 +214,7 @@ func TestPreserveMissingSectionsFullPostUnchanged(t *testing.T) {
 		t.Fatalf("PreserveMissingSections: %v", err)
 	}
 	if !reflect.DeepEqual(plain, merged) {
-		t.Fatalf("full-config POST changed by merge:\nplain:  %+v\nmerged: %+v", plain, merged)
+		t.Fatalf("full-config PATCH changed by merge:\nplain:  %+v\nmerged: %+v", plain, merged)
 	}
 	if len(merged.Debrids) != 1 || merged.Debrids[0].APIKey != "new-key" {
 		t.Fatalf("posted debrids did not win wholesale: %+v", merged.Debrids)
@@ -265,9 +265,9 @@ func preserveNestedConfig() *Config {
 	}
 }
 
-// mergePosted decodes body the way handleUpdateConfig does and applies the
+// mergePartial decodes body the way applyConfigUpdate does and applies the
 // merge against current, returning what would be saved.
-func mergePosted(t *testing.T, current *Config, body string) *Config {
+func mergePartial(t *testing.T, current *Config, body string) *Config {
 	t.Helper()
 	var updated Config
 	if err := json.Unmarshal([]byte(body), &updated); err != nil {
@@ -286,32 +286,32 @@ func mergePosted(t *testing.T, current *Config, body string) *Config {
 // stop_schedule, prune and regrab.
 func TestPreserveMissingSectionsNestedPartialKeepsSafetyKnobs(t *testing.T) {
 	current := preserveNestedConfig()
-	got := mergePosted(t, current, `{"repair":{"enabled":true}}`)
+	got := mergePartial(t, current, `{"repair":{"enabled":true}}`)
 
 	if !got.Repair.Enabled {
 		t.Fatalf("posted repair.enabled not applied: %+v", got.Repair)
 	}
 	if got.Repair.MaxDeletionsPerRun != 5 {
-		t.Fatalf("nested partial POST wiped max_deletions_per_run: %d", got.Repair.MaxDeletionsPerRun)
+		t.Fatalf("nested partial PATCH wiped max_deletions_per_run: %d", got.Repair.MaxDeletionsPerRun)
 	}
 	if got.Repair.StopSchedule != "06:00" {
-		t.Fatalf("nested partial POST wiped stop_schedule: %q", got.Repair.StopSchedule)
+		t.Fatalf("nested partial PATCH wiped stop_schedule: %q", got.Repair.StopSchedule)
 	}
 	if !got.Repair.Prune {
-		t.Fatalf("nested partial POST wiped prune")
+		t.Fatalf("nested partial PATCH wiped prune")
 	}
 	if !got.Repair.Regrab {
-		t.Fatalf("nested partial POST wiped regrab")
+		t.Fatalf("nested partial PATCH wiped regrab")
 	}
 	if got.Repair.Schedule != "0 3 * * *" || got.Repair.Source != RepairSourceManaged ||
 		got.Repair.Workers != 3 || got.Repair.RecheckInterval != "168h" || !got.Repair.SkipNZBRepair {
-		t.Fatalf("nested partial POST wiped the remaining repair fields: %+v", got.Repair)
+		t.Fatalf("nested partial PATCH wiped the remaining repair fields: %+v", got.Repair)
 	}
 	if got.Repair.Repair == nil || *got.Repair.Repair {
-		t.Fatalf("nested partial POST lost the repair:false tri-state: %v", got.Repair.Repair)
+		t.Fatalf("nested partial PATCH lost the repair:false tri-state: %v", got.Repair.Repair)
 	}
 	if len(got.Repair.Arrs) != 2 {
-		t.Fatalf("nested partial POST wiped repair.arrs: %+v", got.Repair.Arrs)
+		t.Fatalf("nested partial PATCH wiped repair.arrs: %+v", got.Repair.Arrs)
 	}
 	// Sibling top-level sections still behave as before.
 	if len(got.Debrids) != 1 || got.Debrids[0].APIKey != "rd-key" || got.DownloadFolder != "/downloads" {
@@ -324,7 +324,7 @@ func TestPreserveMissingSectionsNestedPartialKeepsSafetyKnobs(t *testing.T) {
 // instruction and must overwrite. Losing this would make the cap unclearable.
 func TestPreserveMissingSectionsNestedExplicitValuesStillApply(t *testing.T) {
 	current := preserveNestedConfig()
-	got := mergePosted(t, current,
+	got := mergePartial(t, current,
 		`{"repair":{"max_deletions_per_run":0,"stop_schedule":"","prune":false,"regrab":false,"workers":0}}`)
 
 	if got.Repair.MaxDeletionsPerRun != 0 {
@@ -400,7 +400,7 @@ func TestPreserveMissingSectionsNestedBoolPointerTriState(t *testing.T) {
 			current.Repair.Repair = test.currentRepair
 			current.Mount.Rclone.AsyncRead = test.currentAsync
 
-			got := mergePosted(t, current, test.body)
+			got := mergePartial(t, current, test.body)
 			check(t, "repair.repair", got.Repair.Repair, test.wantRepair)
 			check(t, "mount.rclone.async_read", got.Mount.Rclone.AsyncRead, test.wantAsync)
 			if got.Repair.RepairEnabled() != (test.wantRepair == nil || *test.wantRepair) {
@@ -418,7 +418,7 @@ func TestPreserveMissingSectionsNestedBoolPointerTriState(t *testing.T) {
 func TestPreserveMissingSectionsNestedListsReplaceWholesale(t *testing.T) {
 	current := preserveNestedConfig()
 
-	got := mergePosted(t, current, `{"repair":{"arrs":["radarr"]},"custom_folders":{"shows":{}}}`)
+	got := mergePartial(t, current, `{"repair":{"arrs":["radarr"]},"custom_folders":{"shows":{}}}`)
 	if len(got.Repair.Arrs) != 1 || got.Repair.Arrs[0] != "radarr" {
 		t.Fatalf("posted repair.arrs did not replace wholesale: %+v", got.Repair.Arrs)
 	}
@@ -433,11 +433,11 @@ func TestPreserveMissingSectionsNestedListsReplaceWholesale(t *testing.T) {
 	}
 
 	// Explicitly empty still clears; omitted still preserves.
-	cleared := mergePosted(t, current, `{"repair":{"arrs":[]},"custom_folders":{}}`)
+	cleared := mergePartial(t, current, `{"repair":{"arrs":[]},"custom_folders":{}}`)
 	if len(cleared.Repair.Arrs) != 0 || len(cleared.CustomFolders) != 0 {
 		t.Fatalf("explicitly empty lists did not clear: %+v / %+v", cleared.Repair.Arrs, cleared.CustomFolders)
 	}
-	kept := mergePosted(t, current, `{"repair":{"enabled":true}}`)
+	kept := mergePartial(t, current, `{"repair":{"enabled":true}}`)
 	if len(kept.Repair.Arrs) != 2 || len(kept.CustomFolders) != 1 {
 		t.Fatalf("omitted lists were not preserved: %+v / %+v", kept.Repair.Arrs, kept.CustomFolders)
 	}
@@ -447,7 +447,7 @@ func TestPreserveMissingSectionsNestedListsReplaceWholesale(t *testing.T) {
 // to "repair" — it applies at every struct level, e.g. mount.rclone.
 func TestPreserveMissingSectionsMergesArbitraryDepth(t *testing.T) {
 	current := preserveNestedConfig()
-	got := mergePosted(t, current, `{"mount":{"rclone":{"vfs_cache_mode":"off"}}}`)
+	got := mergePartial(t, current, `{"mount":{"rclone":{"vfs_cache_mode":"off"}}}`)
 
 	if got.Mount.Rclone.VfsCacheMode != "off" {
 		t.Fatalf("posted mount.rclone.vfs_cache_mode not applied: %q", got.Mount.Rclone.VfsCacheMode)
@@ -466,10 +466,10 @@ func TestPreserveMissingSectionsMergesArbitraryDepth(t *testing.T) {
 	}
 }
 
-// TestPreserveMissingSectionsFullNestedPostUnchanged: a body that posts every
+// TestPreserveMissingSectionsFullNestedPatchUnchanged: a body that carries every
 // key of a section behaves exactly like a plain decode, i.e. the recursive merge
 // is a no-op for the web UI's full-config save.
-func TestPreserveMissingSectionsFullNestedPostUnchanged(t *testing.T) {
+func TestPreserveMissingSectionsFullNestedPatchUnchanged(t *testing.T) {
 	current := preserveNestedConfig()
 	body := `{"repair":{
 		"enabled": false, "source": "arr", "schedule": "@daily", "workers": 1,
@@ -483,7 +483,7 @@ func TestPreserveMissingSectionsFullNestedPostUnchanged(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &plain); err != nil {
 		t.Fatalf("unmarshal body: %v", err)
 	}
-	got := mergePosted(t, current, body)
+	got := mergePartial(t, current, body)
 	if !reflect.DeepEqual(plain.Repair, got.Repair) {
 		t.Fatalf("fully posted section changed by merge:\nplain:  %+v\nmerged: %+v", plain.Repair, got.Repair)
 	}

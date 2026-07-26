@@ -76,7 +76,8 @@ These endpoints can delete data, mutate an \*arr, or launch work that does:
 | `DELETE /webdav/{group}/{torrent}` · `MOVE /webdav/...` | Deletes the entry (placements + files) / moves it. |
 | `POST /api/mount/cache/purge` | Purges the whole DFS mount cache. |
 | `POST /api/mount/cache/cleanup` | Evicts expired DFS cache entries. |
-| `POST /api/config` · `PUT /api/repair/config` | Rewrites config on disk. Both **merge recursively** — a key absent from the body keeps its current value at every nesting level. Posted arrays/maps still replace wholesale. |
+| `PATCH /api/config` · `PATCH /api/repair/config` | Rewrites config on disk. **Merges recursively** — a key absent from the body keeps its current value at every nesting level. Submitted arrays/maps still replace wholesale. |
+| `PUT /api/config` · `PUT /api/repair/config` | Rewrites config on disk with the submitted document. **Everything you omit is cleared** — including `repair.max_deletions_per_run`, `stop_schedule`, `prune` and `regrab`. See the note under "Config and auth management" for why that cannot make a config *more* destructive. |
 | `POST /api/update-auth` | Empty username + password **disables authentication entirely**. |
 | `POST /api/refresh-token` | Invalidates the current API token immediately. |
 | `POST /api/setup/complete` · `POST /skip-auth` | Writes config + restarts (pre-setup only; `403` after setup). |
@@ -181,21 +182,48 @@ Not useful from curl; unauthenticated requests `303` to `/login`.
 | Method | Path | Does | Body | Response / Safety |
 |---|---|---|---|---|
 | GET | `/api/config` | Full `config.Config` plus `api_token` and `auth_username`. Exempt from the setup gate. | — | Config JSON. SAFE (**leaks the API token and all provider keys**) |
-| POST | `/api/config` | Update config. **Merges recursively**: a key absent from the posted JSON keeps its current value at *every* nesting level, not just the top (`PreserveMissingSections`). So `{"repair":{"enabled":true}}` changes only `repair.enabled` and leaves `max_deletions_per_run`, `stop_schedule`, `prune`, `regrab` — and the `repair` tri-state — exactly as stored. Explicitly posted values still overwrite, including empty/zero/false ones (`"download_folder": ""`, `"repair":{"prune":false}`). **Arrays and maps are not element-merged**: a posted `debrids` / `arrs` / `usenet.providers` / `repair.arrs` / `custom_folders` is the caller's complete list and **replaces wholesale** (`"debrids": []` still clears); an omitted one is preserved. A posted `null` for a section clears it. `auth`, `use_auth`, `enable_webdav_auth` are always preserved from the live config. \*arrs missing `name`/`host`/`token` are dropped; invalid \*arr hosts → `400`. Restarts only if bind/debrid/usenet/mount changed, else applies live. | REQUIRED — a partial `config.Config` object | `{"status":"success","restarted":bool}`. **DESTRUCTIVE** (writes config) |
+| PATCH | `/api/config` | **Partial update.** A key absent from the submitted JSON keeps its current value at *every* nesting level, not just the top (`PreserveMissingSections`). So `{"repair":{"enabled":true}}` changes only `repair.enabled` and leaves `max_deletions_per_run`, `stop_schedule`, `prune`, `regrab` — and the `repair` tri-state — exactly as stored. Explicitly submitted values still overwrite, including empty/zero/false ones (`"download_folder": ""`, `"repair":{"prune":false}`). **Arrays and maps are not element-merged**: a submitted `debrids` / `arrs` / `usenet.providers` / `repair.arrs` / `custom_folders` is the caller's complete list and **replaces wholesale** (`"debrids": []` still clears); an omitted one is preserved. A submitted `null` for a section clears it. | REQUIRED — a partial `config.Config` object | `{"status":"success","restarted":bool}`. **DESTRUCTIVE** (writes config) |
+| PUT | `/api/config` | **Full replacement.** The submitted document *is* the new config: **every key you omit reverts to its zero value**, then the normal save-time defaults are applied (so e.g. an omitted `download_folder` becomes `<config dir>/downloads`, an omitted `repair.source` becomes `arr`). Omitting `debrids` clears every provider. Submitted values behave exactly as under PATCH. | REQUIRED — a complete `config.Config` object | Same as PATCH. **DESTRUCTIVE** (writes config, clears omissions) |
 | POST | `/api/refresh-token` | Generates a new 256-bit API token and saves it. | — | `{"token","message"}` — note the key is **`token`**, not `api_token`. **DESTRUCTIVE** (old token stops working immediately) |
 | POST | `/api/update-auth` | Set or clear credentials. Empty `username` **and** `password` → sets `use_auth=false` and clears the stored credentials. Otherwise both are required and `password` must equal `confirm_password`. | REQUIRED — `{"username":string,"password":string,"confirm_password":string}` | `{"message"}`. **DESTRUCTIVE** |
 
+Both verbs share one implementation — they differ *only* in whether the merge step runs — so the
+rest is identical for each: `auth`, `use_auth` and `enable_webdav_auth` are always preserved from
+the live config (a PUT cannot disable authentication by omission), \*arrs missing
+`name`/`host`/`token` are dropped, an invalid \*arr host is a `400`, and the server restarts only
+if bind/debrid/usenet/mount changed, else applies live. A missing or malformed body is a `400` on
+both — it is never treated as an empty document.
+
+:::caution[What `PUT` does to the repair safety settings]
+`repair.max_deletions_per_run`, `stop_schedule`, `prune` and `regrab` have **no save-time default**,
+so a `PUT` that omits them clears them outright: `0`, `""`, `false`, `false`. **A `PUT` can drop a
+deletion cap you deliberately tightened.** What it cannot do is make the configuration *more*
+destructive, because each of those zero values is the conservative one — `max_deletions_per_run: 0`
+resolves to the default cap of **100** (unlimited is `-1`), `prune`/`regrab` `false` delete nothing,
+and an absent `repair` tri-state resolves to `true` (re-acquire, non-destructive). `stop_schedule: ""`
+only means the sweep runs to completion.
+
+If you want to change one setting without restating the rest, use **`PATCH`**. That is what the
+Settings page does.
+:::
+
 ```bash
-# Nested partial update: only repair.enabled changes. max_deletions_per_run,
-# stop_schedule, prune, regrab and the repair tri-state keep their stored
-# values — before the recursive merge this POST silently zeroed all of them.
-curl -X POST -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+# PATCH — nested partial update: only repair.enabled changes.
+# max_deletions_per_run, stop_schedule, prune, regrab and the repair tri-state
+# keep their stored values.
+curl -X PATCH -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
   -d '{"repair":{"enabled":true}}' \
   http://localhost:8282/api/config
 
 # Lists replace, they are not element-merged: this leaves ONE debrid configured.
-curl -X POST -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+curl -X PATCH -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
   -d '{"debrids":[{"name":"rd","provider":"realdebrid","api_key":"KEY"}]}' \
+  http://localhost:8282/api/config
+
+# PUT — full replacement. This is NOT "set the log level": it also clears
+# debrids, arrs, the repair block and everything else you did not send.
+curl -X PUT -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"log_level":"debug"}' \
   http://localhost:8282/api/config
 ```
 
@@ -257,7 +285,8 @@ case-insensitive) applies to the group and torrent-file levels only.
 | Method | Path | Does | Body | Response / Safety |
 |---|---|---|---|---|
 | GET | `/api/repair/config` | Current `repair` config block. | — | `RepairConfig`. SAFE |
-| PUT | `/api/repair/config` | **Merges** the posted object into the current repair config, saves, then reschedules. A key absent from the body keeps its current value; an explicitly posted value — including `0`, `""` or `false` — overwrites (`PreserveMissingFields`, the same mechanism `POST /api/config` uses). Validation runs on the merged result: when the merged `enabled` is true, `schedule` must be present and parseable, `recheck_interval` parseable, `source` ∈ `arr`,`managed`; `nntp_connection_percent` must be 0–100 always. An empty or malformed body is a `400`. | **REQUIRED** — any subset of `RepairConfig`: `{enabled,source,schedule,stop_schedule,workers,nntp_connection_percent,strategy,recheck_interval,arrs[],skip_nzb_repair,repair,prune,regrab,max_deletions_per_run,auto_repair}` | Saved `RepairConfig`. **DESTRUCTIVE** (writes config) |
+| PATCH | `/api/repair/config` | **Partial update.** Merges the submitted object into the current repair config, saves, then reschedules. A key absent from the body keeps its current value; an explicitly submitted value — including `0`, `""` or `false` — overwrites (`PreserveMissingFields`, the same mechanism `PATCH /api/config` uses). The `repair` tri-state is preserved exactly: absent keeps the stored pointer, `null` included. | **REQUIRED** — any subset of `RepairConfig`: `{enabled,source,schedule,stop_schedule,workers,nntp_connection_percent,strategy,recheck_interval,arrs[],skip_nzb_repair,repair,prune,regrab,max_deletions_per_run,auto_repair}` | Saved `RepairConfig`. **DESTRUCTIVE** (writes config) |
+| PUT | `/api/repair/config` | **Full replacement.** The submitted object *is* the new repair config: **every key you omit is cleared** — `max_deletions_per_run` → `0`, `stop_schedule` → `""`, `prune`/`regrab` → `false`, `repair` → unset, `arrs` → empty. Fields that have a save-time default (`source`, `workers`, `strategy`, `recheck_interval`, `nntp_connection_percent`) fall back to it rather than to the stored value. Validation still runs on the result, so a `PUT` of `{"enabled":true}` is a **`400`** — the replacement carries no schedule. | **REQUIRED** — a complete `RepairConfig` | Saved `RepairConfig`. **DESTRUCTIVE** (writes config, clears omissions) |
 | GET | `/api/repair/status` | `{enabled,next_run_at,active_run,last_run,health_counts}`. Returns an empty object if the service is unavailable (never `503`). | — | SAFE |
 | POST | `/api/repair/run` | Start a sweep now. Runs even when `repair.enabled` is false. | **OPTIONAL** — `{"ignore_last_checked":bool,"force":bool,"repair":bool,"prune":bool,"regrab":bool,"auto_repair":bool,"unrestrict_link":bool,"protocol":"all"\|"torrent"\|"nzb"}`. **Absent body ⇒ probe only what is due, using the configured REPAIR/PRUNE/RE-GRAB knobs.** Query params of the same names override the body (`1/true/yes/on` and `0/false/no/off`); `force` is an alias for `ignore_last_checked`. `protocol` also accepts `both` (≡ `all`); anything else → `400`. Omitting `protocol` uses `torrent` when `skip_nzb_repair` is set, else `all`. | `{"run_id":"…"}`; `409` if a run is active; `503` if the service is unavailable. **DESTRUCTIVE** if PRUNE/RE-GRAB resolve on |
 | POST | `/api/repair/stop` | Cancels the active run and flips its record to `cancelled`. | — | `200`; `400` if no run is active. SAFE |
@@ -271,9 +300,21 @@ case-insensitive) applies to the group and torrent-file levels only.
 | GET | `/api/repair/health/{name}` | One entry's health, incl. `broken_files`. `{name}` is URL-unescaped. `404` if unknown. | — | `EntryHealth`. SAFE |
 | POST | `/api/repair/health/{name}/check` | Re-probe one entry, then act if it probes broken. Does not take the singleton run lock; `400` if that entry is already being probed. Unlimited deletion budget. | **OPTIONAL** — `{"actions":{"repair":bool,"prune":bool,"regrab":bool}}`. **Absent body and no `?fix=true` ⇒ CHECK-only.** `?fix=true` with absent `actions` ⇒ the configured knobs; an all-false `actions` forces CHECK-only even with `?fix=true`. | `EntryHealth` ack with `status:"repairing"` (work runs in background). **DESTRUCTIVE** when `actions`/`?fix=true` select PRUNE or RE-GRAB |
 
+Validation is identical for both verbs and runs on the RESULTING document: when the resulting
+`enabled` is true, `schedule` must be present and parseable and `recheck_interval` parseable, and
+`source` must be `arr` or `managed`; `nntp_connection_percent` must be 0–100 always. An empty or
+malformed body is a `400` on both, and a rejected request never mutates the stored config.
+
 ```bash
-# Partial update: only the cap changes; schedule, stop_schedule, prune/regrab
-# and the repair tri-state keep their stored values.
+# PATCH — partial update: only the cap changes; schedule, stop_schedule,
+# prune/regrab and the repair tri-state keep their stored values.
+curl -X PATCH -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+  -d '{"max_deletions_per_run":25}' \
+  http://localhost:8282/api/repair/config
+
+# PUT — full replacement. This does NOT just set the cap: it also clears
+# stop_schedule, prune, regrab, arrs and the repair tri-state, and turns the
+# sweep off (enabled was not sent).
 curl -X PUT -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
   -d '{"max_deletions_per_run":25}' \
   http://localhost:8282/api/repair/config
@@ -442,9 +483,11 @@ r = requests.post(f"{BASE_URL}/api/add",
                          "arr": (None, "sonarr")})
 
 # Raise the destructive-action cap without touching any other repair setting.
-r = requests.put(f"{BASE_URL}/api/repair/config",
-                 headers=headers,
-                 json={"max_deletions_per_run": 25})
+# PATCH, not PUT: a PUT here would clear stop_schedule, prune, regrab and the
+# rest of the block along the way.
+r = requests.patch(f"{BASE_URL}/api/repair/config",
+                   headers=headers,
+                   json={"max_deletions_per_run": 25})
 ```
 
 ```javascript
@@ -484,3 +527,8 @@ fetch(`${BASE_URL}/api/add`, { method: 'POST', headers, body: form });
    `repair`/`prune`/`regrab` decide what a run does.
 10. **`POST /api/refresh-token` returns `token`, not `api_token`** — and the old token stops working
     the moment it returns.
+11. **`PUT` on either config endpoint means REPLACE, and it means it.** `PUT /api/repair/config`
+    with `{"max_deletions_per_run":25}` does not "just set the cap" — it clears `stop_schedule`,
+    `prune`, `regrab`, `arrs`, the `repair` tri-state and `enabled` along with it. Use `PATCH` for
+    a one-field change. There is **no `POST /api/config`**; the config endpoints answer `GET`,
+    `PATCH` and `PUT` only.
