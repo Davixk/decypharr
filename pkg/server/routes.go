@@ -67,6 +67,12 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/repair/health/{name}", s.handleGetEntryHealth)
 			r.Post("/repair/health/{name}/check", s.handleRecheckEntry)
 
+			// Queue diagnostics -- read-only. Answers index membership without
+			// going through debrid submission, which otherwise confounds the
+			// answer with provider cache state.
+			r.Get("/queue/consistency", s.handleQueueConsistency)
+			r.Get("/queue/consistency/{infohash}", s.handleQueueKeyState)
+
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)

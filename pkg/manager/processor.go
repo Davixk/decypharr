@@ -158,9 +158,22 @@ func (m *Manager) queueTorrentRetry(importReq *ImportRequest, torrent *storage.E
 
 func newTorrentQueueEntry(importReq *ImportRequest, status debridTypes.TorrentStatus) *storage.Entry {
 	now := time.Now()
+	// A magnet carries its display name in the optional "dn" parameter, so a
+	// bare magnet:?xt=urn:btih:<hash> parses to an empty Name -- and the real
+	// name only arrives later, from the provider. An empty Name makes
+	// DownloadPath() clean back to SavePath, which for an *arr entry is the
+	// shared category directory: every path derived from this entry then points
+	// at a directory owned by all its siblings. The delete path already refuses
+	// to act on that, but the entry should never be built that way to begin
+	// with. Substitute the infohash, which is unique and filesystem-safe; the
+	// real name replaces it once the provider resolves it.
+	name := importReq.Magnet.Name
+	if !utils.IsUsableName(name) {
+		name = importReq.Magnet.InfoHash
+	}
 	torrent := &storage.Entry{
 		InfoHash:         importReq.Magnet.InfoHash,
-		Name:             importReq.Magnet.Name,
+		Name:             name,
 		OriginalFilename: importReq.Magnet.Name,
 		Protocol:         config.ProtocolTorrent,
 		Size:             importReq.Magnet.Size,

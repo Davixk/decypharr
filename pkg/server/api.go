@@ -938,6 +938,35 @@ func (s *Server) handleStopRepair(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleQueueConsistency reconciles queue index membership against a full scan.
+//
+// Queue.Add rejects a duplicate using a bare index lookup, while every listing
+// an arr polls comes from a scan. When those disagree an entry is both
+// "already exists" and invisible, which cannot be distinguished from outside:
+// probing by re-adding a magnet answers through debrid submission, so the
+// result is confounded by provider cache state rather than index state. This
+// answers the index question directly, and yields a real count instead of an
+// inferred one.
+func (s *Server) handleQueueConsistency(w http.ResponseWriter, r *http.Request) {
+	report, err := s.manager.Storage().QueueConsistency()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, report, http.StatusOK)
+}
+
+// handleQueueKeyState answers index membership and scan visibility for one
+// infohash, with no debrid interaction.
+func (s *Server) handleQueueKeyState(w http.ResponseWriter, r *http.Request) {
+	diagnosis, err := s.manager.Storage().QueueKeyState(chi.URLParam(r, "infohash"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	utils.JSONResponse(w, diagnosis, http.StatusOK)
+}
+
 func (s *Server) handleListRepairRuns(w http.ResponseWriter, r *http.Request) {
 	runs, err := s.manager.Storage().ListRepairRuns()
 	if err != nil {
