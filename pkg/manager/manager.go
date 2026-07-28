@@ -601,6 +601,11 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Watch for the queue index and a full scan disagreeing. The condition is
+	// erased by a restart, so it can only be observed from inside the running
+	// process.
+	go m.watchQueueConsistency(ctx)
+
 	// Start workers
 	if err := m.StartWorker(ctx); err != nil {
 		return fmt.Errorf("failed to start manager worker: %w", err)
