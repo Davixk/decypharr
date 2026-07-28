@@ -1154,10 +1154,23 @@ func (s *Storage) FilterQueued(filter func(*Entry) bool) ([]*Entry, error) {
 			// is simultaneously "already exists" for Queue.Add and absent from
 			// every listing — the entry can neither be surfaced to an arr nor
 			// re-added, permanently, with no operator-visible trace.
-			s.logger.Error().Err(err).
+			//
+			// The index carries category/protocol/name as hot fields written at
+			// Put time, so they survive exactly the failure that makes the
+			// payload unreadable. That is what makes the affected population
+			// bounded from the logs alone, with no store census.
+			event := s.logger.Error().Err(err).
 				Str("infohash", key).
-				Int("record_bytes", len(value)).
-				Msg("Undecodable queue record skipped by scan; entry is invisible to listings but still blocks re-add")
+				Int("record_bytes", len(value))
+			if meta, metaErr := s.queue.GetMeta(key); metaErr == nil && meta != nil {
+				event = event.
+					Str("category", meta.Category).
+					Str("protocol", meta.Protocol).
+					Str("name", meta.Name).
+					Str("status", meta.Status).
+					Int64("added_on", meta.AddedOn)
+			}
+			event.Msg("Undecodable queue record skipped by scan; entry is invisible to listings but still blocks re-add")
 			return nil
 		}
 		entry := ProtoToEntry(&pb)
