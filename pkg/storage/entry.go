@@ -1174,6 +1174,20 @@ func (s *Storage) FilterQueued(filter func(*Entry) bool) ([]*Entry, error) {
 			return nil
 		}
 		entry := ProtoToEntry(&pb)
+		// The scan trusts the index to say where a key's record lives. If the
+		// record found there belongs to a different entry, the decode succeeds
+		// and nothing looks wrong: the listing silently shows that other entry
+		// (twice) and never shows this key, while QueueExists — which only
+		// consults the index — keeps reporting the key as present. That is
+		// indistinguishable from the outside from an entry that simply vanished,
+		// and it persists until the index is rebuilt at startup.
+		if !strings.EqualFold(entry.InfoHash, key) {
+			s.logger.Error().
+				Str("index_key", key).
+				Str("record_infohash", entry.InfoHash).
+				Str("record_name", entry.Name).
+				Msg("Queue index points at a record for a different entry; the indexed key is invisible to listings but still blocks re-add")
+		}
 		if filter == nil || filter(entry) {
 			entries = append(entries, entry)
 		}
