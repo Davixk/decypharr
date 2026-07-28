@@ -70,7 +70,14 @@ func (q *QBit) handleTorrentsInfo(w http.ResponseWriter, r *http.Request) {
 	//log all url params
 	ctx := r.Context()
 	category := getCategory(ctx)
-	state := strings.Trim(r.URL.Query().Get("filter"), "")
+	// qBittorrent's "filter" parameter defaults to "all", meaning no filtering.
+	// "all" is not a TorrentState, so passing it straight through matched no
+	// entry and returned an empty list to any client that sent it explicitly.
+	// (strings.Trim(s, "") was also a no-op — an empty cutset trims nothing.)
+	state := strings.TrimSpace(r.URL.Query().Get("filter"))
+	if strings.EqualFold(state, "all") {
+		state = ""
+	}
 	hashes := getHashes(ctx)
 
 	// Convert hashes to filter function

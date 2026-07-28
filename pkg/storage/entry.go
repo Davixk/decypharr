@@ -1148,11 +1148,21 @@ func (s *Storage) FilterQueued(filter func(*Entry) bool) ([]*Entry, error) {
 	var entries []*Entry
 	if err := s.queue.ForEach(func(key string, value []byte) error {
 		var pb EntryProto
-		if proto.Unmarshal(value, &pb) == nil {
-			entry := ProtoToEntry(&pb)
-			if filter == nil || filter(entry) {
-				entries = append(entries, entry)
-			}
+		if err := proto.Unmarshal(value, &pb); err != nil {
+			// Do not drop this silently. QueueExists resolves straight off the
+			// index, so a row that the index knows but this scan cannot decode
+			// is simultaneously "already exists" for Queue.Add and absent from
+			// every listing — the entry can neither be surfaced to an arr nor
+			// re-added, permanently, with no operator-visible trace.
+			s.logger.Error().Err(err).
+				Str("infohash", key).
+				Int("record_bytes", len(value)).
+				Msg("Undecodable queue record skipped by scan; entry is invisible to listings but still blocks re-add")
+			return nil
+		}
+		entry := ProtoToEntry(&pb)
+		if filter == nil || filter(entry) {
+			entries = append(entries, entry)
 		}
 		return nil
 	}); err != nil {
