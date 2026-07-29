@@ -767,10 +767,20 @@ func indexedEntryMetadata(indexed *hybrid.IndexEntry) *hybrid.EntryMeta {
 	}
 }
 
-// GetQueued retrieves a queued entry
+// GetQueued retrieves a queued entry.
+//
+// An absent entry is reported as ErrEntryNotFound so callers can distinguish it
+// from a genuine failure with errors.Is. The underlying store reports absence
+// with its own sentinel, and translating it here means "does this entry exist"
+// has one answer across the package instead of depending on which layer the
+// caller happened to reach.
 func (s *Storage) GetQueued(infohash string) (*Entry, error) {
-	data, err := s.queue.Get(strings.ToLower(infohash))
+	key := strings.ToLower(infohash)
+	data, err := s.queue.Get(key)
 	if err != nil {
+		if errors.Is(err, hybrid.ErrKeyNotFound) {
+			return nil, fmt.Errorf("%w for queue entry %s", ErrEntryNotFound, key)
+		}
 		return nil, err
 	}
 

@@ -2,6 +2,7 @@ package sabnzbd
 
 import (
 	"context"
+	goerrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -111,12 +112,21 @@ func (s *SABnzbd) handleDelete(w http.ResponseWriter, r *http.Request) {
 			continue // Skip empty IDs
 		}
 
-		// Use atomic delete operation
-		if err := s.manager.Queue().Delete(nzoID, nil); err != nil {
-			errors = append(errors, fmt.Sprintf("Failed to delete %s: %v", nzoID, err))
-		} else {
+		// Use atomic delete operation.
+		//
+		// An entry that is already absent is a SATISFIED delete, not a failure:
+		// the caller asked for it to be gone and it is gone. Reporting 500 here
+		// stranded rows permanently — Sonarr's "Remove from queue" with
+		// removeFromClient=true treats a 5xx as a hard failure and keeps the
+		// row, so the operator sees a button that does nothing, with no error
+		// surfaced. Asking us to delete something we never had is the normal
+		// case for an arr tracking an item it has no grab history for.
+		err := s.manager.Queue().Delete(nzoID, nil)
+		if err == nil || goerrors.Is(err, storage.ErrEntryNotFound) {
 			successCount++
+			continue
 		}
+		errors = append(errors, fmt.Sprintf("Failed to delete %s: %v", nzoID, err))
 	}
 
 	// Return response with success/error information

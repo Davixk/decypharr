@@ -37,8 +37,14 @@ var (
 	ErrStoreClosed          = errors.New("store is closed")
 	ErrCorruptedData        = errors.New("corrupted data detected")
 	ErrCompactionInProgress = errors.New("compaction already in progress")
-	errKeyNotFound          = errors.New("key not found")
+	// ErrKeyNotFound is exported so callers can distinguish "absent" from a
+	// real failure with errors.Is instead of matching on message text.
+	ErrKeyNotFound = errors.New("key not found")
 )
+
+// errKeyNotFound is retained as an internal alias so existing call sites read
+// unchanged; it is the same sentinel value as ErrKeyNotFound.
+var errKeyNotFound = ErrKeyNotFound
 
 // Config holds store configuration
 type Config struct {

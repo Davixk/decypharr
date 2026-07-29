@@ -1,6 +1,7 @@
 package qbit
 
 import (
+	"errors"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -180,8 +181,13 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, hash := range hashes {
+		// An entry that is already absent is a satisfied delete, not a failure.
+		// This previously matched on the message text containing "not found",
+		// which happened to work only because both the storage and store-level
+		// sentinels are worded that way — rewording either would silently turn
+		// a tolerated absence back into a 500. Match the sentinel instead.
 		err := q.manager.Queue().Delete(hash, nil)
-		if err != nil && !strings.Contains(err.Error(), "not found") {
+		if err != nil && !errors.Is(err, storage.ErrEntryNotFound) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
