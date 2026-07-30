@@ -83,6 +83,18 @@ func (m *Manager) watchQueueConsistency(ctx context.Context) {
 						Msg("Queue index and scan agree again; the divergence cleared without a restart")
 					divergedSince = time.Time{}
 				}
+				// Healthy and quiet is the normal case, but "a raw orphan was
+				// seen and dismissed" is not the same event as "nothing
+				// happened", and silence cannot distinguish them. Say so once,
+				// so a reader can tell the detector ran and cleared something
+				// from the detector not running at all.
+				if raw := len(report.IndexedNotScanned); raw > 0 {
+					m.logger.Info().
+						Int("raw_orphans", raw).
+						Int("confirmed_orphans", 0).
+						Strs("confirmed_orphan_keys", []string{}).
+						Msg("Queue reconcile saw entries removed mid-scan and dismissed them as snapshot artefacts; index and scan agree")
+				}
 				continue
 			}
 
@@ -100,15 +112,14 @@ func (m *Manager) watchQueueConsistency(ctx context.Context) {
 				Int("scanned_not_indexed", len(report.ScannedNotIndexed)).
 				Int("key_record_mismatch", len(report.KeyRecordMismatch)).
 				Int("undecodable", len(report.Undecodable))
-			// Always name the keys. Counts alone cannot be correlated back to
-			// the operation that caused a divergence, which is the next thing
-			// worth knowing once one is confirmed.
-			if keys := confirmedOrphanKeys(report.IndexedNotScanned, 20); len(keys) > 0 {
-				event = event.Strs("confirmed_orphan_keys", keys)
-			}
-			if len(report.ScannedNotIndexed) > 0 {
-				event = event.Strs("scanned_not_indexed_keys", capKeys(report.ScannedNotIndexed, 20))
-			}
+			// Emit the key lists UNCONDITIONALLY, empty included. A field that
+			// appears only when non-empty reads as "not logged" rather than
+			// "none", and that exact ambiguity already cost this investigation
+			// a round: a conditional field's absence was the answer, and was
+			// filed as a missing feature instead.
+			event = event.
+				Strs("confirmed_orphan_keys", confirmedOrphanKeys(report.IndexedNotScanned, 20)).
+				Strs("scanned_not_indexed_keys", capKeys(report.ScannedNotIndexed, 20))
 			event.Msg("Queue index disagrees with a full scan: entries are rejected as duplicates on re-add while absent from every listing")
 		}
 	}
