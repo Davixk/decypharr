@@ -32,11 +32,20 @@ type QueueKeyMismatch struct {
 	RecordName     string `json:"record_name"`
 }
 
-// QueueOrphan is an index key that a full scan did not yield. DirectReadOK
-// distinguishes the real contradiction (the record is readable by key, so the
-// scan simply skipped it) from a key that was concurrently deleted mid-scan.
+// QueueOrphan is an index key that a full scan did not yield.
+//
+// Confirmed is the field that matters. This reconcile takes three separate
+// snapshots — the key list, the scan, then a per-key re-read — and on a busy
+// queue an entry can legitimately be deleted between any two of them. That
+// produces an apparent orphan which is really just a concurrent delete, and it
+// has exactly the signature of the defect being hunted: transient, self-healing,
+// and indexed-but-not-scanned. Only an orphan that is still indexed, still
+// readable by key, and still absent from a fresh scan is a genuine
+// contradiction.
 type QueueOrphan struct {
 	IndexKey      string `json:"index_key"`
+	Confirmed     bool   `json:"confirmed"`
+	StillIndexed  bool   `json:"still_indexed"`
 	DirectReadOK  bool   `json:"direct_read_ok"`
 	DirectReadErr string `json:"direct_read_error,omitempty"`
 	Name          string `json:"name,omitempty"`
@@ -73,6 +82,19 @@ type QueueKeyDiagnosis struct {
 	Category string `json:"category,omitempty"`
 	Protocol string `json:"protocol,omitempty"`
 	Status   string `json:"status,omitempty"`
+}
+
+// ConfirmedOrphanCount counts only orphans that survived re-verification. An
+// unconfirmed orphan is a snapshot artefact of an entry deleted mid-reconcile,
+// not evidence of anything.
+func (r *QueueConsistencyReport) ConfirmedOrphanCount() int {
+	n := 0
+	for _, orphan := range r.IndexedNotScanned {
+		if orphan.Confirmed {
+			n++
+		}
+	}
+	return n
 }
 
 // QueueConsistency reconciles queue index membership against a full scan.
@@ -112,15 +134,34 @@ func (s *Storage) QueueConsistency() (*QueueConsistencyReport, error) {
 	}
 	report.ScanCount = len(scanned)
 
+	var candidates []string
 	for key := range indexed {
-		if _, ok := scanned[key]; ok {
+		if _, ok := scanned[key]; !ok {
+			candidates = append(candidates, key)
+		}
+	}
+
+	// Re-scan once before believing any of them. A candidate that appears in
+	// this second pass was mid-flight during the first, not missing from it.
+	// Without this step an ordinary concurrent delete is indistinguishable
+	// from the defect, because both look transient and both are
+	// indexed-but-not-scanned.
+	rescanned := make(map[string]struct{})
+	if len(candidates) > 0 {
+		if err := s.queue.ForEach(func(key string, _ []byte) error {
+			rescanned[key] = struct{}{}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("re-scan queue for consistency report: %w", err)
+		}
+	}
+
+	for _, key := range candidates {
+		if _, ok := rescanned[key]; ok {
 			continue
 		}
-		// Confirm before reporting. Keys() and ForEach are separate snapshots,
-		// so a key deleted between them is an expected miss, not a defect. A
-		// key whose record still reads back by direct lookup is the real
-		// contradiction.
 		orphan := QueueOrphan{IndexKey: key}
+		orphan.StillIndexed = s.queue.Exists(key)
 		if _, err := s.queue.Get(key); err != nil {
 			orphan.DirectReadErr = err.Error()
 		} else {
@@ -132,16 +173,25 @@ func (s *Storage) QueueConsistency() (*QueueConsistencyReport, error) {
 			orphan.Protocol = meta.Protocol
 			orphan.Status = meta.Status
 		}
+		// Genuine only if the key is still present and still readable by key
+		// while two independent scans both failed to yield it.
+		orphan.Confirmed = orphan.StillIndexed && orphan.DirectReadOK
 		report.IndexedNotScanned = append(report.IndexedNotScanned, orphan)
 	}
 
+	// The mirror case: a key the scan yielded that the earlier key snapshot did
+	// not list is almost always a concurrent add. Only report it if the key is
+	// genuinely absent from the index now.
 	for key := range scanned {
-		if _, ok := indexed[key]; !ok {
+		if _, ok := indexed[key]; ok {
+			continue
+		}
+		if !s.queue.Exists(key) {
 			report.ScannedNotIndexed = append(report.ScannedNotIndexed, key)
 		}
 	}
 
-	report.Consistent = len(report.IndexedNotScanned) == 0 &&
+	report.Consistent = report.ConfirmedOrphanCount() == 0 &&
 		len(report.ScannedNotIndexed) == 0 &&
 		len(report.KeyRecordMismatch) == 0 &&
 		len(report.Undecodable) == 0

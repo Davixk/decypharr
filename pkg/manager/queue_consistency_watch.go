@@ -95,25 +95,37 @@ func (m *Manager) watchQueueConsistency(ctx context.Context) {
 				Time("diverged_since", divergedSince).
 				Int("index_count", report.IndexCount).
 				Int("scan_count", report.ScanCount).
+				Int("confirmed_orphans", report.ConfirmedOrphanCount()).
 				Int("indexed_not_scanned", len(report.IndexedNotScanned)).
 				Int("scanned_not_indexed", len(report.ScannedNotIndexed)).
 				Int("key_record_mismatch", len(report.KeyRecordMismatch)).
 				Int("undecodable", len(report.Undecodable))
-			if keys := poisonedKeys(report.IndexedNotScanned, 10); len(keys) > 0 {
-				event = event.Strs("poisoned_keys", keys)
+			// Always name the keys. Counts alone cannot be correlated back to
+			// the operation that caused a divergence, which is the next thing
+			// worth knowing once one is confirmed.
+			if keys := confirmedOrphanKeys(report.IndexedNotScanned, 20); len(keys) > 0 {
+				event = event.Strs("confirmed_orphan_keys", keys)
+			}
+			if len(report.ScannedNotIndexed) > 0 {
+				event = event.Strs("scanned_not_indexed_keys", capKeys(report.ScannedNotIndexed, 20))
 			}
 			event.Msg("Queue index disagrees with a full scan: entries are rejected as duplicates on re-add while absent from every listing")
 		}
 	}
 }
 
-// poisonedKeys returns up to limit orphan keys whose record is still readable
-// by direct lookup — the confirmed contradiction, as opposed to a key deleted
-// between the index snapshot and the scan.
-func poisonedKeys(orphans []storage.QueueOrphan, limit int) []string {
+// confirmedOrphanKeys returns up to limit orphan keys that survived
+// re-verification: still indexed, still readable by key, and still absent from
+// a second independent scan.
+//
+// Unconfirmed orphans are deliberately excluded. An entry deleted partway
+// through the reconcile produces an apparent orphan with exactly the signature
+// of the real defect — transient, self-healing, indexed-but-not-scanned — so
+// reporting those would manufacture the very finding this is meant to detect.
+func confirmedOrphanKeys(orphans []storage.QueueOrphan, limit int) []string {
 	keys := make([]string, 0, limit)
 	for _, orphan := range orphans {
-		if !orphan.DirectReadOK {
+		if !orphan.Confirmed {
 			continue
 		}
 		if len(keys) == limit {
@@ -122,4 +134,11 @@ func poisonedKeys(orphans []storage.QueueOrphan, limit int) []string {
 		keys = append(keys, orphan.IndexKey)
 	}
 	return keys
+}
+
+func capKeys(keys []string, limit int) []string {
+	if len(keys) <= limit {
+		return keys
+	}
+	return keys[:limit]
 }
