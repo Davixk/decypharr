@@ -73,6 +73,12 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/queue/consistency", s.handleQueueConsistency)
 			r.Get("/queue/consistency/{infohash}", s.handleQueueKeyState)
 
+			// Debrid diagnostics -- read-only. Distinguishes "configured" from
+			// "registered", and shows the provider chain an add would really
+			// walk, resolved by the same code the add path uses.
+			r.Get("/debrids", s.handleDebridClients)
+			r.Get("/debrids/chain/{arr}", s.handleDebridChain)
+
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)

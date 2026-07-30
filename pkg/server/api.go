@@ -938,6 +938,28 @@ func (s *Server) handleStopRepair(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleDebridClients lists the debrid clients the runtime actually holds.
+//
+// Config listing a provider is not evidence that provider is usable: a client
+// whose construction fails is skipped at startup and simply absent afterwards.
+// This is the debrid analogue of /api/arrs — without it, "configured" and
+// "registered" cannot be told apart from outside.
+func (s *Server) handleDebridClients(w http.ResponseWriter, r *http.Request) {
+	utils.JSONResponse(w, s.manager.RegisteredDebridClients(), http.StatusOK)
+}
+
+// handleDebridChain reports the provider chain a torrent add would actually
+// walk for one arr, resolved through the same selection the add path uses.
+//
+// When fallback is enabled the chain should contain every registered client, so
+// exhausting one provider moves to the next. A single-provider chain here is
+// the failure, and this shows which of the possible causes produced it:
+// selected_debrid not matching any registered client, a provider missing from
+// the registry, or fallback being off on the runtime arr.
+func (s *Server) handleDebridChain(w http.ResponseWriter, r *http.Request) {
+	utils.JSONResponse(w, s.manager.DiagnoseDebridChain(chi.URLParam(r, "arr")), http.StatusOK)
+}
+
 // handleQueueConsistency reconciles queue index membership against a full scan.
 //
 // Queue.Add rejects a duplicate using a bare index lookup, while every listing
