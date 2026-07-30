@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/utils"
@@ -632,6 +634,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 				attemptErr = errors.Join(attemptErr, cleanupDebridAttempt(db, providerName, dbt.Id))
 			}
 			errs = append(errs, attemptErr)
+			logDebridAttemptFailure(_logger, providerName, "submit", debridTorrent.InfoHash, err)
 			continue
 		}
 		if dbt == nil {
@@ -663,6 +666,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 				providerStageError(providerName, "status check", err),
 				cleanupDebridAttempt(db, providerName, cleanupID),
 			))
+			logDebridAttemptFailure(_logger, providerName, "status check", debridTorrent.InfoHash, err)
 			continue
 		}
 		if torrent == nil {
@@ -677,10 +681,12 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			if cleanupID == "" {
 				cleanupID = dbt.Id
 			}
+			uncachedErr := errors.New("torrent is not cached and uncached downloads are disabled")
 			errs = append(errs, errors.Join(
-				providerStageError(providerName, "status check", errors.New("torrent is not cached and uncached downloads are disabled")),
+				providerStageError(providerName, "status check", uncachedErr),
 				cleanupDebridAttempt(db, providerName, cleanupID),
 			))
+			logDebridAttemptFailure(_logger, providerName, "status check", debridTorrent.InfoHash, uncachedErr)
 			continue
 		}
 		if err := ctx.Err(); err != nil {
@@ -770,10 +776,42 @@ func cleanupDebridAttempt(client common.Client, providerName, torrentID string) 
 	return nil
 }
 
+// singleLineError renders a joined error on one line while leaving unwrapping
+// intact.
+//
+// errors.Join separates with newlines, so a multi-provider failure arrives at an
+// *arr as a multi-line body — and an *arr logs only the first line. The result
+// is that a fallback chain which tried every provider is indistinguishable from
+// one that tried a single provider: the operator sees the first provider's error
+// and nothing else. That ambiguity cost this investigation three dead
+// mechanisms before anyone counted the attempt log lines.
+type singleLineError struct{ err error }
+
+func (e singleLineError) Error() string {
+	return strings.ReplaceAll(e.err.Error(), "\n", "; ")
+}
+
+func (e singleLineError) Unwrap() error { return e.err }
+
+// logDebridAttemptFailure records a single provider declining an attempt.
+//
+// Without this the chain is silent: failures are accumulated into the returned
+// error and the caller logs that at Debug, so at INFO level a fallback that
+// tried every provider and one that tried none look identical. Every provider
+// that declines now says so, at WARN, naming itself and its reason.
+func logDebridAttemptFailure(l zerolog.Logger, providerName, stage, infoHash string, err error) {
+	l.Warn().
+		Str("Provider", providerName).
+		Str("Stage", stage).
+		Str("Hash", infoHash).
+		Err(err).
+		Msg("Provider declined this torrent; continuing to the next provider in the chain")
+}
+
 func joinDebridErrors(errs []error) error {
 	joined := errors.Join(errs...)
 	if joined == nil {
 		joined = errors.New("no debrid clients available")
 	}
-	return fmt.Errorf("failed to process torrent: %w", joined)
+	return fmt.Errorf("failed to process torrent: %w", singleLineError{joined})
 }
