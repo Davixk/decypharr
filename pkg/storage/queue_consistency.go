@@ -134,30 +134,23 @@ func (s *Storage) QueueConsistency() (*QueueConsistencyReport, error) {
 	}
 	report.ScanCount = len(scanned)
 
-	var candidates []string
+	// Capture each candidate's evidence IMMEDIATELY, before anything else runs.
+	//
+	// Ordering is the whole design here. Deferring this until after a
+	// re-verification pass would mean a genuinely poisoned entry that gets
+	// deleted in the meantime is dismissed — trading the original false
+	// positive for a false negative on exactly the rare event being hunted.
+	// The distinguishing evidence is available at the moment of detection: a
+	// benign concurrent delete is already unreadable by key, while a real
+	// orphan is still indexed and still readable. Take it then, and let the
+	// re-scan only dismiss, never gate.
+	type candidate struct {
+		key    string
+		orphan QueueOrphan
+	}
+	var candidates []candidate
 	for key := range indexed {
-		if _, ok := scanned[key]; !ok {
-			candidates = append(candidates, key)
-		}
-	}
-
-	// Re-scan once before believing any of them. A candidate that appears in
-	// this second pass was mid-flight during the first, not missing from it.
-	// Without this step an ordinary concurrent delete is indistinguishable
-	// from the defect, because both look transient and both are
-	// indexed-but-not-scanned.
-	rescanned := make(map[string]struct{})
-	if len(candidates) > 0 {
-		if err := s.queue.ForEach(func(key string, _ []byte) error {
-			rescanned[key] = struct{}{}
-			return nil
-		}); err != nil {
-			return nil, fmt.Errorf("re-scan queue for consistency report: %w", err)
-		}
-	}
-
-	for _, key := range candidates {
-		if _, ok := rescanned[key]; ok {
+		if _, ok := scanned[key]; ok {
 			continue
 		}
 		orphan := QueueOrphan{IndexKey: key}
@@ -173,10 +166,30 @@ func (s *Storage) QueueConsistency() (*QueueConsistencyReport, error) {
 			orphan.Protocol = meta.Protocol
 			orphan.Status = meta.Status
 		}
-		// Genuine only if the key is still present and still readable by key
-		// while two independent scans both failed to yield it.
-		orphan.Confirmed = orphan.StillIndexed && orphan.DirectReadOK
-		report.IndexedNotScanned = append(report.IndexedNotScanned, orphan)
+		candidates = append(candidates, candidate{key: key, orphan: orphan})
+	}
+
+	// Re-scan only to dismiss keys that were mid-flight during the first walk.
+	// A candidate that appears here was being written while the first scan
+	// passed it, which is not a divergence.
+	rescanned := make(map[string]struct{})
+	if len(candidates) > 0 {
+		if err := s.queue.ForEach(func(key string, _ []byte) error {
+			rescanned[key] = struct{}{}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("re-scan queue for consistency report: %w", err)
+		}
+	}
+
+	for _, c := range candidates {
+		if _, ok := rescanned[c.key]; ok {
+			continue
+		}
+		// Judged on the evidence as it stood at detection, so a later deletion
+		// cannot retroactively explain away a real contradiction.
+		c.orphan.Confirmed = c.orphan.StillIndexed && c.orphan.DirectReadOK
+		report.IndexedNotScanned = append(report.IndexedNotScanned, c.orphan)
 	}
 
 	// The mirror case: a key the scan yielded that the earlier key snapshot did

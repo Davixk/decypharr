@@ -129,9 +129,43 @@ func (q *Queue) Add(torrent *storage.Entry) error {
 	unlock := q.lockLifecycleAfterDeletion(torrent.InfoHash)
 	defer unlock()
 	if q.storage.QueueExists(torrent.InfoHash) {
+		q.reportInvisibleDuplicate(torrent.InfoHash)
 		return fmt.Errorf("queue entry %s already exists", strings.ToLower(torrent.InfoHash))
 	}
 	return q.storage.AddQueue(torrent)
+}
+
+// reportInvisibleDuplicate checks whether the entry this Add was just refused
+// for is actually visible to a listing.
+//
+// This is the moment the defect does its damage: the index says the infohash is
+// present so the add is refused, while every listing an arr polls comes from a
+// scan. If the scan cannot yield it, the arr can neither see the entry nor
+// re-add it, and re-grabs it forever with nothing to show for it.
+//
+// Checking here rather than only on a timer removes the need to be lucky. A
+// periodic sample against a possibly seconds-long event may simply never
+// intersect one; a duplicate rejection is by definition the event happening, so
+// this catches it deterministically at the point of harm. The cost is one scan
+// of the queue store per refused duplicate — a rare path, and refusals are
+// exactly the case worth paying for.
+//
+// Detection only: the refusal still stands. Whether an entry proven invisible
+// should instead be replaced is a behavioural question, and not one to decide
+// silently inside a diagnostic.
+func (q *Queue) reportInvisibleDuplicate(infohash string) {
+	diagnosis, err := q.storage.QueueKeyState(infohash)
+	if err != nil || diagnosis == nil || !diagnosis.Poisoned {
+		return
+	}
+	q.logger.Error().
+		Str("infohash", diagnosis.InfoHash).
+		Str("name", diagnosis.Name).
+		Str("category", diagnosis.Category).
+		Str("protocol", diagnosis.Protocol).
+		Str("status", diagnosis.Status).
+		Bool("direct_read_ok", diagnosis.DirectReadOK).
+		Msg("Refused a duplicate for an entry no listing can show: the index resolves this infohash but a full scan does not yield it, so the caller can neither see nor re-add it")
 }
 
 func (q *Queue) GetTorrent(infohash string) (*storage.Entry, error) {
