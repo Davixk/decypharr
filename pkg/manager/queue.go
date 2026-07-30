@@ -129,44 +129,86 @@ func (q *Queue) Add(torrent *storage.Entry) error {
 	unlock := q.lockLifecycleAfterDeletion(torrent.InfoHash)
 	defer unlock()
 	if q.storage.QueueExists(torrent.InfoHash) {
-		q.reportInvisibleDuplicate(torrent.InfoHash)
-		return fmt.Errorf("queue entry %s already exists", strings.ToLower(torrent.InfoHash))
+		if !q.replaceInvisibleDuplicate(torrent.InfoHash) {
+			return fmt.Errorf("queue entry %s already exists", strings.ToLower(torrent.InfoHash))
+		}
+		// The previous row was proven unreachable by any listing and has been
+		// dropped; fall through and let this add take its place.
 	}
 	return q.storage.AddQueue(torrent)
 }
 
-// reportInvisibleDuplicate checks whether the entry this Add was just refused
-// for is actually visible to a listing.
+const replaceInvisibleQueueEntryEnv = "DECYPHARR_REPLACE_INVISIBLE_QUEUE_ENTRY"
+
+// replaceInvisibleQueueEntryEnabled reports whether a duplicate refusal may be
+// resolved by replacing an entry proven invisible.
 //
-// This is the moment the defect does its damage: the index says the infohash is
-// present so the add is refused, while every listing an arr polls comes from a
-// scan. If the scan cannot yield it, the arr can neither see the entry nor
-// re-add it, and re-grabs it forever with nothing to show for it.
-//
-// Checking here rather than only on a timer removes the need to be lucky. A
-// periodic sample against a possibly seconds-long event may simply never
-// intersect one; a duplicate rejection is by definition the event happening, so
-// this catches it deterministically at the point of harm. The cost is one scan
-// of the queue store per refused duplicate — a rare path, and refusals are
-// exactly the case worth paying for.
-//
-// Detection only: the refusal still stands. Whether an entry proven invisible
-// should instead be replaced is a behavioural question, and not one to decide
-// silently inside a diagnostic.
-func (q *Queue) reportInvisibleDuplicate(infohash string) {
-	diagnosis, err := q.storage.QueueKeyState(infohash)
-	if err != nil || diagnosis == nil || !diagnosis.Poisoned {
-		return
+// Off by default. This mutates queue state on a path that today only misfires,
+// so it is opt-in until an operator turns it on deliberately.
+func replaceInvisibleQueueEntryEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(replaceInvisibleQueueEntryEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
-	q.logger.Error().
+}
+
+// replaceInvisibleDuplicate inspects the entry an Add was about to be refused
+// for, and reports whether the refusal should be abandoned in its favour.
+//
+// The index says this infohash is present, so the add is refused. Every listing
+// an arr polls comes from a scan instead. When the scan cannot yield the entry,
+// the caller can neither see it, remove it, nor re-add it — so refusing is the
+// one response guaranteed to achieve nothing, and the arr re-grabs forever.
+//
+// The gate is deliberately narrow: the record must still be readable by key AND
+// still absent from a full scan. A concurrently deleted entry fails the first
+// condition, so this can never fire on the artefact that produced the earlier
+// false positives.
+//
+// Returns true only when the stale row was actually removed, so a failed delete
+// falls back to the refusal rather than silently dropping the caller's add.
+func (q *Queue) replaceInvisibleDuplicate(infohash string) bool {
+	diagnosis, err := q.storage.QueueKeyState(infohash)
+	if err != nil || diagnosis == nil || !diagnosis.Poisoned || !diagnosis.DirectReadOK {
+		return false
+	}
+
+	if !replaceInvisibleQueueEntryEnabled() {
+		q.logger.Error().
+			Str("infohash", diagnosis.InfoHash).
+			Str("name", diagnosis.Name).
+			Str("category", diagnosis.Category).
+			Str("protocol", diagnosis.Protocol).
+			Str("status", diagnosis.Status).
+			Msgf("Refused a duplicate for an entry no listing can show; set %s=1 to replace it instead", replaceInvisibleQueueEntryEnv)
+		return false
+	}
+
+	// Row removal only — nil cleanup, so nothing on disk is touched. The
+	// downloaded content is not what is broken here; the index row is.
+	if err := q.storage.DeleteQueued(infohash, nil); err != nil {
+		q.logger.Error().Err(err).
+			Str("infohash", diagnosis.InfoHash).
+			Msg("Could not drop an invisible queue entry; refusing the duplicate as before")
+		return false
+	}
+
+	// WARN, not INFO, and carrying the full identity: once this self-heals, this
+	// line is the ONLY evidence the defect occurred. If the mechanism is still
+	// unknown by then, this is the entire dataset for finding it — a silent fix
+	// would close the symptom and take the investigation with it.
+	q.logger.Warn().
 		Str("infohash", diagnosis.InfoHash).
 		Str("name", diagnosis.Name).
 		Str("category", diagnosis.Category).
 		Str("protocol", diagnosis.Protocol).
 		Str("status", diagnosis.Status).
-		Bool("direct_read_ok", diagnosis.DirectReadOK).
-		Msg("Refused a duplicate for an entry no listing can show: the index resolves this infohash but a full scan does not yield it, so the caller can neither see nor re-add it")
+		Msg("Replaced a queue entry that the index resolved but no listing could show; the re-add now proceeds")
+	return true
 }
+
 
 func (q *Queue) GetTorrent(infohash string) (*storage.Entry, error) {
 	return q.storage.GetQueued(infohash)
