@@ -108,15 +108,29 @@ func (r *Repair) cfg() config.RepairConfig { return config.Get().Repair }
 //
 //   - repair (REPAIR)  — re-acquire the item across providers. Non-destructive.
 //   - prune  (PRUNE)   — delete the item decypharr-side only (no arr). Destructive.
-//   - regrab (RE-GRAB) — delete+blocklist+re-search via the arr. Destructive.
+//   - regrab (RE-GRAB) — DELETE the arr's file record. Destructive.
 //
 // CHECK itself (enumerate + probe + record) always runs and is not represented
 // here — it is the detection that produces the dead items these actions target.
+//
+// regrabSearch and regrabBlocklist are SUB-actions of RE-GRAB, not peers of it.
+// They are meaningless on their own — both describe something done to the arr
+// alongside the delete — so both are gated on regrab and neither appears in
+// any(), destructive() or label() as an independent component. Keeping them
+// subordinate is what preserves the invariant that RE-GRAB is the only
+// arr-coupled component: with regrab off, nothing here can reach the arr.
 type repairActions struct {
-	repair bool
-	prune  bool
-	regrab bool
+	repair          bool
+	prune           bool
+	regrab          bool
+	regrabSearch    bool
+	regrabBlocklist bool
 }
+
+// arrSearch / arrBlocklist resolve the sub-actions with their gate applied, so
+// no caller has to remember to && with regrab.
+func (a repairActions) arrSearch() bool    { return a.regrab && a.regrabSearch }
+func (a repairActions) arrBlocklist() bool { return a.regrab && a.regrabBlocklist }
 
 // destructive reports whether any component that consumes a per-run deletion
 // slot is enabled (PRUNE and RE-GRAB). REPAIR is non-destructive.
@@ -129,6 +143,12 @@ func (a repairActions) any() bool { return a.repair || a.prune || a.regrab }
 // label renders the enabled components as a compact "+"-joined string for the
 // run's Source field (traceability), e.g. "repair+prune". "check-only" when no
 // component is set.
+//
+// RE-GRAB renders its enabled sub-actions inline — "regrab(delete+search)" —
+// rather than as bare "regrab". A run record that just says "regrab" no longer
+// says what was done to the arr, and the whole point of the split is that
+// delete, search and blocklist are now different acts with different blast
+// radii. "delete" is always listed because RE-GRAB always deletes.
 func (a repairActions) label() string {
 	parts := make([]string, 0, 3)
 	if a.repair {
@@ -138,7 +158,14 @@ func (a repairActions) label() string {
 		parts = append(parts, "prune")
 	}
 	if a.regrab {
-		parts = append(parts, "regrab")
+		sub := []string{"delete"}
+		if a.regrabSearch {
+			sub = append(sub, "search")
+		}
+		if a.regrabBlocklist {
+			sub = append(sub, "blocklist")
+		}
+		parts = append(parts, "regrab("+strings.Join(sub, "+")+")")
 	}
 	if len(parts) == 0 {
 		return "check-only"
@@ -152,9 +179,11 @@ func (a repairActions) label() string {
 // PRUNE/RE-GRAB) exactly when all three knobs are off.
 func resolveActions(cfg config.RepairConfig) repairActions {
 	return repairActions{
-		repair: cfg.RepairEnabled(),
-		prune:  cfg.Prune,
-		regrab: cfg.Regrab,
+		repair:          cfg.RepairEnabled(),
+		prune:           cfg.Prune,
+		regrab:          cfg.Regrab,
+		regrabSearch:    cfg.RegrabSearch,
+		regrabBlocklist: cfg.RegrabBlocklist,
 	}
 }
 
@@ -168,10 +197,51 @@ type ManualActions struct {
 	Repair bool `json:"repair"`
 	Prune  bool `json:"prune"`
 	Regrab bool `json:"regrab"`
+
+	// Search / Blocklist override RE-GRAB's sub-actions for this one call. Both
+	// are *bool, and nil means "not specified" — the CONFIGURED knob is used.
+	// They are not part of any(): naming only a sub-action selects no component
+	// and must not make an otherwise-empty selection look non-empty, or
+	// {"blocklist":true} alone would resurrect the all-false footgun that
+	// resolveManualActions exists to prevent.
+	Search    *bool `json:"search,omitempty"`
+	Blocklist *bool `json:"blocklist,omitempty"`
 }
 
 func (a *ManualActions) any() bool {
 	return a != nil && (a.Repair || a.Prune || a.Regrab)
+}
+
+// toActions converts an explicit component selection into a full action set,
+// resolving the RE-GRAB sub-actions against cfg. Every caller that overrides the
+// configured knobs with an opts.Actions selection goes through here, so none of
+// them can forget to carry the sub-actions and silently fall back to the
+// zero-value (search off, blocklist off) when the operator configured otherwise.
+func (a *ManualActions) toActions(cfg config.RepairConfig) repairActions {
+	if a == nil {
+		return repairActions{}
+	}
+	search, blocklist := a.subActions(cfg)
+	return repairActions{
+		repair: a.Repair, prune: a.Prune, regrab: a.Regrab,
+		regrabSearch: search, regrabBlocklist: blocklist,
+	}
+}
+
+// subActions resolves this selection's RE-GRAB sub-actions against the
+// configured defaults, honouring an explicit override when one was supplied.
+func (a *ManualActions) subActions(cfg config.RepairConfig) (search, blocklist bool) {
+	search, blocklist = cfg.RegrabSearch, cfg.RegrabBlocklist
+	if a == nil {
+		return search, blocklist
+	}
+	if a.Search != nil {
+		search = *a.Search
+	}
+	if a.Blocklist != nil {
+		blocklist = *a.Blocklist
+	}
+	return search, blocklist
 }
 
 // resolveManualActions maps an explicit component selection + the legacy fix
@@ -199,7 +269,7 @@ func (r *Repair) resolveManualActions(sel *ManualActions, fix bool) repairAction
 		return repairActions{}
 	}
 	if sel.any() {
-		return repairActions{repair: sel.Repair, prune: sel.Prune, regrab: sel.Regrab}
+		return sel.toActions(r.cfg())
 	}
 	if fix {
 		return resolveActions(r.cfg())
@@ -670,8 +740,7 @@ func (r *Repair) runSweep(trigger storage.RepairRunTrigger, opts RepairRunOption
 		sourceParts = append(sourceParts, "ignore-last-checked")
 	}
 	if opts.Actions != nil {
-		override := repairActions{repair: opts.Actions.Repair, prune: opts.Actions.Prune, regrab: opts.Actions.Regrab}
-		sourceParts = append(sourceParts, override.label())
+		sourceParts = append(sourceParts, opts.Actions.toActions(cfg).label())
 	}
 	if opts.UnrestrictLink {
 		sourceParts = append(sourceParts, "unrestrict-link")

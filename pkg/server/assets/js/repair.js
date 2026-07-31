@@ -160,10 +160,19 @@ class RepairManager {
     // fixComponentMeta maps a component key to its display label + one-liner,
     // shared by the confirm dialogs and toasts so all surfaces read identically.
     fixComponentMeta(component) {
+        // RE-GRAB's description is built from the ticked sub-actions rather than
+        // asserting all three acts. The confirm dialog is the last thing shown
+        // before something destructive runs, so it has to name what will actually
+        // happen — "arr delete + blocklist + search" promised a permanent global
+        // ban on every run, including the ones that do not blocklist at all.
+        const regrabSub = this.selectedRegrabSubActions(['regrab']);
+        const regrabActs = ['arr delete']
+            .concat(regrabSub.search ? ['search'] : [])
+            .concat(regrabSub.blocklist ? ['blocklist (permanent, global)'] : []);
         return ({
             repair: {label: 'REPAIR', desc: 're-acquire on the same or a backup provider'},
-            prune: {label: 'PRUNE', desc: 'delete decypharr-side only — the arr keeps monitoring and re-searches'},
-            regrab: {label: 'RE-GRAB', desc: 'arr delete + blocklist + search'},
+            prune: {label: 'PRUNE', desc: 'delete decypharr-side only — makes no arr call, any arr symlink is left dangling'},
+            regrab: {label: 'RE-GRAB', desc: regrabActs.join(' + ')},
         })[component] || {label: String(component || '').toUpperCase(), desc: ''};
     }
 
@@ -305,6 +314,17 @@ class RepairManager {
             !!document.querySelector(`#actBrokenModal [data-act-component="${c}"]`)?.checked);
     }
 
+    // selectedRegrabSubActions returns RE-GRAB's search/blocklist sub-actions for
+    // the request body. They are sent ONLY when RE-GRAB itself is selected: on
+    // their own they name no component, and the API ignores them in that case
+    // rather than letting a sub-action manufacture an action set.
+    selectedRegrabSubActions(components) {
+        if (!components.includes('regrab')) return {};
+        const read = (name) =>
+            !!document.querySelector(`#actBrokenModal [data-act-subaction="${name}"]`)?.checked;
+        return {search: read('search'), blocklist: read('blocklist')};
+    }
+
     openActBrokenModal() {
         // The button is never inert: when the action is unavailable, say why
         // instead of silently doing nothing.
@@ -316,6 +336,17 @@ class RepairManager {
         if (!modal) return;
         document.querySelectorAll('#actBrokenModal [data-act-component]').forEach((cb) => {
             cb.checked = false;
+        });
+        // Sub-actions open on the operator's CONFIGURED policy rather than off,
+        // so the modal shows what would actually happen. Components start
+        // unticked (nothing is selected yet); sub-actions describe how RE-GRAB
+        // behaves if it is ticked, which is a standing setting, not a selection.
+        const subDefaults = {
+            search: !!this.repairConfig.regrab_search,
+            blocklist: !!this.repairConfig.regrab_blocklist,
+        };
+        document.querySelectorAll('#actBrokenModal [data-act-subaction]').forEach((cb) => {
+            cb.checked = !!subDefaults[cb.getAttribute('data-act-subaction')];
         });
         const count = document.getElementById('actBrokenTargetCount');
         if (count) count.textContent = (this.latestStatus.health_counts || {}).broken || 0;
@@ -406,6 +437,7 @@ class RepairManager {
                         repair: list.includes('repair'),
                         prune: list.includes('prune'),
                         regrab: list.includes('regrab'),
+                        ...this.selectedRegrabSubActions(list),
                     },
                 }),
             });

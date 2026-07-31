@@ -816,6 +816,8 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 		Repair            *bool  `json:"repair,omitempty"`
 		Prune             *bool  `json:"prune,omitempty"`
 		Regrab            *bool  `json:"regrab,omitempty"`
+		Search            *bool  `json:"search,omitempty"`    // RE-GRAB sub-action; nil = configured.
+		Blocklist         *bool  `json:"blocklist,omitempty"` // RE-GRAB sub-action; nil = configured.
 		AutoRepair        *bool  `json:"auto_repair,omitempty"` // Deprecated: back-compat only.
 		UnrestrictLink    bool   `json:"unrestrict_link,omitempty"`
 		Protocol          string `json:"protocol,omitempty"`
@@ -860,6 +862,24 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 		v := false
 		regrab = &v
 	}
+	search := req.Search
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search"))) {
+	case "1", "true", "yes", "on":
+		v := true
+		search = &v
+	case "0", "false", "no", "off":
+		v := false
+		search = &v
+	}
+	blocklist := req.Blocklist
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("blocklist"))) {
+	case "1", "true", "yes", "on":
+		v := true
+		blocklist = &v
+	case "0", "false", "no", "off":
+		v := false
+		blocklist = &v
+	}
 	autoRepair := req.AutoRepair
 	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("auto_repair"))) {
 	case "1", "true", "yes", "on":
@@ -875,13 +895,21 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	// Otherwise fall back to the deprecated auto_repair flag for old clients:
 	// true → use the configured knobs (nil override); false → explicit all-false
 	// (CHECK-only). With nothing set, use the configured knobs (nil override).
+	//
+	// search / blocklist are RE-GRAB sub-actions and deliberately do NOT appear
+	// in the switch condition: naming only a sub-action selects no component, so
+	// on its own it must not manufacture an override. They ride along on an
+	// override that a real component triggered, and are nil (= use the configured
+	// knob) otherwise.
 	var actions *manager.ManualActions
 	switch {
 	case repair != nil || prune != nil || regrab != nil:
 		actions = &manager.ManualActions{
-			Repair: repair != nil && *repair,
-			Prune:  prune != nil && *prune,
-			Regrab: regrab != nil && *regrab,
+			Repair:    repair != nil && *repair,
+			Prune:     prune != nil && *prune,
+			Regrab:    regrab != nil && *regrab,
+			Search:    search,
+			Blocklist: blocklist,
 		}
 	case autoRepair != nil && !*autoRepair:
 		actions = &manager.ManualActions{}
@@ -1132,13 +1160,25 @@ type repairActionsBody struct {
 	Repair bool `json:"repair"`
 	Prune  bool `json:"prune"`
 	Regrab bool `json:"regrab"`
+
+	// Search / Blocklist override RE-GRAB's sub-actions for this one request.
+	// Both are *bool: absent means "not specified", which uses the configured
+	// knob. They are NOT part of explicitNone() — naming only a sub-action
+	// selects no component, and must not make an otherwise-empty selection look
+	// non-empty, or {"blocklist":true} alone would slip past the explicit-none
+	// guard and resolve to the operator's configured components.
+	Search    *bool `json:"search,omitempty"`
+	Blocklist *bool `json:"blocklist,omitempty"`
 }
 
 func (b *repairActionsBody) toManager() *manager.ManualActions {
 	if b == nil {
 		return nil
 	}
-	return &manager.ManualActions{Repair: b.Repair, Prune: b.Prune, Regrab: b.Regrab}
+	return &manager.ManualActions{
+		Repair: b.Repair, Prune: b.Prune, Regrab: b.Regrab,
+		Search: b.Search, Blocklist: b.Blocklist,
+	}
 }
 
 // explicitNone reports that the request carried an "actions" object naming NO

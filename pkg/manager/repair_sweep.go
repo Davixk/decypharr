@@ -199,7 +199,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	// a StopSchedule cuts the sweep short.
 	actions := resolveActions(cfg)
 	if opts.Actions != nil {
-		actions = repairActions{repair: opts.Actions.Repair, prune: opts.Actions.Prune, regrab: opts.Actions.Regrab}
+		actions = opts.Actions.toActions(cfg)
 	}
 
 	// One destructive-deletion budget for the whole sweep. It bounds how many
@@ -289,6 +289,9 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		Int("pruned", run.Stats.Pruned).
 		Int("prune_skipped_not_eligible", run.Stats.PruneSkippedNotEligible).
 		Int("regrabbed", run.Stats.Regrabbed).
+		Int("arr_deleted", run.Stats.ArrDeleted).
+		Int("arr_blocklisted", run.Stats.ArrBlocklisted).
+		Int("arr_searched", run.Stats.ArrSearched).
 		Int("regrab_failed", run.Stats.RegrabFailed).
 		Int("regrab_skipped_no_arr_link", run.Stats.RegrabSkippedNoArrLink).
 		Int("deletions", run.Stats.Deletions).
@@ -1464,7 +1467,7 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 	// the in-memory health record, so order doesn't couple them; RE-GRAB runs
 	// whether or not PRUNE deletes the entry.
 	if wantRegrab {
-		r.regrabDeadEntry(ctx, run, statsMu, name, h)
+		r.regrabDeadEntry(ctx, run, statsMu, name, h, actions)
 	}
 	if wantPrune && r.pruneDeadEntry(name, h) {
 		statsMu.Lock()
@@ -1507,11 +1510,12 @@ func (r *Repair) recordActionSkips(run *storage.RepairRun, statsMu *sync.Mutex, 
 }
 
 // regrabDeadEntry is the RE-GRAB component: the ONLY arr-coupled action. For a
-// dead item it deletes the arr file record, blocklists the grab, and triggers a
-// search, per arr. It does not delete anything decypharr-side and does not
-// verify the outcome (SearchMissing/MarkHistoryFailed only queue work; the next
-// sweep verifies). statsMu guards run.Stats across concurrent entries.
-func (r *Repair) regrabDeadEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth) {
+// dead item it deletes the arr file record, and — each only when separately
+// enabled — blocklists the grab and/or triggers a search, per arr. It does not
+// delete anything decypharr-side and does not verify the outcome
+// (SearchMissing/MarkHistoryFailed only queue work; the next sweep verifies).
+// statsMu guards run.Stats across concurrent entries.
+func (r *Repair) regrabDeadEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, actions repairActions) {
 	// An entry's broken files normally all belong to one arr, but a merged
 	// candidate can span more — group defensively.
 	byArr := make(map[string][]arr.ContentFile)
@@ -1541,8 +1545,17 @@ func (r *Repair) regrabDeadEntry(ctx context.Context, run *storage.RepairRun, st
 		if a == nil {
 			continue
 		}
-		if r.repairArrFiles(ctx, run, statsMu, a, files) {
-			r.logger.Info().Str("component", "RE-GRAB").Str("entry", name).Str("arr", arrName).Int("files", len(files)).Msg("RE-GRAB: deleted arr file records + blocklisted grab + queued re-search")
+		if r.repairArrFiles(ctx, run, statsMu, a, files, actions) {
+			// Report exactly what was done. The old line asserted all three acts
+			// unconditionally, so it claimed a blocklist and a re-search on runs
+			// that performed neither — and after the split, neither is the
+			// default. A log line that overstates the action is worse than none:
+			// it is the record the operator reasons from afterwards.
+			r.logger.Info().Str("component", "RE-GRAB").Str("entry", name).Str("arr", arrName).
+				Int("files", len(files)).
+				Bool("blocklisted", actions.arrBlocklist()).
+				Bool("searched", actions.arrSearch()).
+				Msg("RE-GRAB: deleted arr file records")
 		}
 	}
 	h.LastRepairAt = time.Now()
@@ -1552,12 +1565,31 @@ func (r *Repair) regrabDeadEntry(ctx context.Context, run *storage.RepairRun, st
 // pruneDeadEntry is the PRUNE component: a decypharr-side-ONLY deletion. It
 // removes the provider placements, the symlink/download folder (via the guarded
 // deleteEntryFiles — the category-dir data-loss guard stays in the path), and
-// the db entry through DeleteEntry(hash, true). It makes ZERO arr API calls: by
-// design the arr keeps the item MONITORED so its own next disk scan sees the
-// file missing and re-searches, with no decypharr->arr coupling. Only
-// fully-broken entries reach here (pruneEligible), so a partially-broken entry
-// keeps its healthy files. Returns true when at least one infohash was deleted
-// decypharr-side, so the caller can record the PRUNE outcome.
+// the db entry through DeleteEntry(hash, true). It makes ZERO arr API calls, and
+// there is no decypharr->arr coupling here. Only fully-broken entries reach here
+// (pruneEligible), so a partially-broken entry keeps its healthy files. Returns
+// true when at least one infohash was deleted decypharr-side, so the caller can
+// record the PRUNE outcome.
+//
+// WHAT THIS DOES NOT DO — this comment previously claimed "the arr keeps the item
+// MONITORED so its own next disk scan sees the file missing and re-searches".
+// THAT IS FALSE. Traced in Sonarr/Radarr source: MediaFileTableCleanupService.Clean
+// builds its on-disk key set from Directory.EnumerateFiles and compares with
+// PathEqualityComparer — a pure string comparison, no stat, no target resolution.
+// A DANGLING SYMLINK STILL ENUMERATES as a directory entry, so it is in the set,
+// so the file row is KEPT. The arr therefore never notices, and MissingFromDisk
+// never fires for it. Measured on the production host: 1,707 dangling symlinks
+// against 17 MissingFromDisk events in Radarr's entire history, and those 17 were
+// real deletions rather than dangling links. Independent clincher: Clean runs at
+// DiskScanService.cs:134, BEFORE the size loop at :149 that throws
+// FileNotFoundException on a dead link — for that throw to happen at all, the row
+// must have survived Clean.
+//
+// So after PRUNE the arr is left holding a dangling symlink indefinitely. For an
+// entry WITH an arr link, RE-GRAB (when enabled) is what actually clears the arr
+// side. For the regrab_no_arr_link population there is currently NO path that
+// cleans it up from either side — closing that is arr-side work, not a reason to
+// add coupling here.
 func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) bool {
 	hashes := make(map[string]struct{})
 	for _, bf := range h.BrokenFiles {
@@ -1576,7 +1608,7 @@ func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) bool {
 			continue
 		}
 		deleted = true
-		r.logger.Info().Str("component", "PRUNE").Str("entry", name).Str("infohash", hash).Msg("PRUNE: deleted dead entry decypharr-side (no arr call; arr keeps monitoring)")
+		r.logger.Info().Str("component", "PRUNE").Str("entry", name).Str("infohash", hash).Msg("PRUNE: deleted dead entry decypharr-side (no arr call; any arr symlink is left dangling and the arr will NOT self-heal it)")
 	}
 	if !deleted {
 		return false
@@ -1594,49 +1626,63 @@ func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) bool {
 	return true
 }
 
-// repairArrFiles deletes the broken files in one Arr, blocklists their grabs,
-// and re-searches anything without a grab record. Returns true when the delete
+// repairArrFiles performs RE-GRAB's arr-side work for one Arr: it ALWAYS deletes
+// the broken file records, and then — only when separately enabled — searches for
+// replacements and/or blocklists the grabs. Returns true when the delete
 // succeeded (so the caller may consider the files handled). Concurrency is
 // bounded by the sweep's worker count; Sonarr/Radarr handle that many in-flight
 // API calls fine, and the actual search/grab work is paced by the Arr's own
 // command queue regardless of how the calls arrive.
-func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, a *arr.Arr, files []arr.ContentFile) bool {
-	// Look up the grab history per broken file. Files whose grab record exists
-	// get blocklisted via MarkHistoryFailed (which Sonarr/Radarr auto-re-searches
-	// when "Redownload Failed" is on — the default). Files with no grab record
-	// (history trimmed, manual import) fall back to an explicit SearchMissing.
-	//
-	// HistoryIDs are deduped per arr — a season-pack grab covers multiple broken
-	// files but only needs one history/failed POST.
+//
+// THE THREE ACTS ARE INDEPENDENT, AND THE ARR ALWAYS ALLOWED THEM TO BE.
+// `DELETE /api/v3/moviefile/{id}` takes no blocklist parameter, and a search can
+// be dispatched immediately afterwards with no history or blocklist interaction
+// whatsoever. The coupling was decypharr's alone.
+//
+// It arose from a shortcut: files whose grab-history record still existed were
+// blocklisted via MarkHistoryFailed and NOT searched, because Sonarr/Radarr
+// auto-re-search on a failed history row when "Redownload Failed" is on (the
+// default). SearchMissing was called only for the leftovers. So the blocklist —
+// a global, permanent record — was doing double duty as the search trigger for
+// most files, and the two could not be separated by configuration.
+//
+// The consequence of that shortcut is why the split exists: every ordinary
+// bytes-unavailable cleanup wrote a permanent global ban for a transient,
+// provider-scoped fact, recorded in the arr as "Manually marked as failed" with
+// no reason attached and therefore unauditable afterwards.
+func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, a *arr.Arr, files []arr.ContentFile, actions repairActions) bool {
+	// Resolve grab-history ids up front — only needed for blocklisting, and only
+	// worth the API calls when blocklisting is actually on. Deduped per arr: a
+	// season-pack grab covers multiple broken files but needs one failed POST.
 	historyIDs := make(map[int]struct{})
-	needSearch := make([]arr.ContentFile, 0)
-	for _, f := range files {
-		if ctx != nil && ctx.Err() != nil {
-			return false
+	if actions.arrBlocklist() {
+		for _, f := range files {
+			if ctx != nil && ctx.Err() != nil {
+				return false
+			}
+			var mediaID int
+			switch a.Type {
+			case arr.Sonarr:
+				mediaID = f.EpisodeId
+			case arr.Radarr:
+				mediaID = f.Id
+			}
+			if mediaID == 0 {
+				continue
+			}
+			id, _, herr := a.FindGrabHistoryID(mediaID)
+			if herr != nil || id == 0 {
+				continue
+			}
+			historyIDs[id] = struct{}{}
 		}
-		var mediaID int
-		switch a.Type {
-		case arr.Sonarr:
-			mediaID = f.EpisodeId
-		case arr.Radarr:
-			mediaID = f.Id
-		}
-		if mediaID == 0 {
-			needSearch = append(needSearch, f)
-			continue
-		}
-		id, _, herr := a.FindGrabHistoryID(mediaID)
-		if herr != nil || id == 0 {
-			needSearch = append(needSearch, f)
-			continue
-		}
-		historyIDs[id] = struct{}{}
 	}
 
-	// Clear the EpisodeFile/MovieFile rows first so the upcoming re-search isn't
-	// rejected by upgrade-only quality logic.
+	// ACT 1 — DELETE. Always runs; this is what RE-GRAB now means on its own.
+	// Clearing the EpisodeFile/MovieFile rows first also keeps any subsequent
+	// search from being rejected by upgrade-only quality logic.
 	if err := a.DeleteFiles(ctx, files); err != nil {
-		r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Repair: DeleteFiles failed")
+		r.logger.Warn().Err(err).Str("arr", a.Name).Msg("RE-GRAB: DeleteFiles failed")
 		statsMu.Lock()
 		// RegrabFailed, not RepairFailed: this is an arr-side RE-GRAB delete
 		// that errored, which is a different event from a REPAIR (re-acquire)
@@ -1648,30 +1694,43 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 		statsMu.Unlock()
 		return false
 	}
+	statsMu.Lock()
+	run.Stats.ArrDeleted += len(files)
+	statsMu.Unlock()
 
-	// Blocklist each unique grab. Errors here are non-fatal: a missing blocklist
-	// is bad but DeleteFiles already cleared the rows, so the fallback
-	// SearchMissing below still has a chance to recover.
+	// ACT 2 — BLOCKLIST, only when explicitly enabled. Errors are non-fatal: the
+	// rows are already cleared and a search (if enabled) can still recover.
+	blocklisted := 0
 	for id := range historyIDs {
 		if ctx != nil && ctx.Err() != nil {
 			break
 		}
 		if err := a.MarkHistoryFailed(id); err != nil {
-			r.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", id).Msg("Repair: MarkHistoryFailed failed")
+			r.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", id).Msg("RE-GRAB: MarkHistoryFailed failed")
+			continue
 		}
+		blocklisted++
 	}
 
-	// SearchMissing only for files without a grab record. With one,
-	// MarkHistoryFailed's auto-re-search covers the same ground without creating
-	// an extra command row.
-	if len(needSearch) > 0 {
-		if err := a.SearchMissing(ctx, needSearch); err != nil {
-			r.logger.Warn().Err(err).Str("arr", a.Name).Msg("Repair: SearchMissing fallback failed")
+	// ACT 3 — SEARCH, only when explicitly enabled, over EVERY deleted file.
+	//
+	// Not just the files that lack a grab record. Relying on MarkHistoryFailed's
+	// auto-re-search for the rest is exactly the coupling this split removes: it
+	// would make the search knob a silent no-op for the majority of files
+	// whenever blocklisting is off, which is now the default.
+	searched := 0
+	if actions.arrSearch() && len(files) > 0 {
+		if err := a.SearchMissing(ctx, files); err != nil {
+			r.logger.Warn().Err(err).Str("arr", a.Name).Msg("RE-GRAB: SearchMissing failed")
+		} else {
+			searched = len(files)
 		}
 	}
 
 	statsMu.Lock()
 	run.Stats.Regrabbed += len(files)
+	run.Stats.ArrBlocklisted += blocklisted
+	run.Stats.ArrSearched += searched
 	r.saveRun(run)
 	statsMu.Unlock()
 	return true
@@ -2260,6 +2319,9 @@ func (r *Repair) FixBroken(ctx context.Context, names []string, sel *ManualActio
 			Int("pruned", run.Stats.Pruned).
 			Int("prune_skipped_not_eligible", run.Stats.PruneSkippedNotEligible).
 			Int("regrabbed", run.Stats.Regrabbed).
+			Int("arr_deleted", run.Stats.ArrDeleted).
+			Int("arr_blocklisted", run.Stats.ArrBlocklisted).
+			Int("arr_searched", run.Stats.ArrSearched).
 			Int("regrab_failed", run.Stats.RegrabFailed).
 			Int("regrab_skipped_no_arr_link", run.Stats.RegrabSkippedNoArrLink).
 			Int("deletions", run.Stats.Deletions).

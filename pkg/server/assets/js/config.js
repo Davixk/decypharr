@@ -171,6 +171,13 @@ class ConfigManager {
         if ($('repair.repair')) $('repair.repair').checked = (repair.repair === undefined || repair.repair === null) ? true : !!repair.repair;
         if ($('repair.prune')) $('repair.prune').checked = !!repair.prune;
         if ($('repair.regrab')) $('repair.regrab').checked = !!repair.regrab;
+        // RE-GRAB sub-actions. Both default OFF, including for a config written
+        // before the split — that config's regrab:true used to mean
+        // delete+blocklist+search, and it now means delete only. Deliberate: the
+        // change can only ever do LESS than before, so no operator is surprised
+        // by new damage.
+        if ($('repair.regrab_search')) $('repair.regrab_search').checked = !!repair.regrab_search;
+        if ($('repair.regrab_blocklist')) $('repair.regrab_blocklist').checked = !!repair.regrab_blocklist;
         // Deletion cap. Blank shows the default (100); -1 (unlimited) is shown
         // verbatim so it round-trips. 0/unset → blank so the placeholder reads.
         if ($('repair.max_deletions_per_run')) {
@@ -196,11 +203,14 @@ class ConfigManager {
             skip_nzb_repair: $('repair.skip_nzb_repair')?.checked || false,
             // Repair-action component knobs — each drives its component directly
             // (no master gate). REPAIR = re-acquire (default on); PRUNE =
-            // decypharr-side delete only (never calls the arr); RE-GRAB = arr
-            // delete + search.
+            // decypharr-side delete only (never calls the arr); RE-GRAB = delete
+            // the arr's file record, with search and blocklist as separate,
+            // default-off sub-actions that do nothing unless RE-GRAB is on.
             repair: $('repair.repair') ? !!$('repair.repair').checked : true,
             prune: $('repair.prune')?.checked || false,
             regrab: $('repair.regrab')?.checked || false,
+            regrab_search: $('repair.regrab_search')?.checked || false,
+            regrab_blocklist: $('repair.regrab_blocklist')?.checked || false,
             // Deletion cap: blank → 0 (backend resolves to the default 100). -1
             // means unlimited. omitempty drops a 0 on the wire, which is fine.
             max_deletions_per_run: this.parseMaxDeletions($('repair.max_deletions_per_run')?.value),

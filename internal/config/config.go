@@ -221,13 +221,12 @@ type RepairConfig struct {
 	//              Non-destructive. Defaults to true when unset (nil).
 	//   PRUNE    — Prune knob. On a dead item (REPAIR off or failed), delete it
 	//              decypharr-side ONLY: provider placements + symlink/download
-	//              folder + db entry. NEVER calls the arr — the arr keeps the item
-	//              monitored so its next disk scan re-searches on its own.
-	//              Destructive; defaults false.
-	//   RE-GRAB  — Regrab knob. On a dead item, go through the arr: delete the
-	//              file record, blocklist the grab, and trigger a search. The only
-	//              arr-coupled component. Independent of PRUNE (not gated behind
-	//              it). Destructive; defaults false.
+	//              folder + db entry. NEVER calls the arr. Destructive; defaults
+	//              false. NOTE: this does NOT make the arr self-heal — see the
+	//              "WHAT THIS DOES NOT DO" block on pruneDeadEntry.
+	//   RE-GRAB  — Regrab knob. On a dead item, DELETE the arr's file record. The
+	//              only arr-coupled component. Independent of PRUNE (not gated
+	//              behind it). Destructive; defaults false.
 	//
 	// Actions are driven directly by the REPAIR / PRUNE / RE-GRAB knobs below:
 	// each component acts whenever its own knob is on. A sweep is CHECK-only
@@ -243,6 +242,54 @@ type RepairConfig struct {
 	Repair *bool `json:"repair,omitempty"`
 	Prune  bool  `json:"prune,omitempty"`
 	Regrab bool  `json:"regrab,omitempty"`
+
+	// RE-GRAB used to bundle three arr-side effects behind the single Regrab
+	// knob above: delete the file record, blocklist the grab, and trigger a
+	// search. They are now three separately-gated actions, because bundling them
+	// made one destructive, permanent, global side effect (the blocklist) ride
+	// along with an ordinary cleanup.
+	//
+	// Regrab alone is now DELETE ONLY. An existing config with regrab=true keeps
+	// deleting and silently stops blocklisting and searching. That direction is
+	// deliberate — it is strictly LESS destructive than before, so no operator is
+	// surprised by new damage; they are at worst surprised by less cleanup.
+	//
+	// RegrabSearch — after the delete, ask the arr to search for a replacement.
+	//
+	//   MUST be implemented as an explicit SearchMissing over EVERY deleted file.
+	//   Do NOT reintroduce the old shortcut of letting MarkHistoryFailed's
+	//   "Redownload Failed" side effect stand in for it: that only covers files
+	//   whose grab-history record still exists, so it silently does nothing for
+	//   the rest, and it couples searching to blocklisting all over again.
+	//
+	// RegrabBlocklist — mark the grab failed in the arr, which blocklists the
+	// release globally and permanently.
+	//
+	//   Reserve this for the BAD-RELEASE class: sample-only, wrong content, empty
+	//   file, a .exe masquerading as an episode, malformed NZB. Those are global,
+	//   permanent facts about the release itself and a permanent global ban is the
+	//   correct record for them.
+	//
+	//   It is the WRONG record for bytes-unavailable — an article purged from one
+	//   news server, a debrid returning 451 for one release, a provider-scoped or
+	//   transient refusal. Those are provider-scoped and provisional; a global ban
+	//   destroys a release another provider may serve fine, and the arr writes it
+	//   as "Manually marked as failed" with no reason recorded, so it cannot even
+	//   be audited afterwards. Measured on one production library: 4,724 of 11,362
+	//   blocklist records carried that unauditable signature.
+	//
+	//   Blocklisting is also NOT what produces forward progress, which is the
+	//   usual argument for keeping it bundled. On an add failure the arr walks its
+	//   own ranked candidate list — observed: five distinct infohashes tried in
+	//   sequence for one episode, and another satisfied on the twelfth candidate
+	//   after eleven consecutive refusals. The blocklist only removes candidates
+	//   permanently; it never advances anything.
+	//
+	// Both default OFF. Both are subordinate to Regrab: with Regrab off there are
+	// no arr calls at all, which keeps "RE-GRAB is the only arr-coupled component"
+	// true.
+	RegrabSearch    bool `json:"regrab_search,omitempty"`
+	RegrabBlocklist bool `json:"regrab_blocklist,omitempty"`
 
 	// MaxDeletionsPerRun caps how many entries a single repair run may
 	// destructively heal — i.e. how many entries can have their Arr file
@@ -271,7 +318,7 @@ func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.MaxDeletionsPerRun == 0 &&
-		r.Repair == nil && !r.Prune && !r.Regrab
+		r.Repair == nil && !r.Prune && !r.Regrab && !r.RegrabSearch && !r.RegrabBlocklist
 }
 
 // RepairEnabled resolves the REPAIR (re-acquire) component knob. It defaults to

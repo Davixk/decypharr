@@ -93,7 +93,19 @@ type RepairRunStats struct {
 	Pruned                  int `json:"pruned"`
 	PruneSkippedNotEligible int `json:"prune_skipped_not_eligible"`
 
+	// Regrabbed counts files whose arr file record RE-GRAB successfully deleted.
+	// Retained under its original name for history/API compatibility, but since
+	// the delete/blocklist/search split it means "the delete succeeded" ONLY — it
+	// no longer implies that a blocklist or a search happened.
+	//
+	// ArrDeleted / ArrBlocklisted / ArrSearched report the three acts separately,
+	// which is the point of the split: one `regrabbed` figure could not tell a run
+	// that quietly banned thousands of releases from one that only tidied up file
+	// records. ArrBlocklisted counts grabs (deduped per history id), not files.
 	Regrabbed              int `json:"regrabbed"`
+	ArrDeleted             int `json:"arr_deleted"`
+	ArrBlocklisted         int `json:"arr_blocklisted"`
+	ArrSearched            int `json:"arr_searched"`
 	RegrabFailed           int `json:"regrab_failed"`
 	RegrabSkippedNoArrLink int `json:"regrab_skipped_no_arr_link"`
 
