@@ -18,7 +18,7 @@ import (
 
 // These tests pin the 4-component repair model: CHECK (detect via the managed
 // path, arr-independent), REPAIR (re-acquire, stops the pipeline on success),
-// PRUNE (decypharr-side delete, ZERO arr calls) and RE-GRAB (the only
+// PRUNE (decypharr-side delete, ZERO arr calls) and ARR-DELETE (the only
 // arr-coupled action, independent of PRUNE). They complement
 // repair_deletion_cap_test.go which pins the shared deletion budget.
 
@@ -51,7 +51,7 @@ func seedManagedEntry(t *testing.T, m *Manager, hash, name string) {
 
 // arrLinkedCandidate builds a lazily-probed candidate that already carries the
 // arr targeting a managed sweep would merge from the arr enumeration, so a probe
-// records BrokenFiles with the arr identifiers RE-GRAB needs.
+// records BrokenFiles with the arr identifiers ARR-DELETE needs.
 func arrLinkedCandidate(t *testing.T, m *Manager, name string) *candidate {
 	t.Helper()
 	item, err := m.storage.GetEntryItem(name)
@@ -147,7 +147,7 @@ func TestPruneDeletesDecypharrSideZeroArrCalls(t *testing.T) {
 	}
 
 	run := newRun(t, m)
-	actions := repairActions{prune: true} // PRUNE only, RE-GRAB off
+	actions := repairActions{prune: true} // PRUNE only, ARR-DELETE off
 	if err := r.probeAndHealCandidates(context.Background(), run, cands, names, newHealCache(), RepairRunOptions{}, actions, r.newDeletionBudget(run.ID)); err != nil {
 		t.Fatalf("probeAndHealCandidates: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestPruneDeletesDecypharrSideZeroArrCalls(t *testing.T) {
 	}
 }
 
-// TestRegrabIndependentOfPrune pins that RE-GRAB is NOT coupled to PRUNE:
+// TestRegrabIndependentOfPrune pins that ARR-DELETE is NOT coupled to PRUNE:
 //   - prune=false regrab=true  => arr called, entry NOT decypharr-deleted.
 //   - prune=true  regrab=false => entry decypharr-deleted, ZERO arr calls.
 func TestRegrabIndependentOfPrune(t *testing.T) {
@@ -170,15 +170,15 @@ func TestRegrabIndependentOfPrune(t *testing.T) {
 		cands := map[string]*candidate{"RegrabOnlyA": arrLinkedCandidate(t, m, "RegrabOnlyA")}
 
 		run := newRun(t, m)
-		actions := repairActions{regrab: true} // RE-GRAB only, PRUNE off
+		actions := repairActions{arrDelete: true} // ARR-DELETE only, PRUNE off
 		if err := r.probeAndHealCandidates(context.Background(), run, cands, []string{"RegrabOnlyA"}, newHealCache(), RepairRunOptions{}, actions, r.newDeletionBudget(run.ID)); err != nil {
 			t.Fatalf("probeAndHealCandidates: %v", err)
 		}
 		if got := arrSrv.deleteCalls(); got != 1 {
-			t.Fatalf("RE-GRAB arr DeleteFiles calls = %d, want 1", got)
+			t.Fatalf("ARR-DELETE arr DeleteFiles calls = %d, want 1", got)
 		}
 		if !entryExists(t, m, "regrab-a") {
-			t.Fatal("RE-GRAB-only wrongly deleted the decypharr entry (must NOT prune)")
+			t.Fatal("ARR-DELETE-only wrongly deleted the decypharr entry (must NOT prune)")
 		}
 	})
 
@@ -188,7 +188,7 @@ func TestRegrabIndependentOfPrune(t *testing.T) {
 		cands := map[string]*candidate{"PruneOnlyB": arrLinkedCandidate(t, m, "PruneOnlyB")}
 
 		run := newRun(t, m)
-		actions := repairActions{prune: true} // PRUNE only, RE-GRAB off
+		actions := repairActions{prune: true} // PRUNE only, ARR-DELETE off
 		if err := r.probeAndHealCandidates(context.Background(), run, cands, []string{"PruneOnlyB"}, newHealCache(), RepairRunOptions{}, actions, r.newDeletionBudget(run.ID)); err != nil {
 			t.Fatalf("probeAndHealCandidates: %v", err)
 		}
@@ -235,18 +235,18 @@ func healingFixture(t *testing.T) (*Manager, *Repair, *fakeArrServer) {
 
 // TestRepairReacquiresAndStopsPipeline pins REPAIR: a dead item is re-acquired
 // across providers (reusing ReinsertEntry/Fixer.FixTorrent), which makes it
-// servable, so the destructive pipeline (PRUNE/RE-GRAB) never runs for it even
+// servable, so the destructive pipeline (PRUNE/ARR-DELETE) never runs for it even
 // though both knobs are on — the entry survives and the arr is never called.
 func TestRepairReacquiresAndStopsPipeline(t *testing.T) {
 	m, r, arrSrv := healingFixture(t)
 
 	seedManagedEntry(t, m, "heal-a", "HealMovieA")
-	// Carry arr linkage so that, HAD it stayed dead, RE-GRAB would have fired —
+	// Carry arr linkage so that, HAD it stayed dead, ARR-DELETE would have fired —
 	// making the "arr never called" assertion meaningful.
 	cands := map[string]*candidate{"HealMovieA": arrLinkedCandidate(t, m, "HealMovieA")}
 
 	run := newRun(t, m)
-	actions := repairActions{repair: true, prune: true, regrab: true}
+	actions := repairActions{repair: true, prune: true, arrDelete: true}
 	if err := r.probeAndHealCandidates(context.Background(), run, cands, []string{"HealMovieA"}, newHealCache(), RepairRunOptions{}, actions, r.newDeletionBudget(run.ID)); err != nil {
 		t.Fatalf("probeAndHealCandidates: %v", err)
 	}
@@ -259,13 +259,13 @@ func TestRepairReacquiresAndStopsPipeline(t *testing.T) {
 		t.Fatal("REPAIR succeeded but the entry was still pruned (pipeline did not stop)")
 	}
 	if got := arrSrv.totalCalls(); got != 0 {
-		t.Fatalf("REPAIR healed the item but RE-GRAB still called the arr %d times (pipeline did not stop)", got)
+		t.Fatalf("REPAIR healed the item but ARR-DELETE still called the arr %d times (pipeline did not stop)", got)
 	}
 }
 
-// TestResolveActionsComponents pins that the configured REPAIR/PRUNE/RE-GRAB
+// TestResolveActionsComponents pins that the configured REPAIR/PRUNE/ARR-DELETE
 // knobs drive the action set directly (there is no master gate): REPAIR
-// defaults on, PRUNE/RE-GRAB default off, and all three off ⇒ CHECK-only.
+// defaults on, PRUNE/ARR-DELETE default off, and all three off ⇒ CHECK-only.
 func TestResolveActionsComponents(t *testing.T) {
 	on := true
 	off := false
@@ -274,10 +274,10 @@ func TestResolveActionsComponents(t *testing.T) {
 		cfg  config.RepairConfig
 		want repairActions
 	}{
-		{"all_knobs_off_is_check_only", config.RepairConfig{Repair: &off, Prune: false, Regrab: false}, repairActions{}},
+		{"all_knobs_off_is_check_only", config.RepairConfig{Repair: &off, Prune: false, ArrDelete: &off}, repairActions{}},
 		{"defaults", config.RepairConfig{}, repairActions{repair: true}},
 		{"repair_explicit_off", config.RepairConfig{Repair: &off}, repairActions{}},
-		{"all", config.RepairConfig{Repair: &on, Prune: true, Regrab: true}, repairActions{repair: true, prune: true, regrab: true}},
+		{"all", config.RepairConfig{Repair: &on, Prune: true, ArrDelete: &on}, repairActions{repair: true, prune: true, arrDelete: true}},
 		{"prune_only", config.RepairConfig{Repair: &off, Prune: true}, repairActions{prune: true}},
 	}
 	for _, tc := range cases {

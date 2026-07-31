@@ -156,7 +156,7 @@ func TestProbeNZBMissingMetaCannotTriggerDestructiveAction(t *testing.T) {
 		t.Fatal("PRUNE WOULD DELETE AN ENTRY WHOSE ONLY FAULT IS A MISSING LOCAL INDEX FILE")
 	}
 	if entryHealthHasArrLink(h) {
-		t.Fatal("RE-GRAB would act on a missing-meta entry")
+		t.Fatal("ARR-DELETE would act on a missing-meta entry")
 	}
 	if h.FailureReason != "usenet_meta_missing" {
 		t.Fatalf("failure_reason = %q, want %q so the condition is diagnosable without a re-run", h.FailureReason, "usenet_meta_missing")

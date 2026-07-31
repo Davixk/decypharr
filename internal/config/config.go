@@ -206,7 +206,7 @@ type RepairConfig struct {
 	RecheckInterval       string       `json:"recheck_interval,omitempty"`
 	Arrs                  []string     `json:"arrs,omitempty"`
 	// AutoRepair is DEPRECATED and no longer gates actions. It is retained only
-	// so configs written before the REPAIR/PRUNE/RE-GRAB component split still
+	// so configs written before the REPAIR/PRUNE/ARR-DELETE component split still
 	// round-trip through JSON; the resolver ignores it entirely.
 	AutoRepair    bool `json:"auto_repair,omitempty"`
 	SkipNZBRepair bool `json:"skip_nzb_repair,omitempty"`
@@ -224,13 +224,13 @@ type RepairConfig struct {
 	//              folder + db entry. NEVER calls the arr. Destructive; defaults
 	//              false. NOTE: this does NOT make the arr self-heal — see the
 	//              "WHAT THIS DOES NOT DO" block on pruneDeadEntry.
-	//   RE-GRAB  — Regrab knob. On a dead item, DELETE the arr's file record. The
+	//   ARR-DELETE  — Regrab knob. On a dead item, DELETE the arr's file record. The
 	//              only arr-coupled component. Independent of PRUNE (not gated
 	//              behind it). Destructive; defaults false.
 	//
-	// Actions are driven directly by the REPAIR / PRUNE / RE-GRAB knobs below:
+	// Actions are driven directly by the REPAIR / PRUNE / ARR-DELETE knobs below:
 	// each component acts whenever its own knob is on. A sweep is CHECK-only
-	// (detect + record, no REPAIR/PRUNE/RE-GRAB) exactly when all three are off.
+	// (detect + record, no REPAIR/PRUNE/ARR-DELETE) exactly when all three are off.
 	// There is no separate master gate; the deprecated AutoRepair field above is
 	// ignored by the resolver.
 	//
@@ -238,23 +238,32 @@ type RepairConfig struct {
 	// split) resolves to the safe default of true via RepairEnabled(); Prune and
 	// Regrab default to their false zero value. So a dead item is detected and
 	// re-acquire-attempted by default, but nothing is DELETED until the operator
-	// opts into PRUNE and/or RE-GRAB.
+	// opts into PRUNE and/or ARR-DELETE.
 	Repair *bool `json:"repair,omitempty"`
-	Prune  bool  `json:"prune,omitempty"`
-	Regrab bool  `json:"regrab,omitempty"`
+	Prune bool `json:"prune,omitempty"`
 
-	// RE-GRAB used to bundle three arr-side effects behind the single Regrab
-	// knob above: delete the file record, blocklist the grab, and trigger a
-	// search. They are now three separately-gated actions, because bundling them
-	// made one destructive, permanent, global side effect (the blocklist) ride
-	// along with an ordinary cleanup.
+	// ArrDelete is the arr-side component: it deletes the arr's file record for a
+	// dead item. It is a *bool purely so an unset value can be told apart from an
+	// explicit false, which is what lets the deprecated Regrab alias below
+	// migrate cleanly. Resolve it with ArrDeleteEnabled(), never directly.
 	//
-	// Regrab alone is now DELETE ONLY. An existing config with regrab=true keeps
-	// deleting and silently stops blocklisting and searching. That direction is
-	// deliberate — it is strictly LESS destructive than before, so no operator is
-	// surprised by new damage; they are at worst surprised by less cleanup.
+	// It was called ARR-DELETE, and that name is now wrong. The component used to
+	// bundle three arr-side effects behind one checkbox — delete the file record,
+	// blocklist the grab, trigger a search — so "re-grab" described the whole. The
+	// three are now separately gated, and since ArrSearch and ArrBlocklist both
+	// default OFF, **the default behaviour of this knob does not grab anything at
+	// all**. It is arr-side record management. Naming it "regrab" would tell every
+	// operator who reads the config the opposite of what it does, and the
+	// sub-knobs would inherit the wrong stem: "regrab_search" reads as a variety
+	// of re-grabbing when it is in fact the only part that re-grabs.
 	//
-	// RegrabSearch — after the delete, ask the arr to search for a replacement.
+	// Regrab is the deprecated alias, kept ONLY so configs written before the
+	// rename keep working. setDefaults migrates it onto ArrDelete and clears it,
+	// so nothing downstream reads it.
+	ArrDelete *bool `json:"arr_delete,omitempty" alias:"regrab"`
+	Regrab    *bool `json:"regrab,omitempty"` // Deprecated: use ArrDelete.
+
+	// ArrSearch — after the delete, ask the arr to search for a replacement.
 	//
 	//   MUST be implemented as an explicit SearchMissing over EVERY deleted file.
 	//   Do NOT reintroduce the old shortcut of letting MarkHistoryFailed's
@@ -262,7 +271,7 @@ type RepairConfig struct {
 	//   whose grab-history record still exists, so it silently does nothing for
 	//   the rest, and it couples searching to blocklisting all over again.
 	//
-	// RegrabBlocklist — mark the grab failed in the arr, which blocklists the
+	// ArrBlocklist — mark the grab failed in the arr, which blocklists the
 	// release globally and permanently.
 	//
 	//   Reserve this for the BAD-RELEASE class: sample-only, wrong content, empty
@@ -285,11 +294,11 @@ type RepairConfig struct {
 	//   after eleven consecutive refusals. The blocklist only removes candidates
 	//   permanently; it never advances anything.
 	//
-	// Both default OFF. Both are subordinate to Regrab: with Regrab off there are
-	// no arr calls at all, which keeps "RE-GRAB is the only arr-coupled component"
-	// true.
-	RegrabSearch    bool `json:"regrab_search,omitempty"`
-	RegrabBlocklist bool `json:"regrab_blocklist,omitempty"`
+	// Both default OFF. Both are subordinate to ArrDelete: with it off there are
+	// no arr calls at all, which keeps "the arr component is the only arr-coupled
+	// component" true.
+	ArrSearch    bool `json:"arr_search,omitempty"`
+	ArrBlocklist bool `json:"arr_blocklist,omitempty"`
 
 	// MaxDeletionsPerRun caps how many entries a single repair run may
 	// destructively heal — i.e. how many entries can have their Arr file
@@ -308,7 +317,7 @@ type RepairConfig struct {
 	// A repair sweep still running when StopSchedule fires is cancelled before it
 	// finishes enumerating/probing every candidate. Empty disables the stop
 	// schedule entirely - the repair sweep always runs to completion. When a stop
-	// fires mid-repair-sweep, the enabled REPAIR / PRUNE / RE-GRAB components
+	// fires mid-repair-sweep, the enabled REPAIR / PRUNE / ARR-DELETE components
 	// decide what happens to whatever was already found broken: acted on if any
 	// component is on, left alone (CHECK-only) if all three are off.
 	StopSchedule string `json:"stop_schedule,omitempty"`
@@ -318,7 +327,56 @@ func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.MaxDeletionsPerRun == 0 &&
-		r.Repair == nil && !r.Prune && !r.Regrab && !r.RegrabSearch && !r.RegrabBlocklist
+		r.Repair == nil && !r.Prune && r.ArrDelete == nil && r.Regrab == nil &&
+		!r.ArrSearch && !r.ArrBlocklist
+}
+
+// ArrDeleteEnabled resolves the arr-delete component knob, honouring the
+// deprecated `regrab` alias for configs written before the rename. Always use
+// this rather than reading either field: setDefaults normally migrates the alias
+// away, but a RepairConfig built in memory (tests, API overrides) may not have
+// been through it.
+func (r RepairConfig) ArrDeleteEnabled() bool {
+	if r.ArrDelete != nil {
+		return *r.ArrDelete
+	}
+	return r.Regrab != nil && *r.Regrab
+}
+
+// migrateDeprecatedNames folds the deprecated `regrab` key onto ArrDelete and
+// clears it, so exactly one field is authoritative afterwards. An explicit
+// arr_delete always wins — if both keys are present the operator has already
+// moved to the new name and the stale one must not resurrect an old value.
+func (r *RepairConfig) migrateDeprecatedNames() {
+	if r.Regrab == nil {
+		return
+	}
+	if r.ArrDelete == nil {
+		v := *r.Regrab
+		r.ArrDelete = &v
+	}
+	r.Regrab = nil
+}
+
+// UnmarshalJSON folds the deprecated `regrab` key onto ArrDelete at DECODE time,
+// which is the only point where it can be done safely.
+//
+// Doing it later does not work. The partial-update merge decides field by field
+// on KEY PRESENCE in the posted body, so a client PATCHing `{"regrab": false}`
+// posts no arr_delete key at all; the merge would treat arr_delete as "not
+// mentioned" and restore the live value over it, leaving the component ON after
+// the caller asked to turn it OFF. Folding here means the decoded struct already
+// carries the value, and the `alias:"regrab"` tag on ArrDelete tells the merge
+// the field WAS mentioned. Both halves are required — value and key presence.
+func (r *RepairConfig) UnmarshalJSON(data []byte) error {
+	type raw RepairConfig // shed the method set, or this recurses forever
+	var decoded raw
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*r = RepairConfig(decoded)
+	r.migrateDeprecatedNames()
+	return nil
 }
 
 // RepairEnabled resolves the REPAIR (re-acquire) component knob. It defaults to
@@ -618,6 +676,7 @@ func (c *Config) setDefaults() {
 	// Migrate deprecated fields to Manager (backward compatibility)
 	c.migrateQBitTorrentToManager()
 	c.migrateNotifications()
+	c.Repair.migrateDeprecatedNames()
 
 	if c.DefaultDownloadAction == "" {
 		c.DefaultDownloadAction = DownloadActionSymlink

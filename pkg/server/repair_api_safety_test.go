@@ -14,7 +14,7 @@ import (
 )
 
 // repairFixtureJSON is an operator config with every safety knob deliberately
-// set: a destructive-action cap, a stop schedule, PRUNE on, RE-GRAB off and an
+// set: a destructive-action cap, a stop schedule, PRUNE on, ARR-DELETE off and an
 // explicit repair:false (the *bool tri-state at its non-default value).
 const repairFixtureJSON = `{
   "log_level": "info",
@@ -112,8 +112,8 @@ func TestPatchRepairConfigPartialPreservesSafetyKnobs(t *testing.T) {
 		if !got.Prune {
 			t.Fatalf("partial PATCH wiped prune")
 		}
-		if got.Regrab {
-			t.Fatalf("partial PATCH turned regrab on")
+		if got.ArrDeleteEnabled() {
+			t.Fatalf("partial PATCH turned arr_delete on")
 		}
 		if !got.Enabled || got.Schedule != "0 3 * * *" || got.Source != config.RepairSourceManaged {
 			t.Fatalf("partial PATCH wiped scheduling fields: %+v", got)
@@ -159,7 +159,7 @@ func TestPutRepairConfigPartialClearsOmittedFields(t *testing.T) {
 		if got.StopSchedule != "" {
 			t.Fatalf("PUT must clear stop_schedule: %q", got.StopSchedule)
 		}
-		if got.Prune || got.Regrab {
+		if got.Prune || got.ArrDeleteEnabled() {
 			t.Fatalf("PUT must clear prune/regrab (⇒ delete nothing): %+v", got)
 		}
 		if got.Enabled || got.Schedule != "" || got.SkipNZBRepair || len(got.Arrs) != 0 {
@@ -224,7 +224,7 @@ func TestPatchRepairConfigExplicitValuesStillApply(t *testing.T) {
 		if got.Prune {
 			t.Fatalf("explicit prune:false not applied")
 		}
-		if !got.Regrab {
+		if !got.ArrDeleteEnabled() {
 			t.Fatalf("explicit regrab:true not applied")
 		}
 		if got.Schedule != "0 3 * * *" {
@@ -375,7 +375,7 @@ func TestPatchRepairConfigValidatesMergedResult(t *testing.T) {
 // TestResolveLegacyFixFlag pins FIX 3's decision: an "actions" object that is
 // PRESENT but names no component is an explicit "do nothing" and must never be
 // promoted to the legacy fix flag, which the manager resolves to the operator's
-// configured REPAIR/PRUNE/RE-GRAB knobs (possibly destructive). "actions"
+// configured REPAIR/PRUNE/ARR-DELETE knobs (possibly destructive). "actions"
 // ABSENT keeps the documented fall-back behavior.
 func TestResolveLegacyFixFlag(t *testing.T) {
 	tests := []struct {
@@ -415,7 +415,7 @@ func TestRepairActionsBodyToManagerAllFalse(t *testing.T) {
 	if got == nil {
 		t.Fatal("an explicit all-false actions object must not decay to a nil selection")
 	}
-	if got.Repair || got.Prune || got.Regrab {
+	if got.Repair || got.Prune || got.ArrDelete {
 		t.Fatalf("all-false selection was not preserved: %+v", got)
 	}
 	if (*repairActionsBody)(nil).toManager() != nil {

@@ -19,7 +19,7 @@ import (
 	"github.com/puzpuzpuz/xsync/v4"
 )
 
-// RE-GRAB used to mean one thing — "delete the arr file record, blocklist the
+// ARR-DELETE used to mean one thing — "delete the arr file record, blocklist the
 // grab, search for a replacement" — behind a single checkbox. These tests pin
 // the three acts apart.
 //
@@ -138,34 +138,34 @@ func brokenHealthFor(t *testing.T, m *Manager, name string) *storage.EntryHealth
 	return h
 }
 
-// runRegrab drives RE-GRAB directly with an explicit action set, which is what
+// runRegrab drives ARR-DELETE directly with an explicit action set, which is what
 // the config/API layers resolve to.
 func runRegrab(t *testing.T, r *Repair, m *Manager, actions repairActions) *storage.RepairRun {
 	t.Helper()
 	run := &storage.RepairRun{ID: "test-run"}
 	var statsMu sync.Mutex
 	h := brokenHealthFor(t, m, "Broken.Entry.2024")
-	r.regrabDeadEntry(context.Background(), run, &statsMu, "Broken.Entry.2024", h, actions)
+	r.arrDeleteDeadEntry(context.Background(), run, &statsMu, "Broken.Entry.2024", h, actions)
 	return run
 }
 
 // TestRegrabDefaultDeletesWithoutBlocklistOrSearch is the operator's step 2:
-// "if repair fails, DELETE on the arr side, with NO BLOCKLISTING". With RE-GRAB
+// "if repair fails, DELETE on the arr side, with NO BLOCKLISTING". With ARR-DELETE
 // on and both sub-actions off (the defaults), exactly one thing may happen.
 func TestRegrabDefaultDeletesWithoutBlocklistOrSearch(t *testing.T) {
 	m, r, arrSrv := newRegrabSplitFixture(t)
 
-	run := runRegrab(t, r, m, repairActions{regrab: true})
+	run := runRegrab(t, r, m, repairActions{arrDelete: true})
 
 	deletes, blocklists, searches := arrSrv.counts()
 	if deletes != 1 {
 		t.Fatalf("arr DeleteFiles calls = %d, want 1", deletes)
 	}
 	if blocklists != 0 {
-		t.Fatalf("blocklist POSTs = %d, want 0 — RE-GRAB must not blocklist unless asked", blocklists)
+		t.Fatalf("blocklist POSTs = %d, want 0 — ARR-DELETE must not blocklist unless asked", blocklists)
 	}
 	if searches != 0 {
-		t.Fatalf("search commands = %d, want 0 — RE-GRAB must not search unless asked", searches)
+		t.Fatalf("search commands = %d, want 0 — ARR-DELETE must not search unless asked", searches)
 	}
 	if run.Stats.ArrBlocklisted != 0 || run.Stats.ArrSearched != 0 {
 		t.Fatalf("stats claimed work that did not happen: blocklisted=%d searched=%d",
@@ -187,7 +187,7 @@ func TestRegrabDefaultDeletesWithoutBlocklistOrSearch(t *testing.T) {
 func TestRegrabSearchCoversFilesWithGrabHistory(t *testing.T) {
 	m, r, arrSrv := newRegrabSplitFixture(t)
 
-	run := runRegrab(t, r, m, repairActions{regrab: true, regrabSearch: true})
+	run := runRegrab(t, r, m, repairActions{arrDelete: true, search: true})
 
 	deletes, blocklists, searches := arrSrv.counts()
 	if deletes != 1 {
@@ -213,7 +213,7 @@ func TestRegrabSearchCoversFilesWithGrabHistory(t *testing.T) {
 func TestRegrabBlocklistOnlyWhenEnabled(t *testing.T) {
 	m, r, arrSrv := newRegrabSplitFixture(t)
 
-	run := runRegrab(t, r, m, repairActions{regrab: true, regrabBlocklist: true})
+	run := runRegrab(t, r, m, repairActions{arrDelete: true, blocklist: true})
 
 	deletes, blocklists, searches := arrSrv.counts()
 	if deletes != 1 {
@@ -231,15 +231,15 @@ func TestRegrabBlocklistOnlyWhenEnabled(t *testing.T) {
 }
 
 // TestRegrabSubActionsAreGatedOnRegrab keeps the sub-actions subordinate. With
-// RE-GRAB off, nothing may reach the arr at all — that is the invariant that
-// makes "RE-GRAB is the only arr-coupled component" true.
+// ARR-DELETE off, nothing may reach the arr at all — that is the invariant that
+// makes "ARR-DELETE is the only arr-coupled component" true.
 func TestRegrabSubActionsAreGatedOnRegrab(t *testing.T) {
-	acts := repairActions{regrab: false, regrabSearch: true, regrabBlocklist: true}
-	if acts.arrSearch() {
-		t.Fatal("arrSearch() true with regrab off — sub-actions must be gated on RE-GRAB")
+	acts := repairActions{arrDelete: false, search: true, blocklist: true}
+	if acts.wantSearch() {
+		t.Fatal("arrSearch() true with regrab off — sub-actions must be gated on ARR-DELETE")
 	}
-	if acts.arrBlocklist() {
-		t.Fatal("arrBlocklist() true with regrab off — sub-actions must be gated on RE-GRAB")
+	if acts.wantBlocklist() {
+		t.Fatal("arrBlocklist() true with regrab off — sub-actions must be gated on ARR-DELETE")
 	}
 	if acts.any() {
 		t.Fatal("any() true with only sub-actions set — sub-actions are not components")
@@ -258,11 +258,11 @@ func TestRegrabLabelNamesTheActs(t *testing.T) {
 		acts repairActions
 		want string
 	}{
-		{"delete only", repairActions{regrab: true}, "regrab(delete)"},
-		{"delete+search", repairActions{regrab: true, regrabSearch: true}, "regrab(delete+search)"},
-		{"delete+blocklist", repairActions{regrab: true, regrabBlocklist: true}, "regrab(delete+blocklist)"},
-		{"all three", repairActions{regrab: true, regrabSearch: true, regrabBlocklist: true}, "regrab(delete+search+blocklist)"},
-		{"sub-actions without regrab", repairActions{regrabSearch: true, regrabBlocklist: true}, "check-only"},
+		{"delete only", repairActions{arrDelete: true}, "arr(delete)"},
+		{"delete+search", repairActions{arrDelete: true, search: true}, "arr(delete+search)"},
+		{"delete+blocklist", repairActions{arrDelete: true, blocklist: true}, "arr(delete+blocklist)"},
+		{"all three", repairActions{arrDelete: true, search: true, blocklist: true}, "arr(delete+search+blocklist)"},
+		{"sub-actions without regrab", repairActions{search: true, blocklist: true}, "check-only"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.acts.label(); got != tc.want {
@@ -276,21 +276,21 @@ func TestRegrabLabelNamesTheActs(t *testing.T) {
 // components but says nothing about search/blocklist must inherit the
 // operator's configured policy, not silently get the zero value.
 func TestManualActionsSubActionsDefaultToConfig(t *testing.T) {
-	cfg := config.RepairConfig{RegrabSearch: true, RegrabBlocklist: true}
+	cfg := config.RepairConfig{ArrSearch: true, ArrBlocklist: true}
 
 	sel := &ManualActions{Regrab: true}
 	acts := sel.toActions(cfg)
-	if !acts.regrabSearch || !acts.regrabBlocklist {
+	if !acts.search || !acts.blocklist {
 		t.Fatalf("unspecified sub-actions did not inherit config: %+v", acts)
 	}
 
 	no := false
 	sel = &ManualActions{Regrab: true, Blocklist: &no}
 	acts = sel.toActions(cfg)
-	if !acts.regrabSearch {
+	if !acts.search {
 		t.Fatal("search override leaked from an unrelated blocklist override")
 	}
-	if acts.regrabBlocklist {
+	if acts.blocklist {
 		t.Fatal("explicit blocklist:false was ignored")
 	}
 }

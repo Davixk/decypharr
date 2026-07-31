@@ -202,11 +202,11 @@ func TestPruneDeclineIsCountedAndExplained(t *testing.T) {
 }
 
 // TestRegrabDeclineIsCountedAndExplained is the same treatment for the other
-// silent decline on the destructive path: RE-GRAB with no resolved arr link.
+// silent decline on the destructive path: ARR-DELETE with no resolved arr link.
 func TestRegrabDeclineIsCountedAndExplained(t *testing.T) {
 	m, r, arrSrv, _ := newRepairCapFixture(t, 0)
 
-	// seedManagedEntry has NO arr linkage at all, so RE-GRAB cannot route it.
+	// seedManagedEntry has NO arr linkage at all, so ARR-DELETE cannot route it.
 	seedManagedEntry(t, m, "noarr-a", "NoArrA")
 	h := &storage.EntryHealth{
 		EntryName:   "NoArrA",
@@ -220,17 +220,17 @@ func TestRegrabDeclineIsCountedAndExplained(t *testing.T) {
 
 	run := newRun(t, m)
 	var mu sync.Mutex
-	r.actOnDeadEntry(context.Background(), run, &mu, "NoArrA", h, repairActions{regrab: true}, r.newDeletionBudget(run.ID))
+	r.actOnDeadEntry(context.Background(), run, &mu, "NoArrA", h, repairActions{arrDelete: true}, r.newDeletionBudget(run.ID))
 
 	if got := arrSrv.totalCalls(); got != 0 {
-		t.Fatalf("RE-GRAB made %d arr calls with no arr link, want 0", got)
+		t.Fatalf("ARR-DELETE made %d arr calls with no arr link, want 0", got)
 	}
-	if run.Stats.RegrabSkippedNoArrLink != 1 {
-		t.Fatalf("Stats.RegrabSkippedNoArrLink = %d, want 1", run.Stats.RegrabSkippedNoArrLink)
+	if run.Stats.ArrSkippedNoLink != 1 {
+		t.Fatalf("Stats.ArrSkippedNoLink = %d, want 1", run.Stats.ArrSkippedNoLink)
 	}
 	saved, _ := m.storage.GetEntryHealth("NoArrA")
-	if saved == nil || saved.ActionSkips[componentRegrab] != reasonRegrabNoArrLink {
-		t.Fatalf("health ActionSkips[regrab] = %v, want %q", saved.ActionSkips, reasonRegrabNoArrLink)
+	if saved == nil || saved.ActionSkips[componentArrDelete] != reasonArrNoLink {
+		t.Fatalf("health ActionSkips[regrab] = %v, want %q", saved.ActionSkips, reasonArrNoLink)
 	}
 }
 
@@ -399,7 +399,7 @@ func TestFixBrokenActsOnTorrentsAndExplainsNZB(t *testing.T) {
 //
 // LOUD NOTE: this records `broken`, which is the destructive-eligible class.
 // The assertions below pin the containment that makes that safe — a zero-file
-// entry carries zero BrokenFiles, so PRUNE and RE-GRAB both decline it.
+// entry carries zero BrokenFiles, so PRUNE and ARR-DELETE both decline it.
 func TestZeroFileEntryIsStructurallyBroken(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -461,9 +461,9 @@ func TestZeroFileEntryIsStructurallyBroken(t *testing.T) {
 			}
 			run := newRun(t, m)
 			var mu sync.Mutex
-			r.actOnDeadEntry(context.Background(), run, &mu, entryName, saved, repairActions{prune: true, regrab: true}, r.newDeletionBudget(run.ID))
-			if run.Stats.Pruned != 0 || run.Stats.Regrabbed != 0 {
-				t.Fatalf("destructive action ran on a zero-file entry: pruned=%d regrabbed=%d", run.Stats.Pruned, run.Stats.Regrabbed)
+			r.actOnDeadEntry(context.Background(), run, &mu, entryName, saved, repairActions{prune: true, arrDelete: true}, r.newDeletionBudget(run.ID))
+			if run.Stats.Pruned != 0 || run.Stats.ArrDeleted != 0 {
+				t.Fatalf("destructive action ran on a zero-file entry: pruned=%d arr_deleted=%d", run.Stats.Pruned, run.Stats.ArrDeleted)
 			}
 			if run.Stats.Deletions != 0 {
 				t.Fatalf("Stats.Deletions = %d, want 0", run.Stats.Deletions)
@@ -633,7 +633,7 @@ func TestExplicitAllFalseManualActionsRunsNothing(t *testing.T) {
 
 	// The most dangerous configuration: every destructive knob on.
 	on := true
-	config.Get().Repair = config.RepairConfig{Repair: &on, Prune: true, Regrab: true}
+	config.Get().Repair = config.RepairConfig{Repair: &on, Prune: true, ArrDelete: &on}
 
 	for _, fix := range []bool{false, true} {
 		got := r.resolveManualActions(&ManualActions{}, fix)
@@ -642,7 +642,7 @@ func TestExplicitAllFalseManualActionsRunsNothing(t *testing.T) {
 		}
 	}
 	// A nil selection still falls back to the configured knobs (documented).
-	if got := r.resolveManualActions(nil, true); got != (repairActions{repair: true, prune: true, regrab: true}) {
+	if got := r.resolveManualActions(nil, true); got != (repairActions{repair: true, prune: true, arrDelete: true}) {
 		t.Fatalf("resolveManualActions(nil, true) = %+v, want the configured knobs", got)
 	}
 	// And a partial selection is still honoured verbatim.
@@ -652,7 +652,7 @@ func TestExplicitAllFalseManualActionsRunsNothing(t *testing.T) {
 }
 
 // TestFixBrokenRejectsExplicitAllFalse pins the end-to-end consequence: with
-// PRUNE and RE-GRAB configured on, an explicit "no components" FixBroken must
+// PRUNE and ARR-DELETE configured on, an explicit "no components" FixBroken must
 // delete nothing and touch no arr, rather than running the configured knobs.
 func TestFixBrokenRejectsExplicitAllFalse(t *testing.T) {
 	m, r, arrSrv, _ := newRepairCapFixture(t, 0)
@@ -660,7 +660,7 @@ func TestFixBrokenRejectsExplicitAllFalse(t *testing.T) {
 	cfg := config.Get()
 	cfg.Repair.Repair = &on
 	cfg.Repair.Prune = true
-	cfg.Repair.Regrab = true
+	cfg.Repair.ArrDelete = &on
 
 	seedBrokenEntry(t, m, "allfalse-a", "AllFalseA")
 

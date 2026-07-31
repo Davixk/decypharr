@@ -240,8 +240,8 @@ func TestHandleUpdateConfigNestedPartialPatchPreservesSafetyKnobs(t *testing.T) 
 	if saved.Repair.StopSchedule != "06:00" {
 		t.Fatalf("nested partial PATCH wiped stop_schedule: %q", saved.Repair.StopSchedule)
 	}
-	if !saved.Repair.Prune || !saved.Repair.Regrab {
-		t.Fatalf("nested partial PATCH wiped prune/regrab: %+v", saved.Repair)
+	if !saved.Repair.Prune || !saved.Repair.ArrDeleteEnabled() {
+		t.Fatalf("nested partial PATCH wiped prune/arr_delete: %+v", saved.Repair)
 	}
 	if saved.Repair.Schedule != "0 3 * * *" || saved.Repair.Source != config.RepairSourceManaged || saved.Repair.Workers != 3 {
 		t.Fatalf("nested partial PATCH wiped scheduling fields: %+v", saved.Repair)
@@ -277,8 +277,8 @@ func TestHandleUpdateConfigNestedExplicitValuesStillApply(t *testing.T) {
 	if saved.Repair.StopSchedule != "" {
 		t.Fatalf("explicit stop_schedule:\"\" not applied: %q", saved.Repair.StopSchedule)
 	}
-	if saved.Repair.Prune || saved.Repair.Regrab {
-		t.Fatalf("explicit prune/regrab:false not applied: %+v", saved.Repair)
+	if saved.Repair.Prune || saved.Repair.ArrDeleteEnabled() {
+		t.Fatalf("explicit prune/arr_delete:false not applied: %+v", saved.Repair)
 	}
 	if saved.Repair.Repair == nil || !*saved.Repair.Repair {
 		t.Fatalf("explicit repair:true not applied: %v", saved.Repair.Repair)
@@ -337,7 +337,7 @@ func TestHandleReplaceConfigPartialPutClearsOmittedFields(t *testing.T) {
 	if saved.Repair.StopSchedule != "" {
 		t.Fatalf("PUT must clear stop_schedule: %q", saved.Repair.StopSchedule)
 	}
-	if saved.Repair.Prune || saved.Repair.Regrab {
+	if saved.Repair.Prune || saved.Repair.ArrDeleteEnabled() {
 		t.Fatalf("PUT must clear prune/regrab (⇒ delete nothing): %+v", saved.Repair)
 	}
 	if saved.Repair.Repair != nil {
@@ -385,7 +385,7 @@ func TestHandleReplaceConfigExplicitValuesApply(t *testing.T) {
 	// replacement is not "top level only". stop_schedule and regrab have no
 	// default so they land on zero; source and workers fall back to the
 	// documented defaults rather than keeping the stored managed/3.
-	if saved.Repair.StopSchedule != "" || saved.Repair.Regrab {
+	if saved.Repair.StopSchedule != "" || saved.Repair.ArrDeleteEnabled() {
 		t.Fatalf("PUT preserved fields omitted inside a submitted section: %+v", saved.Repair)
 	}
 	if saved.Repair.Source != config.RepairSourceArr || saved.Repair.Workers != 5 {

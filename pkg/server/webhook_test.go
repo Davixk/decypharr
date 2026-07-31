@@ -57,7 +57,7 @@ const tautulliPayloadNoMediaID = `{"topic":"tautulli","fix":true}`
 // TestTautulliWebhookRequiresAuth is the regression test for the unauthenticated
 // destructive webhook: POST /webhooks/tautulli was registered on the parent
 // router, OUTSIDE the authMiddleware group, so anyone who could reach the port
-// could trigger repair work (PRUNE/RE-GRAB per the operator's configured knobs).
+// could trigger repair work (PRUNE/ARR-DELETE per the operator's configured knobs).
 //
 // It exercises the REAL route wiring (webhookRoutes, as mounted by New) with a
 // nil manager: a request that gets past both the middleware and the media-id
@@ -166,7 +166,7 @@ func TestTautulliWebhookRequiresAuth(t *testing.T) {
 // TestTautulliWebhookNoMediaIDDoesNotSweep is the defense-in-depth half of the
 // fix: even an AUTHENTICATED webhook with no media id must not fall through to
 // svc.RunNow(...), i.e. a full library sweep with the configured
-// REPAIR/PRUNE/RE-GRAB knobs.
+// REPAIR/PRUNE/ARR-DELETE knobs.
 //
 // The Server has a nil manager, so any path that reached the repair service
 // would panic instead of returning 400 — the assertion is therefore both on the

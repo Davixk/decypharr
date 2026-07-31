@@ -1457,7 +1457,7 @@
                                 </label>
                                 <input type="text" class="input w-full" name="repair.stop_schedule" id="repair.stop_schedule"
                                        placeholder="e.g. 06:00, 0 6 * * *, 4h">
-                                <span class="label-text-alt opacity-70">Cron expression, clock time, or interval. If a CHECK sweep is still running when this fires, it's stopped early. The enabled <strong>REPAIR</strong> / <strong>PRUNE</strong> / <strong>RE-GRAB</strong> components decide whether to act on whatever was found broken so far.</span>
+                                <span class="label-text-alt opacity-70">Cron expression, clock time, or interval. If a CHECK sweep is still running when this fires, it's stopped early. The enabled <strong>REPAIR</strong> / <strong>PRUNE</strong> / <strong>ARR-DELETE</strong> components decide whether to act on whatever was found broken so far.</span>
                             </div>
 
                             <div>
@@ -1468,7 +1468,7 @@
                                 </label>
                                 <select class="select w-full" name="repair.arrs" id="repair.arrs" multiple
                                         size="3"></select>
-                                <span class="label-text-alt opacity-70">Limits which arrs RE-GRAB may target.</span>
+                                <span class="label-text-alt opacity-70">Limits which arrs ARR-DELETE may target.</span>
                             </div>
                         </div>
 
@@ -1486,9 +1486,9 @@
                             <div class="alert alert-info alert-soft text-sm leading-relaxed">
                                 <span>
                                     <strong>CHECK</strong> always runs (detect + record). Enable any of
-                                    <strong>REPAIR</strong> / <strong>PRUNE</strong> / <strong>RE-GRAB</strong> below to act on dead items —
+                                    <strong>REPAIR</strong> / <strong>PRUNE</strong> / <strong>ARR-DELETE</strong> below to act on dead items —
                                     REPAIR re-acquires, PRUNE deletes decypharr-side (the arr keeps monitoring and re-searches),
-                                    RE-GRAB goes through the arr (delete + blocklist + search). Each is independent; with all
+                                    ARR-DELETE goes through the arr (delete the file record; search and blocklist are separate opt-ins). Each is independent; with all
                                     three off the sweep is detect-only.
                                 </span>
                             </div>
@@ -1506,22 +1506,22 @@
                                 </label>
                                 <label class="label cursor-pointer justify-start gap-3">
                                     <input type="checkbox" class="checkbox checkbox-error checkbox-sm"
-                                           id="repair.regrab" name="repair.regrab">
-                                    <span class="label-text font-medium">RE-GRAB <span class="opacity-60 font-normal">delete the arr's file record (arr-coupled)</span></span>
+                                           id="repair.arr_delete" name="repair.arr_delete">
+                                    <span class="label-text font-medium">ARR-DELETE <span class="opacity-60 font-normal">delete the arr's file record (arr-coupled)</span></span>
                                 </label>
                             </div>
 
                             <div class="ml-1 pl-4 border-l-2 border-base-300 space-y-2">
-                                <span class="label-text-alt opacity-70">RE-GRAB sub-actions &mdash; both off by default, and both do nothing unless RE-GRAB is on.</span>
+                                <span class="label-text-alt opacity-70">ARR-DELETE sub-actions &mdash; both off by default, and both do nothing unless ARR-DELETE is on.</span>
                                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                     <label class="label cursor-pointer justify-start gap-3">
                                         <input type="checkbox" class="checkbox checkbox-warning checkbox-sm"
-                                               id="repair.regrab_search" name="repair.regrab_search">
+                                               id="repair.arr_search" name="repair.arr_search">
                                         <span class="label-text font-medium">&hellip; and search <span class="opacity-60 font-normal">ask the arr for a replacement after the delete</span></span>
                                     </label>
                                     <label class="label cursor-pointer justify-start gap-3">
                                         <input type="checkbox" class="checkbox checkbox-error checkbox-sm"
-                                               id="repair.regrab_blocklist" name="repair.regrab_blocklist">
+                                               id="repair.arr_blocklist" name="repair.arr_blocklist">
                                         <span class="label-text font-medium">&hellip; and blocklist <span class="opacity-60 font-normal">ban the release globally and permanently</span></span>
                                     </label>
                                 </div>
@@ -1536,7 +1536,7 @@
                                 </label>
                                 <input type="number" min="-1" class="input w-full" name="repair.max_deletions_per_run"
                                        id="repair.max_deletions_per_run" placeholder="100">
-                                <span class="label-text-alt opacity-70">Caps how many entries PRUNE + RE-GRAB may delete in a single run, so a provider-wide outage can't mass-delete. Blank / 0 = 100. −1 = unlimited.</span>
+                                <span class="label-text-alt opacity-70">Caps how many entries PRUNE + ARR-DELETE may delete in a single run, so a provider-wide outage can't mass-delete. Blank / 0 = 100. −1 = unlimited.</span>
                             </div>
                         </div>
 

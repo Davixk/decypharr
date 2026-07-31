@@ -245,7 +245,7 @@ func preserveNestedConfig() *Config {
 			RecheckInterval:    "168h",
 			MaxDeletionsPerRun: 5,
 			Prune:              true,
-			Regrab:             true,
+			ArrDelete:          boolPtr(true),
 			SkipNZBRepair:      true,
 			Repair:             boolPtr(false),
 			Arrs:               []string{"sonarr", "radarr"},
@@ -300,8 +300,8 @@ func TestPreserveMissingSectionsNestedPartialKeepsSafetyKnobs(t *testing.T) {
 	if !got.Repair.Prune {
 		t.Fatalf("nested partial PATCH wiped prune")
 	}
-	if !got.Repair.Regrab {
-		t.Fatalf("nested partial PATCH wiped regrab")
+	if !got.Repair.ArrDeleteEnabled() {
+		t.Fatalf("nested partial PATCH wiped arr_delete")
 	}
 	if got.Repair.Schedule != "0 3 * * *" || got.Repair.Source != RepairSourceManaged ||
 		got.Repair.Workers != 3 || got.Repair.RecheckInterval != "168h" || !got.Repair.SkipNZBRepair {
@@ -333,7 +333,7 @@ func TestPreserveMissingSectionsNestedExplicitValuesStillApply(t *testing.T) {
 	if got.Repair.StopSchedule != "" {
 		t.Fatalf("explicit stop_schedule:\"\" not applied: %q", got.Repair.StopSchedule)
 	}
-	if got.Repair.Prune || got.Repair.Regrab {
+	if got.Repair.Prune || got.Repair.ArrDeleteEnabled() {
 		t.Fatalf("explicit prune/regrab:false not applied: %+v", got.Repair)
 	}
 	if got.Repair.Workers != 0 {

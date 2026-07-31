@@ -331,11 +331,11 @@ func TestIndeterminateIsNeverActionable(t *testing.T) {
 	}
 	run := &storage.RepairRun{ID: "unknown-run"}
 	var mu sync.Mutex
-	actions := repairActions{repair: true, prune: true, regrab: true}
+	actions := repairActions{repair: true, prune: true, arrDelete: true}
 	r.actOnDeadEntry(context.Background(), run, &mu, "Unverified", h, actions, r.newDeletionBudget(run.ID))
 
-	if run.Stats.Pruned != 0 || run.Stats.Regrabbed != 0 {
-		t.Fatalf("unknown entry triggered destructive actions: pruned=%d regrabbed=%d", run.Stats.Pruned, run.Stats.Regrabbed)
+	if run.Stats.Pruned != 0 || run.Stats.ArrDeleted != 0 {
+		t.Fatalf("unknown entry triggered destructive actions: pruned=%d arr_deleted=%d", run.Stats.Pruned, run.Stats.ArrDeleted)
 	}
 	if got := arrSrv.totalCalls(); got != 0 {
 		t.Fatalf("unknown entry made %d arr calls, want 0", got)
@@ -458,7 +458,7 @@ func TestManualRecheckMediaHonoursDeletionCap(t *testing.T) {
 	}
 
 	budget := r.newDeletionBudget(run.ID)
-	actions := repairActions{repair: true, prune: true, regrab: true}
+	actions := repairActions{repair: true, prune: true, arrDelete: true}
 	if err := r.probeAndHealCandidates(context.Background(), run, candidates, names, newHealCache(), RepairRunOptions{}, actions, budget); err != nil {
 		t.Fatalf("probeAndHealCandidates: %v", err)
 	}

@@ -15,7 +15,7 @@ import (
 // a typo'd body fall through to a zero-value request — which on these handlers
 // does not mean "do nothing", it means "run a full default sweep"
 // (handleRunRepair) or "act on EVERY broken entry with the configured knobs"
-// (handleFixBroken, which can PRUNE/RE-GRAB destructively). A live operator
+// (handleFixBroken, which can PRUNE/ARR-DELETE destructively). A live operator
 // probing the API with `{` launched a real sweep this way.
 func TestDecodeOptionalJSONBody(t *testing.T) {
 	type payload struct {

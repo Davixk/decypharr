@@ -25,7 +25,7 @@ class RepairManager {
         $('runNowBtn')?.addEventListener('click', () => this.openRunModal());
         $('stopRunBtn')?.addEventListener('click', () => this.stopRun());
         // "Act on broken": select-MANY over the whole broken set. REPAIR /
-        // PRUNE / RE-GRAB compose, so the modal collects any combination and
+        // PRUNE / ARR-DELETE compose, so the modal collects any combination and
         // sends them in a single request.
         $('actBrokenBtn')?.addEventListener('click', () => this.openActBrokenModal());
         $('actBrokenForm')?.addEventListener('submit', (e) => {
@@ -80,10 +80,10 @@ class RepairManager {
         if (unrestrictLink) unrestrictLink.checked = false;
         const runRepair = document.getElementById('runRepair');
         const runPrune = document.getElementById('runPrune');
-        const runRegrab = document.getElementById('runRegrab');
+        const runArrDelete = document.getElementById('runArrDelete');
         if (runRepair) runRepair.checked = this.repairConfig.repair !== false;
         if (runPrune) runPrune.checked = !!this.repairConfig.prune;
-        if (runRegrab) runRegrab.checked = !!this.repairConfig.regrab;
+        if (runArrDelete) runArrDelete.checked = !!(this.repairConfig.arr_delete ?? this.repairConfig.regrab);
         const defaultProtocol = this.repairConfig.skip_nzb_repair ? 'torrent' : 'all';
         const protocol = document.querySelector(`input[name="runProtocol"][value="${defaultProtocol}"]`)
             || document.getElementById('runProtocolAll');
@@ -160,19 +160,19 @@ class RepairManager {
     // fixComponentMeta maps a component key to its display label + one-liner,
     // shared by the confirm dialogs and toasts so all surfaces read identically.
     fixComponentMeta(component) {
-        // RE-GRAB's description is built from the ticked sub-actions rather than
+        // ARR-DELETE's description is built from the ticked sub-actions rather than
         // asserting all three acts. The confirm dialog is the last thing shown
         // before something destructive runs, so it has to name what will actually
         // happen — "arr delete + blocklist + search" promised a permanent global
         // ban on every run, including the ones that do not blocklist at all.
-        const regrabSub = this.selectedRegrabSubActions(['regrab']);
-        const regrabActs = ['arr delete']
-            .concat(regrabSub.search ? ['search'] : [])
-            .concat(regrabSub.blocklist ? ['blocklist (permanent, global)'] : []);
+        const arrSub = this.selectedArrSubActions(['arr_delete']);
+        const arrActs = ['arr delete']
+            .concat(arrSub.search ? ['search'] : [])
+            .concat(arrSub.blocklist ? ['blocklist (permanent, global)'] : []);
         return ({
             repair: {label: 'REPAIR', desc: 're-acquire on the same or a backup provider'},
             prune: {label: 'PRUNE', desc: 'delete decypharr-side only — makes no arr call, any arr symlink is left dangling'},
-            regrab: {label: 'RE-GRAB', desc: regrabActs.join(' + ')},
+            arr_delete: {label: 'ARR-DELETE', desc: arrActs.join(' + ')},
         })[component] || {label: String(component || '').toUpperCase(), desc: ''};
     }
 
@@ -190,7 +190,7 @@ class RepairManager {
             actions: {
                 repair: !!$('recheckRepair')?.checked,
                 prune: !!$('recheckPrune')?.checked,
-                regrab: !!$('recheckRegrab')?.checked,
+                arr_delete: !!$('recheckArrDelete')?.checked,
             },
         };
         const btn = $('recheckMediaBtn');
@@ -255,9 +255,9 @@ class RepairManager {
                 <div class="${stats.repair_skipped_unsupported ? 'text-warning' : ''}" title="${RepairManager.STAT_TITLES.repair_skipped_unsupported}">Repair n/a: <strong>${stats.repair_skipped_unsupported ?? 0}</strong></div>
                 <div class="${stats.pruned ? 'text-warning' : ''}">Pruned: <strong>${stats.pruned ?? 0}</strong></div>
                 <div class="${stats.prune_skipped_not_eligible ? 'text-warning' : ''}" title="${RepairManager.STAT_TITLES.prune_skipped_not_eligible}">Prune skipped: <strong>${stats.prune_skipped_not_eligible ?? 0}</strong></div>
-                <div class="${stats.regrabbed ? 'text-info' : ''}">Re-grabbed: <strong>${stats.regrabbed ?? 0}</strong></div>
-                <div class="${stats.regrab_failed ? 'text-error' : ''}" title="${RepairManager.STAT_TITLES.regrab_failed}">Re-grab fail: <strong>${stats.regrab_failed ?? 0}</strong></div>
-                <div class="${stats.regrab_skipped_no_arr_link ? 'text-warning' : ''}" title="${RepairManager.STAT_TITLES.regrab_skipped_no_arr_link}">Re-grab no arr: <strong>${stats.regrab_skipped_no_arr_link ?? 0}</strong></div>
+                <div class="${stats.arr_deleted ? 'text-info' : ''}">Arr deleted: <strong>${stats.arr_deleted ?? 0}</strong></div>
+                <div class="${stats.arr_delete_failed ? 'text-error' : ''}" title="${RepairManager.STAT_TITLES.arr_delete_failed}">Arr delete fail: <strong>${stats.arr_delete_failed ?? 0}</strong></div>
+                <div class="${stats.arr_skipped_no_link ? 'text-warning' : ''}" title="${RepairManager.STAT_TITLES.arr_skipped_no_link}">Arr no link: <strong>${stats.arr_skipped_no_link ?? 0}</strong></div>
             </div>
             ${run.error ? `<div class="mt-2 text-error text-xs">${this.escape(run.error)}</div>` : ''}
         `;
@@ -278,7 +278,7 @@ class RepairManager {
             const protocol = document.querySelector('input[name="runProtocol"]:checked')?.value || 'all';
             const repair = !!document.getElementById('runRepair')?.checked;
             const prune = !!document.getElementById('runPrune')?.checked;
-            const regrab = !!document.getElementById('runRegrab')?.checked;
+            const arrDelete = !!document.getElementById('runArrDelete')?.checked;
             const res = await fetch(`${this.api}/repair/run`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -288,7 +288,7 @@ class RepairManager {
                     protocol,
                     repair,
                     prune,
-                    regrab,
+                    arr_delete: arrDelete,
                 }),
             });
             if (!res.ok) {
@@ -308,18 +308,18 @@ class RepairManager {
     // ---- "Act on broken" (select-many) ----------------------------------
 
     // selectedFixComponents returns the ticked components in canonical
-    // REPAIR → PRUNE → RE-GRAB order.
+    // REPAIR → PRUNE → ARR-DELETE order.
     selectedFixComponents() {
-        return ['repair', 'prune', 'regrab'].filter((c) =>
+        return ['repair', 'prune', 'arr_delete'].filter((c) =>
             !!document.querySelector(`#actBrokenModal [data-act-component="${c}"]`)?.checked);
     }
 
-    // selectedRegrabSubActions returns RE-GRAB's search/blocklist sub-actions for
-    // the request body. They are sent ONLY when RE-GRAB itself is selected: on
+    // selectedArrSubActions returns ARR-DELETE's search/blocklist sub-actions for
+    // the request body. They are sent ONLY when ARR-DELETE itself is selected: on
     // their own they name no component, and the API ignores them in that case
     // rather than letting a sub-action manufacture an action set.
-    selectedRegrabSubActions(components) {
-        if (!components.includes('regrab')) return {};
+    selectedArrSubActions(components) {
+        if (!components.includes('arr_delete')) return {};
         const read = (name) =>
             !!document.querySelector(`#actBrokenModal [data-act-subaction="${name}"]`)?.checked;
         return {search: read('search'), blocklist: read('blocklist')};
@@ -339,11 +339,11 @@ class RepairManager {
         });
         // Sub-actions open on the operator's CONFIGURED policy rather than off,
         // so the modal shows what would actually happen. Components start
-        // unticked (nothing is selected yet); sub-actions describe how RE-GRAB
+        // unticked (nothing is selected yet); sub-actions describe how ARR-DELETE
         // behaves if it is ticked, which is a standing setting, not a selection.
         const subDefaults = {
-            search: !!this.repairConfig.regrab_search,
-            blocklist: !!this.repairConfig.regrab_blocklist,
+            search: !!this.repairConfig.arr_search,
+            blocklist: !!this.repairConfig.arr_blocklist,
         };
         document.querySelectorAll('#actBrokenModal [data-act-subaction]').forEach((cb) => {
             cb.checked = !!subDefaults[cb.getAttribute('data-act-subaction')];
@@ -397,7 +397,7 @@ class RepairManager {
     }
 
     // renderActBrokenConfirm names EXACTLY which components will run and calls
-    // out the destructive ones (PRUNE / RE-GRAB) before anything is sent.
+    // out the destructive ones (PRUNE / ARR-DELETE) before anything is sent.
     renderActBrokenConfirm(components) {
         const labels = components.map((c) => this.fixComponentMeta(c).label);
         const target = document.getElementById('actBrokenConfirmComponents');
@@ -420,7 +420,7 @@ class RepairManager {
     }
 
     // fixBroken posts /repair/fix ONCE for every selected component over the
-    // whole broken set. components ⊆ {repair, prune, regrab} and compose, so
+    // whole broken set. components ⊆ {repair, prune, arr_delete} and compose, so
     // two ticked components mean one request with both flags true.
     async fixBroken(components) {
         const list = (Array.isArray(components) ? components : [components]).filter(Boolean);
@@ -436,8 +436,8 @@ class RepairManager {
                     actions: {
                         repair: list.includes('repair'),
                         prune: list.includes('prune'),
-                        regrab: list.includes('regrab'),
-                        ...this.selectedRegrabSubActions(list),
+                        arr_delete: list.includes('arr_delete'),
+                        ...this.selectedArrSubActions(list),
                     },
                 }),
             });
@@ -642,9 +642,9 @@ class RepairManager {
             ['repair_skipped_unsupported', 'Repair n/a'],
             ['pruned', 'Pruned'],
             ['prune_skipped_not_eligible', 'Prune skipped'],
-            ['regrabbed', 'Re-grabbed'],
-            ['regrab_failed', 'Re-grab fail'],
-            ['regrab_skipped_no_arr_link', 'Re-grab no arr'],
+            ['arr_deleted', 'Arr deleted'],
+            ['arr_delete_failed', 'Arr delete fail'],
+            ['arr_skipped_no_link', 'Arr no link'],
             ['deletions', 'Deletions'],
             ['deletion_cap_skipped', 'Cap-skipped'],
         ];
@@ -758,7 +758,7 @@ class RepairManager {
                         </button>
                         <button class="btn btn-xs btn-info btn-outline font-semibold" data-action="fix" data-component="repair" data-name="${this.escapeAttr(h.entry_name)}" title="REPAIR — re-acquire on same/backup provider" aria-label="Repair ${this.escape(h.entry_name)}">R</button>
                         <button class="btn btn-xs btn-warning btn-outline font-semibold" data-action="fix" data-component="prune" data-name="${this.escapeAttr(h.entry_name)}" title="PRUNE — delete decypharr-side, arr keeps monitoring" aria-label="Prune ${this.escape(h.entry_name)}">P</button>
-                        <button class="btn btn-xs btn-error btn-outline font-semibold" data-action="fix" data-component="regrab" data-name="${this.escapeAttr(h.entry_name)}" title="RE-GRAB — arr delete + blocklist + search" aria-label="Re-grab ${this.escape(h.entry_name)}">G</button>
+                        <button class="btn btn-xs btn-error btn-outline font-semibold" data-action="fix" data-component="arr_delete" data-name="${this.escapeAttr(h.entry_name)}" title="ARR-DELETE — delete the arr's file record" aria-label="Arr-delete ${this.escape(h.entry_name)}">G</button>
                     </div>
                 </td>
             `;
@@ -808,8 +808,8 @@ class RepairManager {
             rows.push(`<div><span class="font-semibold text-error">REPAIR failed:</span> ${this.escape(h.last_repair_error)}</div>`);
         }
         const skips = h.action_skips || {};
-        const labels = {repair: 'REPAIR', prune: 'PRUNE', regrab: 'RE-GRAB'};
-        for (const key of ['repair', 'prune', 'regrab']) {
+        const labels = {repair: 'REPAIR', prune: 'PRUNE', arr_delete: 'ARR-DELETE'};
+        for (const key of ['repair', 'prune', 'arr_delete']) {
             if (!skips[key]) continue;
             rows.push(`<div><span class="font-semibold text-warning">${labels[key]} declined:</span> ${this.escape(skips[key])}</div>`);
         }
@@ -975,9 +975,9 @@ class RepairManager {
                 + annotate('repair_skipped_unsupported', 'text-warning', 'n/a');
             const prunedCell = `${s.pruned ?? 0}`
                 + annotate('prune_skipped_not_eligible', 'text-warning', 'skipped');
-            const regrabbedCell = `${s.regrabbed ?? 0}`
-                + annotate('regrab_failed', 'text-error', 'fail')
-                + annotate('regrab_skipped_no_arr_link', 'text-warning', 'no arr');
+            const arrDeletedCell = `${s.arr_deleted ?? 0}`
+                + annotate('arr_delete_failed', 'text-error', 'fail')
+                + annotate('arr_skipped_no_link', 'text-warning', 'no arr');
             tr.innerHTML = `
                 <td class="font-mono text-sm">${start ? start.toLocaleString() : '-'}</td>
                 <td>${this.escape(run.trigger || '-')}</td>
@@ -986,7 +986,7 @@ class RepairManager {
                 <td class="${s.broken ? 'text-error font-medium' : ''}">${s.broken ?? 0}</td>
                 <td class="${s.reacquired ? 'text-success font-medium' : ''}">${repairedCell}</td>
                 <td class="${s.pruned ? 'text-warning font-medium' : ''}">${prunedCell}</td>
-                <td class="${s.regrabbed ? 'text-info font-medium' : ''}">${regrabbedCell}</td>
+                <td class="${s.arr_deleted ? 'text-info font-medium' : ''}">${arrDeletedCell}</td>
                 <td class="${deletions ? 'font-medium' : ''}">${deletionsCell}</td>
                 <td>${duration}</td>
                 <td class="text-xs text-error">${this.escape(run.error || '')}</td>
@@ -1048,10 +1048,10 @@ class RepairManager {
 // attributes and must stay free of quotes and markup.
 RepairManager.STAT_TITLES = {
     repair_failed: 'REPAIR: re-acquire attempts that errored',
-    repair_skipped_unsupported: 'REPAIR declined: the entry protocol cannot be re-acquired (nzb entries can only be RE-GRABbed or PRUNEd)',
+    repair_skipped_unsupported: 'REPAIR declined: the entry protocol cannot be re-acquired (nzb entries can only be ARR-DELETEbed or PRUNEd)',
     prune_skipped_not_eligible: 'PRUNE declined: only some files in the entry are broken, so deleting the whole entry would be wrong',
-    regrab_failed: 'RE-GRAB: arr-side failures (file delete / blocklist / search)',
-    regrab_skipped_no_arr_link: 'RE-GRAB declined: the entry has no resolved arr link to route through',
+    arr_delete_failed: 'ARR-DELETE: arr-side failures (arr file-record delete)',
+    arr_skipped_no_link: 'ARR-DELETE declined: the entry has no resolved arr link to route through',
 };
 
 window.RepairManager = RepairManager;

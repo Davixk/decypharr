@@ -115,6 +115,20 @@ func mergeMissingFields(dst, from reflect.Value, posted map[string]any) {
 		if !ok {
 			value, ok = folded[strings.ToLower(name)]
 		}
+		// A renamed field carries its previous JSON key in an `alias` tag. A
+		// caller using the old name IS speaking about this field, so the alias
+		// counts as mentioned — otherwise a PATCH sending only the deprecated key
+		// would be silently overwritten from the live config, the exact opposite
+		// of what the caller asked for. The struct's UnmarshalJSON is what puts
+		// the aliased VALUE onto the current field; this settles only presence.
+		if !ok {
+			if alias := field.Tag.Get("alias"); alias != "" {
+				_, ok = posted[alias]
+				if !ok {
+					_, ok = folded[strings.ToLower(alias)]
+				}
+			}
+		}
 		if !ok {
 			// Never mentioned: keep what is currently configured.
 			dst.Field(i).Set(from.Field(i))

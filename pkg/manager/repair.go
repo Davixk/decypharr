@@ -41,7 +41,7 @@ type RepairRunOptions struct {
 	IgnoreLastChecked bool
 	// Actions, when non-nil, is an explicit per-component override for this
 	// one-off run (from the Run modal). Nil means use the configured
-	// REPAIR/PRUNE/RE-GRAB knobs.
+	// REPAIR/PRUNE/ARR-DELETE knobs.
 	Actions        *ManualActions
 	UnrestrictLink bool
 	ProtocolScope  string
@@ -106,49 +106,55 @@ func (r *Repair) cfg() config.RepairConfig { return config.Get().Repair }
 // dead item after CHECK has found it. The four components are independent and
 // individually knob-gated:
 //
-//   - repair (REPAIR)  — re-acquire the item across providers. Non-destructive.
-//   - prune  (PRUNE)   — delete the item decypharr-side only (no arr). Destructive.
-//   - regrab (RE-GRAB) — DELETE the arr's file record. Destructive.
+//   - repair    (REPAIR)     — re-acquire the item across providers. Non-destructive.
+//   - prune     (PRUNE)      — delete the item decypharr-side only (no arr). Destructive.
+//   - arrDelete (ARR-DELETE) — delete the arr's file record. Destructive.
 //
 // CHECK itself (enumerate + probe + record) always runs and is not represented
 // here — it is the detection that produces the dead items these actions target.
 //
-// regrabSearch and regrabBlocklist are SUB-actions of RE-GRAB, not peers of it.
-// They are meaningless on their own — both describe something done to the arr
-// alongside the delete — so both are gated on regrab and neither appears in
-// any(), destructive() or label() as an independent component. Keeping them
-// subordinate is what preserves the invariant that RE-GRAB is the only
-// arr-coupled component: with regrab off, nothing here can reach the arr.
+// arrDelete was called REGRAB until the acts were split apart. With search and
+// blocklist now separately gated and both defaulting off, the component's
+// default behaviour grabs nothing whatsoever, so the old name asserted the
+// opposite of what it does.
+//
+// search and blocklist are SUB-actions of arrDelete, not peers of it. They are
+// meaningless on their own — both describe something done to the arr alongside
+// the delete — so both are gated on arrDelete and neither appears in any(),
+// destructive() or label() as an independent component. Keeping them subordinate
+// is what preserves the invariant that this is the only arr-coupled component:
+// with arrDelete off, nothing here can reach the arr.
 type repairActions struct {
-	repair          bool
-	prune           bool
-	regrab          bool
-	regrabSearch    bool
-	regrabBlocklist bool
+	repair    bool
+	prune     bool
+	arrDelete bool
+	search    bool
+	blocklist bool
 }
 
-// arrSearch / arrBlocklist resolve the sub-actions with their gate applied, so
-// no caller has to remember to && with regrab.
-func (a repairActions) arrSearch() bool    { return a.regrab && a.regrabSearch }
-func (a repairActions) arrBlocklist() bool { return a.regrab && a.regrabBlocklist }
+// wantSearch / wantBlocklist resolve the sub-actions with their gate applied, so
+// no caller has to remember to && with arrDelete.
+func (a repairActions) wantSearch() bool    { return a.arrDelete && a.search }
+func (a repairActions) wantBlocklist() bool { return a.arrDelete && a.blocklist }
 
 // destructive reports whether any component that consumes a per-run deletion
-// slot is enabled (PRUNE and RE-GRAB). REPAIR is non-destructive.
-func (a repairActions) destructive() bool { return a.prune || a.regrab }
+// slot is enabled (PRUNE and ARR-DELETE). REPAIR is non-destructive.
+func (a repairActions) destructive() bool { return a.prune || a.arrDelete }
 
 // any reports whether any action component is enabled. When false the run is
 // CHECK-only: probe and record health, take no further action.
-func (a repairActions) any() bool { return a.repair || a.prune || a.regrab }
+func (a repairActions) any() bool { return a.repair || a.prune || a.arrDelete }
 
 // label renders the enabled components as a compact "+"-joined string for the
 // run's Source field (traceability), e.g. "repair+prune". "check-only" when no
 // component is set.
 //
-// RE-GRAB renders its enabled sub-actions inline — "regrab(delete+search)" —
-// rather than as bare "regrab". A run record that just says "regrab" no longer
-// says what was done to the arr, and the whole point of the split is that
-// delete, search and blocklist are now different acts with different blast
-// radii. "delete" is always listed because RE-GRAB always deletes.
+// The arr component renders its enabled sub-actions inline —
+// "arr(delete+search)" — rather than as a bare component name. A run record that
+// just names the component no longer says what was done to the arr, and the
+// whole point of the split is that delete, search and blocklist are different
+// acts with different blast radii. "delete" is always listed because the
+// component always deletes.
 func (a repairActions) label() string {
 	parts := make([]string, 0, 3)
 	if a.repair {
@@ -157,15 +163,15 @@ func (a repairActions) label() string {
 	if a.prune {
 		parts = append(parts, "prune")
 	}
-	if a.regrab {
+	if a.arrDelete {
 		sub := []string{"delete"}
-		if a.regrabSearch {
+		if a.search {
 			sub = append(sub, "search")
 		}
-		if a.regrabBlocklist {
+		if a.blocklist {
 			sub = append(sub, "blocklist")
 		}
-		parts = append(parts, "regrab("+strings.Join(sub, "+")+")")
+		parts = append(parts, "arr("+strings.Join(sub, "+")+")")
 	}
 	if len(parts) == 0 {
 		return "check-only"
@@ -174,16 +180,16 @@ func (a repairActions) label() string {
 }
 
 // resolveActions maps the configured component knobs directly to the
-// per-component action set: REPAIR defaults on (RepairEnabled), PRUNE/RE-GRAB
+// per-component action set: REPAIR defaults on (RepairEnabled), PRUNE/ARR-DELETE
 // default off. There is no master gate — the run is CHECK-only (no REPAIR/
-// PRUNE/RE-GRAB) exactly when all three knobs are off.
+// PRUNE/ARR-DELETE) exactly when all three knobs are off.
 func resolveActions(cfg config.RepairConfig) repairActions {
 	return repairActions{
-		repair:          cfg.RepairEnabled(),
-		prune:           cfg.Prune,
-		regrab:          cfg.Regrab,
-		regrabSearch:    cfg.RegrabSearch,
-		regrabBlocklist: cfg.RegrabBlocklist,
+		repair:    cfg.RepairEnabled(),
+		prune:     cfg.Prune,
+		arrDelete: cfg.ArrDeleteEnabled(),
+		search:    cfg.ArrSearch,
+		blocklist: cfg.ArrBlocklist,
 	}
 }
 
@@ -196,24 +202,34 @@ func resolveActions(cfg config.RepairConfig) repairActions {
 type ManualActions struct {
 	Repair bool `json:"repair"`
 	Prune  bool `json:"prune"`
-	Regrab bool `json:"regrab"`
 
-	// Search / Blocklist override RE-GRAB's sub-actions for this one call. Both
-	// are *bool, and nil means "not specified" — the CONFIGURED knob is used.
-	// They are not part of any(): naming only a sub-action selects no component
-	// and must not make an otherwise-empty selection look non-empty, or
+	// ArrDelete selects the arr-side component. Regrab is its deprecated alias,
+	// accepted so API clients written before the rename keep working; resolve
+	// with arrDeleteSelected(), never by reading either field.
+	ArrDelete bool `json:"arr_delete"`
+	Regrab    bool `json:"regrab"` // Deprecated: use ArrDelete.
+
+	// Search / Blocklist override the arr component's sub-actions for this one
+	// call. Both are *bool, and nil means "not specified" — the CONFIGURED knob
+	// is used. They are not part of any(): naming only a sub-action selects no
+	// component and must not make an otherwise-empty selection look non-empty, or
 	// {"blocklist":true} alone would resurrect the all-false footgun that
 	// resolveManualActions exists to prevent.
 	Search    *bool `json:"search,omitempty"`
 	Blocklist *bool `json:"blocklist,omitempty"`
 }
 
+// arrDeleteSelected accepts either the current key or the deprecated alias.
+func (a *ManualActions) arrDeleteSelected() bool {
+	return a != nil && (a.ArrDelete || a.Regrab)
+}
+
 func (a *ManualActions) any() bool {
-	return a != nil && (a.Repair || a.Prune || a.Regrab)
+	return a != nil && (a.Repair || a.Prune || a.arrDeleteSelected())
 }
 
 // toActions converts an explicit component selection into a full action set,
-// resolving the RE-GRAB sub-actions against cfg. Every caller that overrides the
+// resolving the arr sub-actions against cfg. Every caller that overrides the
 // configured knobs with an opts.Actions selection goes through here, so none of
 // them can forget to carry the sub-actions and silently fall back to the
 // zero-value (search off, blocklist off) when the operator configured otherwise.
@@ -223,15 +239,15 @@ func (a *ManualActions) toActions(cfg config.RepairConfig) repairActions {
 	}
 	search, blocklist := a.subActions(cfg)
 	return repairActions{
-		repair: a.Repair, prune: a.Prune, regrab: a.Regrab,
-		regrabSearch: search, regrabBlocklist: blocklist,
+		repair: a.Repair, prune: a.Prune, arrDelete: a.arrDeleteSelected(),
+		search: search, blocklist: blocklist,
 	}
 }
 
-// subActions resolves this selection's RE-GRAB sub-actions against the
-// configured defaults, honouring an explicit override when one was supplied.
+// subActions resolves this selection's arr sub-actions against the configured
+// defaults, honouring an explicit override when one was supplied.
 func (a *ManualActions) subActions(cfg config.RepairConfig) (search, blocklist bool) {
-	search, blocklist = cfg.RegrabSearch, cfg.RegrabBlocklist
+	search, blocklist = cfg.ArrSearch, cfg.ArrBlocklist
 	if a == nil {
 		return search, blocklist
 	}
@@ -252,14 +268,14 @@ func (a *ManualActions) subActions(cfg config.RepairConfig) (search, blocklist b
 //   - sel names ≥1 component                → exactly those components (single-
 //     component invocation, e.g. PRUNE-only, works here).
 //   - sel is nil but fix == true            → fall back to the CONFIGURED
-//     REPAIR/PRUNE/RE-GRAB knobs (back-compat with the old fix:true clients) —
+//     REPAIR/PRUNE/ARR-DELETE knobs (back-compat with the old fix:true clients) —
 //     NOT force-all, fixing the previous force-all footgun.
 //   - otherwise                             → CHECK-only (no action).
 //
 // The first rule is the root-cause fix for the all-false footgun. Gating on
 // sel.any() alone made an explicit all-false selection indistinguishable from a
 // nil one, so it fell through to the configured knobs and could run PRUNE /
-// RE-GRAB on a request that asked for nothing. The HTTP layer now rejects that
+// ARR-DELETE on a request that asked for nothing. The HTTP layer now rejects that
 // shape with a 400 before it ever reaches here, but the guard belongs at the
 // source: every non-HTTP caller of FixBroken / RecheckEntry / RecheckMedia gets
 // it too, and the two layers agree rather than conflict (both resolve an
@@ -595,7 +611,7 @@ func (r *Repair) StopRun() error {
 // stopActiveRepairSweep is invoked by the StopSchedule job. Unlike StopRun, this is
 // not a user-initiated abort: the repair sweep is marked completed (not cancelled),
 // and whether whatever was found broken up to this point gets acted on is
-// decided by the enabled REPAIR / PRUNE / RE-GRAB components. With no active
+// decided by the enabled REPAIR / PRUNE / ARR-DELETE components. With no active
 // repair sweep this is a no-op.
 func (r *Repair) stopActiveRepairSweep() {
 	r.mu.Lock()
@@ -848,7 +864,7 @@ func discordContextFor(run *storage.RepairRun) string {
 		run.ID, run.Trigger, run.Source, run.Status,
 		run.StartedAt.Format(dateFmt), run.CompletedAt.Format(dateFmt),
 		run.Stats.Probed, run.Stats.Broken,
-		run.Stats.Reacquired, run.Stats.Pruned, run.Stats.Regrabbed,
+		run.Stats.Reacquired, run.Stats.Pruned, run.Stats.ArrDeleted,
 	)
 }
 

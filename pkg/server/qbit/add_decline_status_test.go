@@ -22,7 +22,7 @@ import (
 //	                                    and defers every remaining candidate of
 //	                                    that protocol to a LATER cycle
 //
-// This matters more since RE-GRAB stopped blocklisting: same-cycle iteration
+// This matters more since ARR-DELETE stopped blocklisting: same-cycle iteration
 // down the ranked list is now the ONLY thing producing forward progress on a
 // declined release. A regression that surfaced a per-release decline as a
 // client-unavailable error would silently convert "try the next release" into

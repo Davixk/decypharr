@@ -152,7 +152,7 @@ func New(mgr *manager.Manager) *Server {
 		})
 
 		// Webhooks. These are MUTATING endpoints (the Tautulli one can launch
-		// repair work, which may PRUNE/RE-GRAB per the configured knobs), so they
+		// repair work, which may PRUNE/ARR-DELETE per the configured knobs), so they
 		// are authenticated like every other mutating surface — see
 		// webhookRoutes/webhookAuthMiddleware in webhook.go. They were previously
 		// registered here, outside the auth group, and needed no credentials.

@@ -58,10 +58,12 @@ const (
 //	PRUNE   → Pruned: entries deleted decypharr-side (no arr call).
 //	          PruneSkippedNotEligible: dead entries PRUNE DECLINED to delete
 //	          because they are not fully broken / carry no infohash.
-//	RE-GRAB → Regrabbed: arr file records deleted + blocklisted + re-searched;
-//	          RegrabFailed counts arr file deletes that errored;
-//	          RegrabSkippedNoArrLink counts dead entries with no resolved arr
-//	          link, which RE-GRAB cannot route.
+//	ARR-DELETE → ArrDeleted: arr file records deleted.
+//	          ArrSearched / ArrBlocklisted: the two opt-in sub-actions, counted
+//	          separately so a run says which of the three acts it performed.
+//	          ArrDeleteFailed counts arr file deletes that errored;
+//	          ArrSkippedNoLink counts dead entries with no resolved arr link,
+//	          which ARR-DELETE cannot route.
 //
 // The three *Skipped* counters exist because a component that DECLINES to act
 // is otherwise indistinguishable from a component that never ran: a run that
@@ -71,13 +73,16 @@ const (
 // reason in EntryHealth.ActionSkips.
 //
 // Deletions is how many entries consumed a destructive-deletion slot this run
-// (PRUNE and/or RE-GRAB combined); DeletionCapSkipped is how many broken
+// (PRUNE and/or ARR-DELETE combined); DeletionCapSkipped is how many broken
 // entries were left un-deleted because the per-run cap was already exhausted.
 //
 // NOTE for UI/API consumers: RepairFailed (`repair_failed`) counts REPAIR
-// failures, matching its name. Arr-side RE-GRAB delete failures — which it
-// used to carry — now have their own RegrabFailed (`regrab_failed`), which is
-// the key the run logs already used for them.
+// failures, matching its name. Arr-side delete failures — which it used to
+// carry — have their own ArrDeleteFailed (`arr_delete_failed`).
+//
+// RENAMED 2026-07-31 with the delete/blocklist/search split. Consumers keying on
+// the old names must update: `regrabbed` → `arr_deleted`, `regrab_failed` →
+// `arr_delete_failed`, `regrab_skipped_no_arr_link` → `arr_skipped_no_link`.
 type RepairRunStats struct {
 	Candidates   int `json:"candidates"`
 	SkippedFresh int `json:"skipped_fresh"`
@@ -93,21 +98,24 @@ type RepairRunStats struct {
 	Pruned                  int `json:"pruned"`
 	PruneSkippedNotEligible int `json:"prune_skipped_not_eligible"`
 
-	// Regrabbed counts files whose arr file record RE-GRAB successfully deleted.
-	// Retained under its original name for history/API compatibility, but since
-	// the delete/blocklist/search split it means "the delete succeeded" ONLY — it
-	// no longer implies that a blocklist or a search happened.
+	// The three arr-side acts are counted SEPARATELY, which is the point of the
+	// split: one blended "regrabbed" figure could not tell a run that quietly
+	// banned thousands of releases from one that only tidied up file records.
 	//
-	// ArrDeleted / ArrBlocklisted / ArrSearched report the three acts separately,
-	// which is the point of the split: one `regrabbed` figure could not tell a run
-	// that quietly banned thousands of releases from one that only tidied up file
-	// records. ArrBlocklisted counts grabs (deduped per history id), not files.
-	Regrabbed              int `json:"regrabbed"`
-	ArrDeleted             int `json:"arr_deleted"`
-	ArrBlocklisted         int `json:"arr_blocklisted"`
-	ArrSearched            int `json:"arr_searched"`
-	RegrabFailed           int `json:"regrab_failed"`
-	RegrabSkippedNoArrLink int `json:"regrab_skipped_no_arr_link"`
+	// ArrBlocklisted counts grabs (deduped per history id), not files; the other
+	// two count files.
+	//
+	// The old `regrabbed` counter is GONE rather than kept as an alias. It
+	// duplicated ArrDeleted exactly, and leaving a field named for a grab that no
+	// longer happens is the same class of mistake as the log line that claimed
+	// the arr would self-heal. Run history written before this rename will show
+	// zero in the new columns; run records are a rolling log of sweeps, not
+	// durable accounting.
+	ArrDeleted      int `json:"arr_deleted"`
+	ArrBlocklisted  int `json:"arr_blocklisted"`
+	ArrSearched     int `json:"arr_searched"`
+	ArrDeleteFailed int `json:"arr_delete_failed"`
+	ArrSkippedNoLink int `json:"arr_skipped_no_link"`
 
 	Deletions          int `json:"deletions"`
 	DeletionCapSkipped int `json:"deletion_cap_skipped"`

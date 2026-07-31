@@ -815,9 +815,10 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 		Force             bool   `json:"force,omitempty"`
 		Repair            *bool  `json:"repair,omitempty"`
 		Prune             *bool  `json:"prune,omitempty"`
-		Regrab            *bool  `json:"regrab,omitempty"`
-		Search            *bool  `json:"search,omitempty"`    // RE-GRAB sub-action; nil = configured.
-		Blocklist         *bool  `json:"blocklist,omitempty"` // RE-GRAB sub-action; nil = configured.
+		ArrDelete         *bool  `json:"arr_delete,omitempty"`
+		Regrab            *bool  `json:"regrab,omitempty"` // Deprecated: use arr_delete.
+		Search            *bool  `json:"search,omitempty"`    // ARR-DELETE sub-action; nil = configured.
+		Blocklist         *bool  `json:"blocklist,omitempty"` // ARR-DELETE sub-action; nil = configured.
 		AutoRepair        *bool  `json:"auto_repair,omitempty"` // Deprecated: back-compat only.
 		UnrestrictLink    bool   `json:"unrestrict_link,omitempty"`
 		Protocol          string `json:"protocol,omitempty"`
@@ -853,14 +854,22 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 		v := false
 		prune = &v
 	}
-	regrab := req.Regrab
-	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("regrab"))) {
-	case "1", "true", "yes", "on":
-		v := true
-		regrab = &v
-	case "0", "false", "no", "off":
-		v := false
-		regrab = &v
+	// arr_delete, with `regrab` accepted as the deprecated alias. An explicit
+	// arr_delete always wins so a client that sends both is not surprised by the
+	// stale key.
+	arrDelete := req.ArrDelete
+	if arrDelete == nil {
+		arrDelete = req.Regrab
+	}
+	for _, key := range []string{"regrab", "arr_delete"} {
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key))) {
+		case "1", "true", "yes", "on":
+			v := true
+			arrDelete = &v
+		case "0", "false", "no", "off":
+			v := false
+			arrDelete = &v
+		}
 	}
 	search := req.Search
 	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search"))) {
@@ -890,24 +899,24 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 		autoRepair = &v
 	}
 	// Resolve the one-off per-component override for this run. Explicit
-	// REPAIR/PRUNE/RE-GRAB keys (JSON body or query param) win: if any is present
+	// REPAIR/PRUNE/ARR-DELETE keys (JSON body or query param) win: if any is present
 	// build an explicit override with each absent key defaulting to false.
 	// Otherwise fall back to the deprecated auto_repair flag for old clients:
 	// true → use the configured knobs (nil override); false → explicit all-false
 	// (CHECK-only). With nothing set, use the configured knobs (nil override).
 	//
-	// search / blocklist are RE-GRAB sub-actions and deliberately do NOT appear
+	// search / blocklist are ARR-DELETE sub-actions and deliberately do NOT appear
 	// in the switch condition: naming only a sub-action selects no component, so
 	// on its own it must not manufacture an override. They ride along on an
 	// override that a real component triggered, and are nil (= use the configured
 	// knob) otherwise.
 	var actions *manager.ManualActions
 	switch {
-	case repair != nil || prune != nil || regrab != nil:
+	case repair != nil || prune != nil || arrDelete != nil:
 		actions = &manager.ManualActions{
 			Repair:    repair != nil && *repair,
 			Prune:     prune != nil && *prune,
-			Regrab:    regrab != nil && *regrab,
+			ArrDelete: arrDelete != nil && *arrDelete,
 			Search:    search,
 			Blocklist: blocklist,
 		}
@@ -1152,16 +1161,21 @@ func (s *Server) handleRecheckEntry(w http.ResponseWriter, r *http.Request) {
 // repairActionsBody is the per-component action selection accepted by the
 // manual fix endpoints. A nil *repairActionsBody (the "actions" key absent)
 // means "not specified" → the manager falls back to the configured
-// REPAIR/PRUNE/RE-GRAB knobs (never force-all). Present-but-all-false is an
+// REPAIR/PRUNE/ARR-DELETE knobs (never force-all). Present-but-all-false is an
 // explicit "no components": CHECK-only on the recheck endpoints, and a 400 on
 // /api/repair/fix, which has nothing to do without a component. See
 // explicitNone.
 type repairActionsBody struct {
 	Repair bool `json:"repair"`
 	Prune  bool `json:"prune"`
-	Regrab bool `json:"regrab"`
 
-	// Search / Blocklist override RE-GRAB's sub-actions for this one request.
+	// ArrDelete selects the arr-side component; Regrab is its deprecated alias,
+	// accepted so clients written before the rename keep working. Read them
+	// through arrDeleteSelected(), never directly.
+	ArrDelete bool `json:"arr_delete"`
+	Regrab    bool `json:"regrab"` // Deprecated: use ArrDelete.
+
+	// Search / Blocklist override ARR-DELETE's sub-actions for this one request.
 	// Both are *bool: absent means "not specified", which uses the configured
 	// knob. They are NOT part of explicitNone() — naming only a sub-action
 	// selects no component, and must not make an otherwise-empty selection look
@@ -1176,7 +1190,7 @@ func (b *repairActionsBody) toManager() *manager.ManualActions {
 		return nil
 	}
 	return &manager.ManualActions{
-		Repair: b.Repair, Prune: b.Prune, Regrab: b.Regrab,
+		Repair: b.Repair, Prune: b.Prune, ArrDelete: b.arrDeleteSelected(),
 		Search: b.Search, Blocklist: b.Blocklist,
 	}
 }
@@ -1190,11 +1204,16 @@ func (b *repairActionsBody) toManager() *manager.ManualActions {
 // false either way) and so honors the legacy fix flag for both. On
 // /api/repair/fix — where the manager passes fix=true unconditionally — that
 // turned an explicit all-false selection into a run of the operator's
-// configured REPAIR/PRUNE/RE-GRAB knobs: the exact opposite of what was asked,
+// configured REPAIR/PRUNE/ARR-DELETE knobs: the exact opposite of what was asked,
 // and destructive if prune/regrab are on. Handlers must therefore never pass
 // fix=true when this is true.
 func (b *repairActionsBody) explicitNone() bool {
-	return b != nil && !b.Repair && !b.Prune && !b.Regrab
+	return b != nil && !b.Repair && !b.Prune && !b.arrDeleteSelected()
+}
+
+// arrDeleteSelected accepts either the current key or the deprecated alias.
+func (b *repairActionsBody) arrDeleteSelected() bool {
+	return b != nil && (b.ArrDelete || b.Regrab)
 }
 
 // resolveLegacyFixFlag decides what to pass as the manager's legacy fix flag.
@@ -1214,7 +1233,7 @@ func resolveLegacyFixFlag(actions *repairActionsBody, fix bool) bool {
 // Empty/missing names ⇒ act on every broken entry. A specified "actions" runs
 // exactly those components (single-component invocation supported, e.g.
 // PRUNE-only); omitting "actions" falls back to the configured
-// REPAIR/PRUNE/RE-GRAB knobs. An "actions" object naming NO component is an
+// REPAIR/PRUNE/ARR-DELETE knobs. An "actions" object naming NO component is an
 // explicit no-op and is rejected with 400 rather than silently promoted to the
 // configured knobs.
 func (s *Server) handleFixBroken(w http.ResponseWriter, r *http.Request) {
@@ -1231,11 +1250,11 @@ func (s *Server) handleFixBroken(w http.ResponseWriter, r *http.Request) {
 	// An "actions" object that is PRESENT but names no component is an explicit
 	// "do nothing". This endpoint only ever acts (it never re-probes) and the
 	// manager resolves it with fix=true unconditionally, so passing it through
-	// would run the configured knobs — possibly PRUNE/RE-GRAB — on every broken
+	// would run the configured knobs — possibly PRUNE/ARR-DELETE — on every broken
 	// entry. Refuse it here, with the same message the manager uses when a
 	// selection resolves to no components.
 	if req.Actions.explicitNone() {
-		http.Error(w, "no repair action selected: enable REPAIR, PRUNE, or RE-GRAB", http.StatusBadRequest)
+		http.Error(w, "no repair action selected: enable REPAIR, PRUNE, or ARR-DELETE", http.StatusBadRequest)
 		return
 	}
 	svc := s.manager.Repair()

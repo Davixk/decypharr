@@ -126,7 +126,7 @@ type fileResult struct {
 const (
 	componentRepair = "repair"
 	componentPrune  = "prune"
-	componentRegrab = "regrab"
+	componentArrDelete = "arr_delete"
 )
 
 // Machine-readable reasons recorded when a component DECLINES to act, or when a
@@ -139,7 +139,7 @@ const (
 	// re-inserted — Entry.CanBeFixed() is literally IsTorrent(). Usenet has no
 	// analogue: the articles either exist on the news servers or they do not,
 	// and re-parsing the same NZB asks the same providers for the same message
-	// ids. A dead nzb is recovered by RE-GRAB (a fresh NZB from the indexer) or
+	// ids. A dead nzb is recovered by ARR-DELETE (a fresh NZB from the indexer) or
 	// PRUNE, never by REPAIR.
 	reasonRepairUnsupportedProtocol = "repair_unsupported_protocol"
 	// reasonRepairEntryMissing: the health record names an infohash whose entry
@@ -159,9 +159,9 @@ const (
 	reasonPrunePartialEntry  = "prune_partial_entry"
 	reasonPruneNoInfohash    = "prune_no_infohash"
 
-	// reasonRegrabNoArrLink: no broken file resolved to an arr file record, so
+	// reasonArrNoLink: no broken file resolved to an arr file record, so
 	// there is no arr to delete from, blocklist in, or re-search.
-	reasonRegrabNoArrLink = "regrab_no_arr_link"
+	reasonArrNoLink = "arr_no_link"
 
 	// reasonDeletionCapReached: the per-run destructive budget was exhausted
 	// before this entry, so ALL destructive components were skipped for it.
@@ -191,9 +191,9 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	cfg := r.cfg()
 	log := r.logger.With().Str("run_id", run.ID).Logger()
 
-	// Resolve the action set once from the configured REPAIR/PRUNE/RE-GRAB knobs.
+	// Resolve the action set once from the configured REPAIR/PRUNE/ARR-DELETE knobs.
 	// There is no master gate: the sweep is CHECK-only (probe + record, no
-	// REPAIR/PRUNE/RE-GRAB) exactly when all three knobs are off. A one-off run
+	// REPAIR/PRUNE/ARR-DELETE) exactly when all three knobs are off. A one-off run
 	// (Run modal) may pass opts.Actions to override the configured knobs for that
 	// run. This also decides what happens to whatever was found broken so far if
 	// a StopSchedule cuts the sweep short.
@@ -204,7 +204,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 
 	// One destructive-deletion budget for the whole sweep. It bounds how many
 	// entries this run may destructively act on (PRUNE decypharr-delete and/or
-	// RE-GRAB arr-delete), so a provider-wide false "unavailable" can't mass-act
+	// ARR-DELETE arr-delete), so a provider-wide false "unavailable" can't mass-act
 	// on the entire due set in one run. Shared by the inline action pass and any
 	// StopSchedule post-stop pass.
 	budget := r.newDeletionBudget(run.ID)
@@ -212,10 +212,10 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	log.Info().
 		Bool("repair", actions.repair).
 		Bool("prune", actions.prune).
-		Bool("regrab", actions.regrab).
+		Bool("arr_delete", actions.arrDelete).
 		Msg("Sweep: selecting candidates (CHECK: whole managed library)")
 	// CHECK always enumerates the whole hosted library via the managed path.
-	// RE-GRAB targeting (arr linkage) is merged in only when regrab is enabled.
+	// ARR-DELETE targeting (arr linkage) is merged in only when regrab is enabled.
 	candidates, err := r.enumerateCandidates(ctx, cfg, actions)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -258,7 +258,7 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 
 	run.Stage = storage.RepairStageProbing
 	r.saveRun(run)
-	log.Info().Int("due", len(due)).Int("skipped_fresh", skipped).Str("protocol", protocolScope).Bool("repair", actions.repair).Bool("prune", actions.prune).Bool("regrab", actions.regrab).Msg("Sweep: probing")
+	log.Info().Int("due", len(due)).Int("skipped_fresh", skipped).Str("protocol", protocolScope).Bool("repair", actions.repair).Bool("prune", actions.prune).Bool("arr_delete", actions.arrDelete).Msg("Sweep: probing")
 
 	heal := newHealCache()
 	err = r.probeAndHealCandidates(ctx, run, due, names, heal, opts, actions, budget)
@@ -288,12 +288,12 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		Int("repair_skipped_unsupported", run.Stats.RepairSkippedUnsupported).
 		Int("pruned", run.Stats.Pruned).
 		Int("prune_skipped_not_eligible", run.Stats.PruneSkippedNotEligible).
-		Int("regrabbed", run.Stats.Regrabbed).
+		
 		Int("arr_deleted", run.Stats.ArrDeleted).
 		Int("arr_blocklisted", run.Stats.ArrBlocklisted).
 		Int("arr_searched", run.Stats.ArrSearched).
-		Int("regrab_failed", run.Stats.RegrabFailed).
-		Int("regrab_skipped_no_arr_link", run.Stats.RegrabSkippedNoArrLink).
+		Int("arr_delete_failed", run.Stats.ArrDeleteFailed).
+		Int("arr_skipped_no_link", run.Stats.ArrSkippedNoLink).
 		Int("deletions", run.Stats.Deletions).
 		Int("deletion_cap_skipped", run.Stats.DeletionCapSkipped).
 		Msg("Sweep: completed")
@@ -317,7 +317,7 @@ func (r *Repair) finishCancelledRepairSweep(ctx context.Context, run *storage.Re
 	}
 
 	log := r.logger.With().Str("run_id", run.ID).Logger()
-	log.Info().Bool("prune", actions.prune).Bool("regrab", actions.regrab).Msg("Repair sweep: stop schedule fired; finishing run")
+	log.Info().Bool("prune", actions.prune).Bool("arr_delete", actions.arrDelete).Msg("Repair sweep: stop schedule fired; finishing run")
 
 	if actions.destructive() && len(names) > 0 {
 		// Use a fresh, un-cancelled context for the final action pass: the
@@ -327,9 +327,9 @@ func (r *Repair) finishCancelledRepairSweep(ctx context.Context, run *storage.Re
 		repairCtx, cancel := context.WithTimeout(detachedRepairContext(ctx, r.parentCtx), repairStopFinalRepairTimeout)
 		defer cancel()
 
-		// Require an arr file only when RE-GRAB is the sole destructive action;
+		// Require an arr file only when ARR-DELETE is the sole destructive action;
 		// PRUNE can act on entries with no arr link, so don't filter them out.
-		healths, _ := r.collectBrokenHealths(names, actions.regrab && !actions.prune)
+		healths, _ := r.collectBrokenHealths(names, actions.arrDelete && !actions.prune)
 		if healths.Size() > 0 {
 			run.Stage = storage.RepairStageRepairing
 			r.saveRun(run)
@@ -371,10 +371,10 @@ func detachedRepairContext(runCtx, parentCtx context.Context) context.Context {
 //   - REPAIR:  probeEntry runs the debrid re-acquire inline; on success the item
 //     becomes healthy and the pipeline stops for it.
 //   - PRUNE:   if still dead, delete the item decypharr-side only (no arr).
-//   - RE-GRAB: independently, if still dead, delete+blocklist+re-search via the
+//   - ARR-DELETE: independently, if still dead, delete+blocklist+re-search via the
 //     arr (whether or not PRUNE ran).
 //
-// PRUNE and RE-GRAB are bounded per-item by the shared per-run deletion budget.
+// PRUNE and ARR-DELETE are bounded per-item by the shared per-run deletion budget.
 func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.RepairRun, candidates map[string]*candidate, names []string, heal *healCache, opts RepairRunOptions, actions repairActions, budget *repairDeletionBudget) error {
 	// run.Stats has plain int fields, so a single mutex guards every mutation
 	// and the saveRun that follows it.
@@ -403,7 +403,7 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 			}
 
 			// Still dead after REPAIR (re-acquire): run the destructive
-			// components (PRUNE and/or RE-GRAB) for just this item, bounded by
+			// components (PRUNE and/or ARR-DELETE) for just this item, bounded by
 			// the per-run deletion budget. Independent and knob-gated.
 			if h.Status == storage.HealthBroken {
 				r.actOnDeadEntry(gctx, run, &runMu, name, h, actions, budget)
@@ -439,7 +439,7 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 // (≤2 in parallel), runs the REPAIR re-acquire on broken torrents (only when
 // repair is set), then persists final health. When REPAIR heals the item its
 // rolled-up status becomes healthy, which is what stops the downstream
-// PRUNE/RE-GRAB pipeline for it.
+// PRUNE/ARR-DELETE pipeline for it.
 func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, repair bool) (*storage.EntryHealth, repairAttempt) {
 	s := r.manager.storage
 	// Lazily load the entry body. Enumeration only recorded the name, so the
@@ -455,7 +455,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 			// reporting healthy with last_failed_at never set. Downgrade any
 			// such record to `unknown` instead: it stops asserting health while
 			// staying non-actionable (a storage read failure must never trigger
-			// PRUNE/RE-GRAB).
+			// PRUNE/ARR-DELETE).
 			r.downgradeUnverifiableHealth(c.name)
 			return nil, repairAttempt{}
 		}
@@ -550,7 +550,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 // It records `broken`, which is a DESTRUCTIVE-ELIGIBLE class, so state the
 // consequence plainly: an entry with zero probeable files carries zero
 // BrokenFiles, therefore BrokenCount == 0, therefore pruneEligible() is false
-// and entryHealthHasArrLink() is false. Neither PRUNE nor RE-GRAB can act on
+// and entryHealthHasArrLink() is false. Neither PRUNE nor ARR-DELETE can act on
 // it — it is honest and visible without being deletable. `broken` is chosen
 // over `unknown` because the statement being made is "nothing here can be
 // served", which is true and permanent, not "this run could not tell".
@@ -1098,7 +1098,7 @@ func (r *Repair) readPayloadFromURL(ctx context.Context, entry *storage.Entry, f
 // entry has no placement to re-insert; its articles either still exist on the
 // news servers or they do not. Re-parsing the staged NZB asks the same
 // providers for the same message ids and cannot resurrect a 430 or a
-// payload-less article. A dead nzb is recovered by RE-GRAB (a fresh NZB from
+// payload-less article. A dead nzb is recovered by ARR-DELETE (a fresh NZB from
 // the indexer) or PRUNE.
 func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal *healCache) repairAttempt {
 	byHash := make(map[string][]int)
@@ -1159,7 +1159,7 @@ func (r *Repair) tryReacquireInfoHash(ctx context.Context, infoHash, entryName s
 		attempt.unsupported++
 		attempt.skip = reasonRepairUnsupportedProtocol + ":" + string(entry.Protocol)
 		log.Debug().Str("protocol", string(entry.Protocol)).
-			Msg("REPAIR: protocol has no re-acquire path (only torrents can be re-inserted); leaving dead for PRUNE/RE-GRAB")
+			Msg("REPAIR: protocol has no re-acquire path (only torrents can be re-inserted); leaving dead for PRUNE/ARR-DELETE")
 		return false
 	}
 
@@ -1171,7 +1171,7 @@ func (r *Repair) tryReacquireInfoHash(ctx context.Context, infoHash, entryName s
 		// at all look exactly the same.
 		attempt.failed++
 		attempt.err = err.Error()
-		log.Debug().Err(err).Msg("REPAIR: re-acquire failed; leaving dead for PRUNE/RE-GRAB")
+		log.Debug().Err(err).Msg("REPAIR: re-acquire failed; leaving dead for PRUNE/ARR-DELETE")
 		return false
 	}
 	attempt.reacquired++
@@ -1258,7 +1258,7 @@ func firstProtocol(results []fileResult) config.Protocol {
 //
 //	REPAIR  — re-acquire across providers; on success the item is servable and
 //	          the destructive components are skipped for it.
-//	PRUNE / RE-GRAB — if still dead, the destructive pass via actOnDeadEntry.
+//	PRUNE / ARR-DELETE — if still dead, the destructive pass via actOnDeadEntry.
 //
 // The scheduled sweep instead applies REPAIR inline during probing (probeEntry)
 // and only reaches actOnDeadEntry for what's still dead.
@@ -1356,8 +1356,8 @@ func (r *Repair) reacquireDeadEntry(ctx context.Context, run *storage.RepairRun,
 }
 
 // entryHealthHasArrLink reports whether a dead entry carries the arr
-// identifiers RE-GRAB needs to delete + re-search. Best-effort: an entry with
-// no resolved arr link simply can't be RE-GRAB'd (logged, then skipped).
+// identifiers ARR-DELETE needs to delete + re-search. Best-effort: an entry with
+// no resolved arr link simply can't be ARR-DELETE'd (logged, then skipped).
 func entryHealthHasArrLink(h *storage.EntryHealth) bool {
 	for _, bf := range h.BrokenFiles {
 		if bf.ArrName != "" && bf.ArrFileID != 0 {
@@ -1400,15 +1400,15 @@ func pruneEligible(h *storage.EntryHealth) bool { return pruneIneligibleReason(h
 
 // actOnDeadEntry runs the destructive pipeline for one dead item after CHECK
 // found it dead and REPAIR (if enabled) failed to re-acquire it. PRUNE and
-// RE-GRAB are INDEPENDENT and individually knob-gated — RE-GRAB is not gated
+// ARR-DELETE are INDEPENDENT and individually knob-gated — ARR-DELETE is not gated
 // behind PRUNE and vice-versa. Both are bounded by the shared per-run deletion
 // budget: one slot is reserved per dead entry that undergoes any destructive
 // action this run (a provider-wide false "unavailable" therefore can't mass-act
 // on the whole due set in one run). A nil / unlimited budget (single-item
 // paths) always grants. statsMu guards run.Stats across concurrent entries.
 //
-// INVARIANT: PRUNE (pruneDeadEntry) makes ZERO arr API calls — only RE-GRAB
-// (regrabDeadEntry) touches the arr.
+// INVARIANT: PRUNE (pruneDeadEntry) makes ZERO arr API calls — only ARR-DELETE
+// (arrDeleteDeadEntry) touches the arr.
 func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, actions repairActions, budget *repairDeletionBudget) {
 	if h == nil || h.Status != storage.HealthBroken {
 		return
@@ -1422,16 +1422,16 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 	if actions.prune {
 		pruneSkip = pruneIneligibleReason(h)
 	}
-	regrabSkip := ""
-	if actions.regrab && !entryHealthHasArrLink(h) {
-		regrabSkip = reasonRegrabNoArrLink
+	arrSkip := ""
+	if actions.arrDelete && !entryHealthHasArrLink(h) {
+		arrSkip = reasonArrNoLink
 	}
 
-	wantRegrab := actions.regrab && regrabSkip == ""
+	wantArrDelete := actions.arrDelete && arrSkip == ""
 	wantPrune := actions.prune && pruneSkip == ""
 
-	if regrabSkip != "" {
-		r.logger.Debug().Str("component", "RE-GRAB").Str("entry", name).Msg("RE-GRAB: no arr link resolved for dead item; cannot re-grab it")
+	if arrSkip != "" {
+		r.logger.Debug().Str("component", "ARR-DELETE").Str("entry", name).Msg("ARR-DELETE: no arr link resolved for dead item; cannot re-grab it")
 	}
 	if pruneSkip != "" {
 		r.logger.Debug().Str("component", "PRUNE").Str("entry", name).
@@ -1440,34 +1440,34 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 			Msg("PRUNE: declined to delete dead item decypharr-side (partial entries keep their surviving files' symlinks)")
 	}
 
-	if !wantRegrab && !wantPrune {
+	if !wantArrDelete && !wantPrune {
 		// Nothing destructive to do (no arr link and not prune-eligible): don't
 		// consume a deletion slot. Non-destructive probes/re-inserts never count
 		// against the cap.
-		r.recordActionSkips(run, statsMu, h, pruneSkip, regrabSkip)
+		r.recordActionSkips(run, statsMu, h, pruneSkip, arrSkip)
 		return
 	}
 
-	// Reserve one destructive slot for this dead entry (covers RE-GRAB and/or
+	// Reserve one destructive slot for this dead entry (covers ARR-DELETE and/or
 	// PRUNE). If the run's cap is exhausted, skip ALL destructive actions for
 	// this entry and leave it dead so it is re-picked next run.
 	if !budget.reserve() {
 		if wantPrune {
 			pruneSkip = reasonDeletionCapReached
 		}
-		if wantRegrab {
-			regrabSkip = reasonDeletionCapReached
+		if wantArrDelete {
+			arrSkip = reasonDeletionCapReached
 		}
-		r.recordActionSkips(run, statsMu, h, pruneSkip, regrabSkip)
+		r.recordActionSkips(run, statsMu, h, pruneSkip, arrSkip)
 		return
 	}
-	r.recordActionSkips(run, statsMu, h, pruneSkip, regrabSkip)
+	r.recordActionSkips(run, statsMu, h, pruneSkip, arrSkip)
 
-	// RE-GRAB first (arr-side), then PRUNE (decypharr-side). Both read only from
-	// the in-memory health record, so order doesn't couple them; RE-GRAB runs
+	// ARR-DELETE first (arr-side), then PRUNE (decypharr-side). Both read only from
+	// the in-memory health record, so order doesn't couple them; ARR-DELETE runs
 	// whether or not PRUNE deletes the entry.
-	if wantRegrab {
-		r.regrabDeadEntry(ctx, run, statsMu, name, h, actions)
+	if wantArrDelete {
+		r.arrDeleteDeadEntry(ctx, run, statsMu, name, h, actions)
 	}
 	if wantPrune && r.pruneDeadEntry(name, h) {
 		statsMu.Lock()
@@ -1477,7 +1477,7 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 	}
 }
 
-// recordActionSkips persists why PRUNE / RE-GRAB declined to act on this entry
+// recordActionSkips persists why PRUNE / ARR-DELETE declined to act on this entry
 // and counts the decline on the run. An empty reason CLEARS that component's
 // stale skip, so the health record always describes the most recent run that
 // considered the entry rather than accumulating history.
@@ -1486,22 +1486,22 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 // run counter (DeletionCapSkipped, from the budget) and counting it as an
 // eligibility decline would misreport a capped run as a policy refusal. The
 // reason still lands on the health record so a per-entry lookup explains it.
-func (r *Repair) recordActionSkips(run *storage.RepairRun, statsMu *sync.Mutex, h *storage.EntryHealth, pruneSkip, regrabSkip string) {
+func (r *Repair) recordActionSkips(run *storage.RepairRun, statsMu *sync.Mutex, h *storage.EntryHealth, pruneSkip, arrSkip string) {
 	if h == nil {
 		return
 	}
 	h.SetActionSkip(componentPrune, pruneSkip)
-	h.SetActionSkip(componentRegrab, regrabSkip)
+	h.SetActionSkip(componentArrDelete, arrSkip)
 
 	countPrune := pruneSkip != "" && pruneSkip != reasonDeletionCapReached
-	countRegrab := regrabSkip != "" && regrabSkip != reasonDeletionCapReached
+	countRegrab := arrSkip != "" && arrSkip != reasonDeletionCapReached
 	if (countPrune || countRegrab) && run != nil && statsMu != nil {
 		statsMu.Lock()
 		if countPrune {
 			run.Stats.PruneSkippedNotEligible++
 		}
 		if countRegrab {
-			run.Stats.RegrabSkippedNoArrLink++
+			run.Stats.ArrSkippedNoLink++
 		}
 		r.saveRun(run)
 		statsMu.Unlock()
@@ -1509,13 +1509,13 @@ func (r *Repair) recordActionSkips(run *storage.RepairRun, statsMu *sync.Mutex, 
 	r.saveHealth(h)
 }
 
-// regrabDeadEntry is the RE-GRAB component: the ONLY arr-coupled action. For a
+// arrDeleteDeadEntry is the ARR-DELETE component: the ONLY arr-coupled action. For a
 // dead item it deletes the arr file record, and — each only when separately
 // enabled — blocklists the grab and/or triggers a search, per arr. It does not
 // delete anything decypharr-side and does not verify the outcome
 // (SearchMissing/MarkHistoryFailed only queue work; the next sweep verifies).
 // statsMu guards run.Stats across concurrent entries.
-func (r *Repair) regrabDeadEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, actions repairActions) {
+func (r *Repair) arrDeleteDeadEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, h *storage.EntryHealth, actions repairActions) {
 	// An entry's broken files normally all belong to one arr, but a merged
 	// candidate can span more — group defensively.
 	byArr := make(map[string][]arr.ContentFile)
@@ -1551,11 +1551,11 @@ func (r *Repair) regrabDeadEntry(ctx context.Context, run *storage.RepairRun, st
 			// that performed neither — and after the split, neither is the
 			// default. A log line that overstates the action is worse than none:
 			// it is the record the operator reasons from afterwards.
-			r.logger.Info().Str("component", "RE-GRAB").Str("entry", name).Str("arr", arrName).
+			r.logger.Info().Str("component", "ARR-DELETE").Str("entry", name).Str("arr", arrName).
 				Int("files", len(files)).
-				Bool("blocklisted", actions.arrBlocklist()).
-				Bool("searched", actions.arrSearch()).
-				Msg("RE-GRAB: deleted arr file records")
+				Bool("blocklisted", actions.wantBlocklist()).
+				Bool("searched", actions.wantSearch()).
+				Msg("ARR-DELETE: deleted arr file records")
 		}
 	}
 	h.LastRepairAt = time.Now()
@@ -1586,7 +1586,7 @@ func (r *Repair) regrabDeadEntry(ctx context.Context, run *storage.RepairRun, st
 // must have survived Clean.
 //
 // So after PRUNE the arr is left holding a dangling symlink indefinitely. For an
-// entry WITH an arr link, RE-GRAB (when enabled) is what actually clears the arr
+// entry WITH an arr link, ARR-DELETE (when enabled) is what actually clears the arr
 // side. For the regrab_no_arr_link population there is currently NO path that
 // cleans it up from either side — closing that is arr-side work, not a reason to
 // add coupling here.
@@ -1626,7 +1626,7 @@ func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) bool {
 	return true
 }
 
-// repairArrFiles performs RE-GRAB's arr-side work for one Arr: it ALWAYS deletes
+// repairArrFiles performs ARR-DELETE's arr-side work for one Arr: it ALWAYS deletes
 // the broken file records, and then — only when separately enabled — searches for
 // replacements and/or blocklists the grabs. Returns true when the delete
 // succeeded (so the caller may consider the files handled). Concurrency is
@@ -1655,7 +1655,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// worth the API calls when blocklisting is actually on. Deduped per arr: a
 	// season-pack grab covers multiple broken files but needs one failed POST.
 	historyIDs := make(map[int]struct{})
-	if actions.arrBlocklist() {
+	if actions.wantBlocklist() {
 		for _, f := range files {
 			if ctx != nil && ctx.Err() != nil {
 				return false
@@ -1678,25 +1678,21 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 		}
 	}
 
-	// ACT 1 — DELETE. Always runs; this is what RE-GRAB now means on its own.
+	// ACT 1 — DELETE. Always runs; this is what ARR-DELETE now means on its own.
 	// Clearing the EpisodeFile/MovieFile rows first also keeps any subsequent
 	// search from being rejected by upgrade-only quality logic.
 	if err := a.DeleteFiles(ctx, files); err != nil {
-		r.logger.Warn().Err(err).Str("arr", a.Name).Msg("RE-GRAB: DeleteFiles failed")
+		r.logger.Warn().Err(err).Str("arr", a.Name).Msg("ARR-DELETE: DeleteFiles failed")
 		statsMu.Lock()
-		// RegrabFailed, not RepairFailed: this is an arr-side RE-GRAB delete
+		// ArrDeleteFailed, not RepairFailed: this is an arr-side ARR-DELETE delete
 		// that errored, which is a different event from a REPAIR (re-acquire)
 		// attempt failing. They shared a counter, so `repair_failed` could not
 		// answer "did REPAIR fail?" — the question the operator actually had.
-		// The run logs already called this one `regrab_failed`.
-		run.Stats.RegrabFailed += len(files)
+		run.Stats.ArrDeleteFailed += len(files)
 		r.saveRun(run)
 		statsMu.Unlock()
 		return false
 	}
-	statsMu.Lock()
-	run.Stats.ArrDeleted += len(files)
-	statsMu.Unlock()
 
 	// ACT 2 — BLOCKLIST, only when explicitly enabled. Errors are non-fatal: the
 	// rows are already cleared and a search (if enabled) can still recover.
@@ -1706,7 +1702,7 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 			break
 		}
 		if err := a.MarkHistoryFailed(id); err != nil {
-			r.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", id).Msg("RE-GRAB: MarkHistoryFailed failed")
+			r.logger.Warn().Err(err).Str("arr", a.Name).Int("history_id", id).Msg("ARR-DELETE: MarkHistoryFailed failed")
 			continue
 		}
 		blocklisted++
@@ -1719,16 +1715,16 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 	// would make the search knob a silent no-op for the majority of files
 	// whenever blocklisting is off, which is now the default.
 	searched := 0
-	if actions.arrSearch() && len(files) > 0 {
+	if actions.wantSearch() && len(files) > 0 {
 		if err := a.SearchMissing(ctx, files); err != nil {
-			r.logger.Warn().Err(err).Str("arr", a.Name).Msg("RE-GRAB: SearchMissing failed")
+			r.logger.Warn().Err(err).Str("arr", a.Name).Msg("ARR-DELETE: SearchMissing failed")
 		} else {
 			searched = len(files)
 		}
 	}
 
 	statsMu.Lock()
-	run.Stats.Regrabbed += len(files)
+	run.Stats.ArrDeleted += len(files)
 	run.Stats.ArrBlocklisted += blocklisted
 	run.Stats.ArrSearched += searched
 	r.saveRun(run)
@@ -1741,10 +1737,10 @@ func (r *Repair) repairArrFiles(ctx context.Context, run *storage.RepairRun, sta
 // enumerateCandidates builds the CHECK candidate set. CHECK always enumerates
 // the WHOLE hosted library via the managed path (every live entry-item, no arr
 // / TMDB / symlink dependency), replacing the old arr-gated enumeration as the
-// default detection. When RE-GRAB is enabled, the arr enumeration is run once
+// default detection. When ARR-DELETE is enabled, the arr enumeration is run once
 // and its arr targeting (arrName/arrKind/contentMap) is merged onto the managed
 // candidates so dead items can be routed to the arr; entries with no arr match
-// are still CHECK'd/REPAIR'd/PRUNE'd, they just can't be RE-GRAB'd. The
+// are still CHECK'd/REPAIR'd/PRUNE'd, they just can't be ARR-DELETE'd. The
 // configured cfg.Source no longer switches detection — it is retained for
 // backward compat only.
 func (r *Repair) enumerateCandidates(ctx context.Context, cfg config.RepairConfig, actions repairActions) (map[string]*candidate, error) {
@@ -1752,7 +1748,7 @@ func (r *Repair) enumerateCandidates(ctx context.Context, cfg config.RepairConfi
 	if err != nil {
 		return out, err
 	}
-	if !actions.regrab {
+	if !actions.arrDelete {
 		return out, nil
 	}
 
@@ -1761,14 +1757,14 @@ func (r *Repair) enumerateCandidates(ctx context.Context, cfg config.RepairConfi
 		if errors.Is(arrErr, context.Canceled) {
 			return out, arrErr
 		}
-		r.logger.Warn().Err(arrErr).Msg("Sweep: arr enumeration for RE-GRAB targeting failed; dead items without an arr link can't be re-grabbed this run")
+		r.logger.Warn().Err(arrErr).Msg("Sweep: arr enumeration for ARR-DELETE targeting failed; dead items without an arr link can't be re-grabbed this run")
 		return out, nil
 	}
 	mergeArrContext(out, arrCands)
 	return out, nil
 }
 
-// mergeArrContext folds RE-GRAB arr targeting (arrName/arrKind/contentMap) from
+// mergeArrContext folds ARR-DELETE arr targeting (arrName/arrKind/contentMap) from
 // an arr enumeration into the already-enumerated managed candidate set without
 // retaining the arr enumeration's loaded entry bodies (managed loads bodies
 // lazily per-entry to bound memory). Arr entries with no managed counterpart are
@@ -2050,7 +2046,7 @@ const (
 	tierNoVerdict sweepTier = iota
 
 	// tierBroken — `broken`. A verdict exists and it is ACTIONABLE NOW: this is
-	// the only tier where REPAIR / PRUNE / RE-GRAB have anything to do. It sits
+	// the only tier where REPAIR / PRUNE / ARR-DELETE have anything to do. It sits
 	// behind tierNoVerdict only because an entry with no verdict may turn out to
 	// be broken too, and finding that out is what makes it actionable.
 	tierBroken
@@ -2215,13 +2211,13 @@ func (r *Repair) markBrokenHealthCleared(h *storage.EntryHealth, at time.Time) {
 
 // FixBroken acts on currently-broken entries WITHOUT reprobing, applying the
 // selected components: REPAIR (re-acquire across providers), PRUNE (delete
-// decypharr-side only) and/or RE-GRAB (arr delete + blocklist + search). When
+// decypharr-side only) and/or ARR-DELETE (arr delete + blocklist + search). When
 // names is empty every entry with Status=broken is acted on. Returns the new
 // RepairRun record immediately; the work runs in the background.
 //
 // Component precedence (resolveManualActions): an explicit selection runs
 // exactly those components — single-component invocation (e.g. PRUNE-only) is
-// supported; a nil selection falls back to the configured REPAIR/PRUNE/RE-GRAB
+// supported; a nil selection falls back to the configured REPAIR/PRUNE/ARR-DELETE
 // knobs — never force-all.
 //
 // Use this from the UI when a previous sweep already identified broken entries
@@ -2241,13 +2237,13 @@ func (r *Repair) FixBroken(ctx context.Context, names []string, sel *ManualActio
 	// all-false sel ⇒ no components ⇒ the error below.
 	actions := r.resolveManualActions(sel, sel == nil)
 	if !actions.any() {
-		return nil, errors.New("no repair action selected: enable REPAIR, PRUNE, or RE-GRAB")
+		return nil, errors.New("no repair action selected: enable REPAIR, PRUNE, or ARR-DELETE")
 	}
 
-	// Require an arr link only when RE-GRAB is the ONLY thing that can act:
+	// Require an arr link only when ARR-DELETE is the ONLY thing that can act:
 	// PRUNE and REPAIR act on entries with no arr link too, so requiring one
 	// would wrongly exclude prune-/repair-eligible broken entries.
-	requireArr := actions.regrab && !actions.prune && !actions.repair
+	requireArr := actions.arrDelete && !actions.prune && !actions.repair
 	healths, wantedCount := r.collectBrokenHealths(names, requireArr)
 	if healths.Size() == 0 {
 		return nil, errors.New("no fixable broken entries")
@@ -2287,7 +2283,7 @@ func (r *Repair) FixBroken(ctx context.Context, names []string, sel *ManualActio
 	}
 
 	// FixBroken is a bulk path (it can act on every broken entry at once), so its
-	// destructive components (PRUNE/RE-GRAB) are bounded by the same per-run
+	// destructive components (PRUNE/ARR-DELETE) are bounded by the same per-run
 	// deletion cap as the scheduled sweep: at most maxDeletionsPerRun entries get
 	// deleted per invocation, the rest stay broken for the next run. REPAIR
 	// re-acquires are non-destructive and never consume a slot.
@@ -2318,12 +2314,12 @@ func (r *Repair) FixBroken(ctx context.Context, names []string, sel *ManualActio
 			Int("repair_skipped_unsupported", run.Stats.RepairSkippedUnsupported).
 			Int("pruned", run.Stats.Pruned).
 			Int("prune_skipped_not_eligible", run.Stats.PruneSkippedNotEligible).
-			Int("regrabbed", run.Stats.Regrabbed).
+			
 			Int("arr_deleted", run.Stats.ArrDeleted).
 			Int("arr_blocklisted", run.Stats.ArrBlocklisted).
 			Int("arr_searched", run.Stats.ArrSearched).
-			Int("regrab_failed", run.Stats.RegrabFailed).
-			Int("regrab_skipped_no_arr_link", run.Stats.RegrabSkippedNoArrLink).
+			Int("arr_delete_failed", run.Stats.ArrDeleteFailed).
+			Int("arr_skipped_no_link", run.Stats.ArrSkippedNoLink).
 			Int("deletions", run.Stats.Deletions).
 			Int("deletion_cap_skipped", run.Stats.DeletionCapSkipped).
 			Msg("FixBroken: completed")
@@ -2358,8 +2354,8 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, sel *Manual
 		ctx = r.parentCtx
 	}
 	r.runWG.Go(func() {
-		// Arr targeting is only needed when RE-GRAB is selected.
-		if actions.regrab {
+		// Arr targeting is only needed when ARR-DELETE is selected.
+		if actions.arrDelete {
 			r.attachArrContext(ctx, c)
 		}
 		heal := newHealCache()
@@ -2375,7 +2371,7 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, sel *Manual
 		// max_deletions_per_run is the ONLY guard against a mass-delete, so no
 		// path that can reach a destructive action may run uncapped: nil here
 		// meant this entry point silently opted out of the cap. actOnDeadEntry
-		// applies only the destructive components (PRUNE/RE-GRAB); REPAIR
+		// applies only the destructive components (PRUNE/ARR-DELETE); REPAIR
 		// already ran inline above.
 		budget := r.newDeletionBudget(runID)
 		r.actOnDeadEntry(ctx, pseudo, &statsMu, entryName, final, actions, budget)
@@ -2531,7 +2527,7 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 		Int("broken", run.Stats.Broken).
 		Int("reacquired", run.Stats.Reacquired).
 		Int("pruned", run.Stats.Pruned).
-		Int("regrabbed", run.Stats.Regrabbed).
+		
 		Str("actions", actions.label()).
 		Msg("RecheckMedia: completed")
 }

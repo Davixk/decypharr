@@ -15,7 +15,7 @@ import (
 // webhookRoutes returns the webhook router, mounted at /webhooks.
 //
 // Every route here is authenticated: these are mutating endpoints that can
-// launch repair work (REPAIR/PRUNE/RE-GRAB), so an unauthenticated caller must
+// launch repair work (REPAIR/PRUNE/ARR-DELETE), so an unauthenticated caller must
 // never reach them. The Tautulli route used to be registered on the parent
 // router, outside the auth group, and required no credentials at all.
 func (s *Server) webhookRoutes() http.Handler {
@@ -86,7 +86,7 @@ func (s *Server) webhookAuthorized(r *http.Request) bool {
 //
 // A payload with NO media id is rejected with 400. It previously fell through
 // to svc.RunNow(...), i.e. a FULL library sweep using the operator's configured
-// REPAIR/PRUNE/RE-GRAB knobs, so a single untargeted notification could mass
+// REPAIR/PRUNE/ARR-DELETE knobs, so a single untargeted notification could mass
 // delete. Nothing about a Tautulli notification implies "sweep the entire
 // library", so the untargeted case is an explicit client error — checked before
 // the repair service is even looked up, so there is no path from an untargeted
@@ -129,7 +129,7 @@ func (s *Server) handleTautulli(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Legacy webhook: no explicit component selection. payload.Fix=true maps to
-	// the configured REPAIR/PRUNE/RE-GRAB knobs (nil selection); fix=false is a
+	// the configured REPAIR/PRUNE/ARR-DELETE knobs (nil selection); fix=false is a
 	// CHECK-only recheck.
 	run, err := svc.RecheckMedia(s.manager.Context(), strings.TrimSpace(payload.Arr), mediaID, nil, payload.Fix)
 	if err != nil {

@@ -10,14 +10,14 @@ import (
 )
 
 // These tests pin the component-explicit manual fix endpoints: a request may
-// drive a SINGLE component (PRUNE-only, RE-GRAB-only, REPAIR-only), and an
-// omitted selection falls back to the CONFIGURED REPAIR/PRUNE/RE-GRAB knobs —
+// drive a SINGLE component (PRUNE-only, ARR-DELETE-only, REPAIR-only), and an
+// omitted selection falls back to the CONFIGURED REPAIR/PRUNE/ARR-DELETE knobs —
 // never the old force-all bundle. They also assert the run record carries the
 // per-component outcome counters.
 
 // TestResolveManualActionsPrecedence pins the precedence rules of
 // resolveManualActions: explicit selection wins; omitted + fix falls back to the
-// configured REPAIR/PRUNE/RE-GRAB knobs (NOT force-all); omitted + no fix is
+// configured REPAIR/PRUNE/ARR-DELETE knobs (NOT force-all); omitted + no fix is
 // CHECK-only.
 func TestResolveManualActionsPrecedence(t *testing.T) {
 	config.Reset()
@@ -34,12 +34,12 @@ func TestResolveManualActionsPrecedence(t *testing.T) {
 		want repairActions
 	}{
 		// An explicit single-component selection is honored verbatim, ignoring
-		// config — this is what makes PRUNE-only / RE-GRAB-only invocation work.
+		// config — this is what makes PRUNE-only / ARR-DELETE-only invocation work.
 		{"explicit_prune_only_wins", &ManualActions{Prune: true}, false,
-			config.RepairConfig{Repair: &on, Prune: true, Regrab: true},
+			config.RepairConfig{Repair: &on, Prune: true, ArrDelete: &on},
 			repairActions{prune: true}},
 		{"explicit_regrab_only", &ManualActions{Regrab: true}, false,
-			config.RepairConfig{}, repairActions{regrab: true}},
+			config.RepairConfig{}, repairActions{arrDelete: true}},
 		// Omitted selection + legacy fix:true → configured knobs. Configured
 		// prune (repair defaults on, regrab off) → NOT force-all.
 		{"omitted_fix_true_uses_configured_not_forceall", nil, true,
@@ -48,7 +48,7 @@ func TestResolveManualActionsPrecedence(t *testing.T) {
 		// All component knobs off + omitted selection → CHECK-only (the footgun
 		// fix: the old code forced all three here).
 		{"omitted_fix_true_all_knobs_off_check_only", nil, true,
-			config.RepairConfig{Repair: &off, Prune: false, Regrab: false},
+			config.RepairConfig{Repair: &off, Prune: false, ArrDelete: &off},
 			repairActions{}},
 		{"omitted_fix_false_check_only", nil, false,
 			config.RepairConfig{Prune: true},
@@ -57,13 +57,13 @@ func TestResolveManualActionsPrecedence(t *testing.T) {
 		// must run nothing — it is NOT "unspecified". This case previously
 		// pinned the opposite (it fell through to the fix path and ran the
 		// configured knobs), which is the all-false footgun: a request asking
-		// for nothing could run the operator's configured PRUNE/RE-GRAB. See
+		// for nothing could run the operator's configured PRUNE/ARR-DELETE. See
 		// TestExplicitAllFalseManualActionsRunsNothing.
 		{"present_all_false_is_explicit_none", &ManualActions{}, true,
-			config.RepairConfig{Repair: &off, Regrab: true},
+			config.RepairConfig{Repair: &off, ArrDelete: &on},
 			repairActions{}},
 		{"present_all_false_is_explicit_none_even_with_destructive_knobs", &ManualActions{}, true,
-			config.RepairConfig{Repair: &on, Prune: true, Regrab: true},
+			config.RepairConfig{Repair: &on, Prune: true, ArrDelete: &on},
 			repairActions{}},
 	}
 	for _, tc := range cases {
@@ -105,17 +105,17 @@ func TestFixBrokenPruneOnly(t *testing.T) {
 	if final.Stats.Pruned != 3 {
 		t.Fatalf("Stats.Pruned = %d, want 3", final.Stats.Pruned)
 	}
-	if final.Stats.Regrabbed != 0 || final.Stats.Reacquired != 0 {
-		t.Fatalf("Stats.Regrabbed=%d Reacquired=%d, want 0/0 (prune-only)", final.Stats.Regrabbed, final.Stats.Reacquired)
+	if final.Stats.ArrDeleted != 0 || final.Stats.Reacquired != 0 {
+		t.Fatalf("Stats.ArrDeleted=%d Reacquired=%d, want 0/0 (prune-only)", final.Stats.ArrDeleted, final.Stats.Reacquired)
 	}
 	if final.Stats.Deletions != 3 {
 		t.Fatalf("Stats.Deletions = %d, want 3", final.Stats.Deletions)
 	}
 }
 
-// TestFixBrokenRegrabOnly pins single-component RE-GRAB via the manual endpoint:
+// TestFixBrokenRegrabOnly pins single-component ARR-DELETE via the manual endpoint:
 // calls the arr (delete + search), does NOT delete the decypharr entry, and
-// records Regrabbed with zero Pruned.
+// records ArrDeleted with zero Pruned.
 func TestFixBrokenRegrabOnly(t *testing.T) {
 	m, r, arrSrv, _ := newRepairCapFixture(t, 0)
 
@@ -131,7 +131,7 @@ func TestFixBrokenRegrabOnly(t *testing.T) {
 	waitRunComplete(t, m, run.ID)
 
 	if got := countExisting(t, m, hashes); got != 3 {
-		t.Fatalf("%d/3 entries remain, want 3 (RE-GRAB never prunes decypharr-side)", got)
+		t.Fatalf("%d/3 entries remain, want 3 (ARR-DELETE never prunes decypharr-side)", got)
 	}
 	if got := arrSrv.deleteCalls(); got != 3 {
 		t.Fatalf("arr DeleteFiles calls = %d, want 3", got)
@@ -140,8 +140,8 @@ func TestFixBrokenRegrabOnly(t *testing.T) {
 	if err != nil || final == nil {
 		t.Fatalf("GetRepairRun: %v", err)
 	}
-	if final.Stats.Regrabbed != 3 {
-		t.Fatalf("Stats.Regrabbed = %d, want 3", final.Stats.Regrabbed)
+	if final.Stats.ArrDeleted != 3 {
+		t.Fatalf("Stats.ArrDeleted = %d, want 3", final.Stats.ArrDeleted)
 	}
 	if final.Stats.Pruned != 0 {
 		t.Fatalf("Stats.Pruned = %d, want 0 (regrab-only)", final.Stats.Pruned)
@@ -149,7 +149,7 @@ func TestFixBrokenRegrabOnly(t *testing.T) {
 }
 
 // TestFixBrokenOmittedFallsBackToConfigured pins that omitting the selection
-// falls back to the configured REPAIR/PRUNE/RE-GRAB knobs — never force-all.
+// falls back to the configured REPAIR/PRUNE/ARR-DELETE knobs — never force-all.
 func TestFixBrokenOmittedFallsBackToConfigured(t *testing.T) {
 	t.Run("all_knobs_off_no_selection_errors", func(t *testing.T) {
 		m, r, _, _ := newRepairCapFixture(t, 0)
@@ -157,7 +157,7 @@ func TestFixBrokenOmittedFallsBackToConfigured(t *testing.T) {
 		cfg := config.Get()
 		cfg.Repair.Repair = &off  // REPAIR off
 		cfg.Repair.Prune = false  // PRUNE off
-		cfg.Repair.Regrab = false // RE-GRAB off
+		cfg.Repair.ArrDelete = &off // ARR-DELETE off
 		seedBrokenEntry(t, m, "fbcfg-a", "FbCfgA")
 
 		if _, err := r.FixBroken(context.Background(), nil, nil); err == nil {
@@ -174,7 +174,7 @@ func TestFixBrokenOmittedFallsBackToConfigured(t *testing.T) {
 		cfg := config.Get()
 		cfg.Repair.Repair = &off // REPAIR off
 		cfg.Repair.Prune = true  // PRUNE on
-		cfg.Repair.Regrab = false
+		cfg.Repair.ArrDelete = &off
 		seedBrokenEntry(t, m, "fbcfg-b", "FbCfgB")
 
 		run, err := r.FixBroken(context.Background(), nil, nil)
@@ -187,7 +187,7 @@ func TestFixBrokenOmittedFallsBackToConfigured(t *testing.T) {
 			t.Fatal("configured PRUNE should have deleted the entry")
 		}
 		if got := arrSrv.totalCalls(); got != 0 {
-			t.Fatalf("configured prune-only made %d arr calls, want 0 (NOT force-all RE-GRAB)", got)
+			t.Fatalf("configured prune-only made %d arr calls, want 0 (NOT force-all ARR-DELETE)", got)
 		}
 	})
 }
@@ -219,8 +219,8 @@ func TestFixBrokenRepairOnlyReacquires(t *testing.T) {
 	if final.Stats.Reacquired != 1 {
 		t.Fatalf("Stats.Reacquired = %d, want 1", final.Stats.Reacquired)
 	}
-	if final.Stats.Pruned != 0 || final.Stats.Regrabbed != 0 {
-		t.Fatalf("Stats.Pruned=%d Regrabbed=%d, want 0/0 (repair-only)", final.Stats.Pruned, final.Stats.Regrabbed)
+	if final.Stats.Pruned != 0 || final.Stats.ArrDeleted != 0 {
+		t.Fatalf("Stats.Pruned=%d ArrDeleted=%d, want 0/0 (repair-only)", final.Stats.Pruned, final.Stats.ArrDeleted)
 	}
 	if h, _ := m.storage.GetEntryHealth("ReacA"); h != nil && h.Status == storage.HealthBroken {
 		t.Fatal("re-acquired entry is still marked broken")

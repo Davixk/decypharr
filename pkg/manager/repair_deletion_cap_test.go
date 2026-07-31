@@ -277,10 +277,10 @@ func TestMaxDeletionsPerRunResolution(t *testing.T) {
 }
 
 // TestSweepEnforcesDeletionCap is the headline case: 5 fully-broken entries, a
-// per-run cap of 2, PRUNE + RE-GRAB on. The scheduled/RunNow sweep path
+// per-run cap of 2, PRUNE + ARR-DELETE on. The scheduled/RunNow sweep path
 // (probeAndHealCandidates -> actOnDeadEntry -> regrab/prune) reserves one budget
 // slot per destructively-acted entry, so it must act on at most 2 entries: 2
-// arr file-record deletes (RE-GRAB) + 2 decypharr entry deletes (PRUNE), leave
+// arr file-record deletes (ARR-DELETE) + 2 decypharr entry deletes (PRUNE), leave
 // the other 3 dead in storage, and WARN.
 //
 // Change vs pre-split: this used to pass a single `autoRepair=true` bool; the
@@ -318,7 +318,7 @@ func TestSweepEnforcesDeletionCap(t *testing.T) {
 
 	budget := r.newDeletionBudget(run.ID)
 	heal := newHealCache()
-	actions := repairActions{repair: true, prune: true, regrab: true}
+	actions := repairActions{repair: true, prune: true, arrDelete: true}
 	if err := r.probeAndHealCandidates(context.Background(), run, candidates, names, heal, RepairRunOptions{}, actions, budget); err != nil {
 		t.Fatalf("probeAndHealCandidates: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestSingleItemHealNotBlockedByCap(t *testing.T) {
 	// Single-item path uses a nil budget: never blocked. actOnDeadEntry applies
 	// only the destructive components, so pass {Prune,Regrab} directly (was
 	// manualFixActions(); repair is a no-op in actOnDeadEntry).
-	destructive := repairActions{prune: true, regrab: true}
+	destructive := repairActions{prune: true, arrDelete: true}
 	seedBrokenEntry(t, m, "single-nil", "SingleNil")
 	hNil, _ := m.storage.GetEntryHealth("SingleNil")
 	run := &storage.RepairRun{ID: uuid.NewString()}
@@ -405,7 +405,7 @@ func TestSingleItemHealNotBlockedByCap(t *testing.T) {
 
 // TestNonDestructiveRepairUnaffectedByCap pins that when no destructive
 // component is enabled (CHECK-only, e.g. all knobs off) the sweep never
-// reaches PRUNE/RE-GRAB, so nothing is deleted and no cap slot is consumed
+// reaches PRUNE/ARR-DELETE, so nothing is deleted and no cap slot is consumed
 // regardless of how many entries are broken.
 func TestNonDestructiveRepairUnaffectedByCap(t *testing.T) {
 	m, r, arrSrv, _ := newRepairCapFixture(t, 2)
