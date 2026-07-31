@@ -312,6 +312,12 @@ func isIdleExpired(lastUsed time.Time, now time.Time) bool {
 func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connection) error) error {
 	var lastErr error
 	var exclusions providerExclusions
+	// unreachable records that some provider could not give an answer at all —
+	// dialled and failed, timed out, was too busy, or could never be acquired.
+	// A content verdict means "this article is not here"; it can only be
+	// generalised to "no provider has it" when every provider actually answered.
+	// See the downgrade at the end of this function.
+	var unreachable error
 
 	for providerAttempts := 0; providerAttempts < len(c.providers); providerAttempts++ {
 		if ctx.Err() != nil {
@@ -320,12 +326,22 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 
 		conn, connProvider, err := c.getAnyAvailableConnection(ctx, exclusions)
 		if err != nil {
-			// Never let an acquire failure overwrite a definitive content
-			// verdict already collected from a provider. Excluding a provider
-			// after a 430 (or a no-payload article) can leave no eligible pool
-			// for the next round; reporting "no available connection" then
-			// would downgrade a real dead-content answer to an infrastructure
-			// error and hide it from the permanent-failure path.
+			// An acquire failure here has two very different causes and they must
+			// not be conflated.
+			//
+			// Usually it is a consequence of OUR OWN exclusions: a provider that
+			// answered 430 is excluded, and with nothing left eligible the next
+			// round cannot acquire. That is not evidence anyone is unreachable, so
+			// the content verdict must survive it — otherwise a real dead-content
+			// answer is downgraded to an infrastructure error and never reaches
+			// the permanent-failure path.
+			//
+			// But if some provider is still un-excluded, it was never asked and we
+			// could not reach it. That IS unreachability, and it means "no provider
+			// serves this" was never established.
+			if c.hasUnexcludedProvider(exclusions) {
+				unreachable = err
+			}
 			if !IsContentMissingError(lastErr) {
 				lastErr = err
 			}
@@ -450,6 +466,10 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			case ErrorTypeArticleNotFound:
 				excludeForArticleNotFound(&exclusions, errorProvider)
 			case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
+				// This provider was asked and could not answer. It is excluded from
+				// further rounds, but it must not count towards "every provider says
+				// no" — it said nothing.
+				unreachable = err
 				exclusions.excludeHost(errorProvider.Host)
 			case ErrorTypeYencDecode:
 				if !IsArticlePayloadMissingError(err) {
@@ -467,6 +487,8 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				return err
 			}
 		} else if customerror.IsPanicError(err) {
+			// A panic tells us nothing about whether the article exists.
+			unreachable = err
 			exclusions.excludeHost(errorProvider.Host)
 		} else {
 			// Unknown error type - return immediately
@@ -474,10 +496,44 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		}
 	}
 
+	// A content verdict only generalises to "no configured provider serves this"
+	// when every provider actually answered. If any of them was unreachable —
+	// never acquired, dial failed, timed out, too busy, panicked — then one
+	// provider saying 430 has NOT established that the others cannot serve it,
+	// and reporting a content verdict would let an outage on our side harden
+	// into a permanent statement about someone else's release.
+	//
+	// This is the mixed case of the same principle the probe classifier already
+	// applies to the all-infrastructure case: a provider being unreachable is a
+	// fact about us, not about the content. Downgrading here makes the caller
+	// treat it as indeterminate — accept and queue for retry — instead of
+	// refusing outright.
+	//
+	// With a single provider this cannot trigger: the loop runs once, so either
+	// that provider answered (verdict stands) or it did not (already an
+	// infrastructure error).
+	if IsContentMissingError(lastErr) && unreachable != nil {
+		return NewNoAvailableConnectionError(
+			"content verdict not established: a provider answered 'article not found' but another could not be reached",
+			unreachable)
+	}
+
 	if lastErr != nil {
 		return lastErr
 	}
 	return NewNoAvailableConnectionError("all providers failed", nil)
+}
+
+// hasUnexcludedProvider reports whether any configured provider has NOT been
+// excluded yet, i.e. was never asked. Used to tell an acquire failure caused by
+// our own exclusions apart from one caused by a provider we could not reach.
+func (c *Client) hasUnexcludedProvider(exclusions providerExclusions) bool {
+	for _, provider := range c.providers {
+		if !exclusions.excludes(provider) {
+			return true
+		}
+	}
+	return false
 }
 
 // returnOrReleaseConn returns a connection to the pool or releases it if closed

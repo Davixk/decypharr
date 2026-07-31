@@ -71,15 +71,41 @@ func TestProviderPoolAcquireTimeoutDoesNotPoisonRecovery(t *testing.T) {
 	}
 }
 
+// Both providers answered, and both said the article is not there. "No provider
+// serves this" IS established, so the caller gets a content verdict.
 func TestFailoverExcludesProviderThatProducedTerminalArticleMissing(t *testing.T) {
-	testFailoverExcludesTerminalProvider(t, &Error{Type: ErrorTypeArticleNotFound, Code: 430, Message: "No Such Article"})
+	testFailoverExcludesTerminalProvider(t,
+		&Error{Type: ErrorTypeArticleNotFound, Code: 430, Message: "No Such Article"},
+		true)
 }
 
-func TestFailoverExcludesProviderThatProducedTerminalConnectionError(t *testing.T) {
-	testFailoverExcludesTerminalProvider(t, &Error{Type: ErrorTypeConnection, Message: "provider B disconnected"})
+// Provider B was asked and could NOT answer (it disconnected); provider A said
+// 423. That does not establish that no provider serves the article — B never
+// gave an opinion — so the result must be indeterminate, NOT a content verdict.
+//
+// This assertion is the reverse of what it was before 2026-08-01. It used to
+// expect article-not-found, conflating "the one provider that answered says no"
+// with "nobody has it". Under the rule the operator stated — at least one
+// provider must be able to serve it, and refuse only once that is *established*
+// — an unreachable provider must never harden into a permanent statement about
+// somebody else's release. Same principle as an all-infrastructure failure
+// staying indeterminate; this is just the mixed case.
+//
+// Consequence worth being explicit about: this widens beyond the usenet add
+// gate that motivated it. Every consumer of the verdict (repair probes, the
+// permanent-failure path) now also refuses to call an article dead while a
+// provider was unreachable. That is the intended direction — a false permanent
+// verdict is worse than a retry — but it is a real change in blast radius.
+func TestFailoverConnectionErrorOnOneProviderYieldsIndeterminate(t *testing.T) {
+	testFailoverExcludesTerminalProvider(t,
+		&Error{Type: ErrorTypeConnection, Message: "provider B disconnected"},
+		false)
 }
 
-func testFailoverExcludesTerminalProvider(t *testing.T, providerBError error) {
+// wantContentVerdict selects which outcome the caller must see; the provider
+// callback sequence and slot accounting are identical either way, and are what
+// pins the exclusion behaviour this helper was originally written for.
+func testFailoverExcludesTerminalProvider(t *testing.T, providerBError error, wantContentVerdict bool) {
 	t.Helper()
 	providerA := config.UsenetProvider{Host: "provider-a", MaxConnections: 4, Priority: 1}
 	providerB := config.UsenetProvider{Host: "provider-b", MaxConnections: 4, Priority: 1}
@@ -116,8 +142,14 @@ func testFailoverExcludesTerminalProvider(t *testing.T, providerBError error) {
 		}
 	})
 
-	if !IsArticleNotFoundError(err) {
-		t.Fatalf("ExecuteWithFailover error = %v with sequence %v, want article not found", err, sequence)
+	if got := IsArticleNotFoundError(err); got != wantContentVerdict {
+		if wantContentVerdict {
+			t.Fatalf("ExecuteWithFailover error = %v with sequence %v, want article not found "+
+				"(every provider answered, so the verdict is established)", err, sequence)
+		}
+		t.Fatalf("ExecuteWithFailover error = %v with sequence %v, want an INDETERMINATE error: "+
+			"provider B could not answer, so one provider's 423 does not establish that nobody serves it",
+			err, sequence)
 	}
 	wantSequence := []string{providerA.Host, providerB.Host, providerA.Host}
 	if len(sequence) != len(wantSequence) {
