@@ -317,6 +317,9 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 	urlList := strings.Split(urls, "\n")
 	var nzoIDs []string
 	var errors []string
+	// See handleAddFile: kept typed so the status code can separate a per-release
+	// rejection from a client outage.
+	var firstErr error
 
 	for _, url := range urlList {
 		url = strings.TrimSpace(url)
@@ -328,6 +331,9 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.logger.Error().Err(err).Str("url", url).Msg("Failed to add NZB from URL")
 			errors = append(errors, fmt.Sprintf("Failed to add %s: %v", url, err))
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		if nzoID != "" {
@@ -340,7 +346,7 @@ func (s *SABnzbd) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		if len(errors) > 0 {
 			errMsg = strings.Join(errors, "; ")
 		}
-		s.writeError(w, errMsg, http.StatusInternalServerError)
+		s.writeError(w, errMsg, addNZBErrorStatus(firstErr))
 		return
 	}
 
@@ -388,6 +394,11 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 
 	var nzoIDs []string
 	var errors []string
+	// firstErr keeps the first add error as a typed error, not just its text, so
+	// the status code below can tell "this release is unservable" (a per-release
+	// rejection the arr should skip past) from "we are broken" (a client outage
+	// the arr should back off from). The `errors` slice is display text only.
+	var firstErr error
 
 	// Try to get multiple files from "name" field
 	if r.MultipartForm != nil && r.MultipartForm.File != nil {
@@ -418,6 +429,9 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				s.logger.Error().Err(err).Str("filename", fileHeader.Filename).Msg("Failed to add NZB file")
 				errors = append(errors, fmt.Sprintf("Failed to add %s: %v", fileHeader.Filename, err))
+				if firstErr == nil {
+					firstErr = err
+				}
 				continue
 			}
 			if nzbID != "" {
@@ -443,7 +457,7 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 		// Parse NZB file
 		nzbID, err := s.addNZBFile(ctx, content, header.Filename, _arr, action)
 		if err != nil {
-			s.writeError(w, fmt.Sprintf("Failed to add NZB file: %s", err.Error()), http.StatusInternalServerError)
+			s.writeError(w, fmt.Sprintf("Failed to add NZB file: %s", err.Error()), addNZBErrorStatus(err))
 			return
 		}
 		if nzbID != "" {
@@ -456,7 +470,10 @@ func (s *SABnzbd) handleAddFile(w http.ResponseWriter, r *http.Request) {
 		if len(errors) > 0 {
 			errMsg = strings.Join(errors, "; ")
 		}
-		s.writeError(w, errMsg, http.StatusInternalServerError)
+		// A batch in which nothing was servable is a per-release rejection, not a
+		// client outage — answer 4xx so the arr tries its next candidate now
+		// rather than shelving the whole protocol until the next search cycle.
+		s.writeError(w, errMsg, addNZBErrorStatus(firstErr))
 		return
 	}
 
@@ -635,6 +652,31 @@ func (s *SABnzbd) addNZBURL(ctx context.Context, url string, arr *arr.Arr, actio
 		return "", fmt.Errorf("downloaded content is empty")
 	}
 	return s.addNZBFile(ctx, content, filename, arr, action)
+}
+
+// addNZBErrorStatus maps an add failure to the HTTP status the arr should see.
+//
+// This is not cosmetic. Sonarr/Radarr branch on the exception their SABnzbd
+// client raises, and the two branches behave very differently:
+//
+//	4xx with a body  -> an ordinary rejection -> the arr catches it inside its
+//	                    loop over the ranked decision list and tries the NEXT
+//	                    approved release in the SAME search cycle.
+//	5xx / no response -> DownloadClientUnavailable -> the arr marks the client
+//	                    down and defers every remaining candidate of that
+//	                    protocol to a LATER cycle.
+//
+// So an unservable release must answer 4xx: it is a fact about that release,
+// and the arr has other candidates it can try immediately. Everything else —
+// a broken parse, storage failures, our own NNTP substrate being unreachable —
+// stays 5xx, because those are facts about us, and telling the arr to burn
+// through its remaining candidates while we are broken would blocklist a whole
+// ranked list for no reason.
+func addNZBErrorStatus(err error) int {
+	if goerrors.Is(err, manager.ErrNZBUnavailable) {
+		return http.StatusUnprocessableEntity
+	}
+	return http.StatusInternalServerError
 }
 
 func (s *SABnzbd) addNZBFile(ctx context.Context, content []byte, filename string, arr *arr.Arr, action config.DownloadAction) (string, error) {

@@ -15,6 +15,24 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
+// ErrNZBUnavailable reports that an NZB was REFUSED at add time because no
+// configured usenet provider can serve it — a genuine 430/423 from a provider
+// that answered, not a connectivity problem on our side.
+//
+// It exists so the HTTP layer can tell this apart from decypharr being broken.
+// The distinction decides which branch Sonarr/Radarr take, and they are not
+// close: a 4xx with a body is a per-release rejection, so the arr moves to the
+// next ranked candidate within the SAME search cycle; a 5xx is read as
+// DownloadClientUnavailable, so the arr marks the client down and defers every
+// remaining candidate of that protocol to a LATER cycle.
+//
+// Reserve the unavailable branch strictly for "this release cannot be served".
+// Anything about our own health — connectivity, auth, timeouts, no acquirable
+// connection — must NOT reach here; it is ErrProbeInfrastructure and keeps the
+// entry queued for retry, because refusing a release over our own outage is the
+// usenet twin of deleting a library because a mount was unreachable.
+var ErrNZBUnavailable = errors.New("no configured usenet provider can serve this release")
+
 // AddNewNZB parses an NZB before entering the active-download queue.
 func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, error) {
 	if m.usenet == nil {
@@ -140,29 +158,56 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 			}
 		}
 		if errors.Is(err, parser.ErrArticlesUnavailable) && ctx.Err() == nil {
-			// The NZB parsed structurally but its articles failed the parse-time
-			// availability probe. Rejecting the add here surfaces as a raw HTTP
-			// error to Sonarr/Radarr ("Failed to connect to SABnzbd") and the
-			// release is never blocklisted. Accept the add instead and record the
-			// failure on the reserved queue entry so the SABnzbd history reports
-			// it as Failed with a clear fail_message — the same UX the async
-			// processing pipeline provides for post-admission failures.
-			entry.MarkAsError(err)
-			updateErr := m.queue.Update(entry)
-			if updateErr == nil {
-				m.logger.Warn().
-					Err(err).
+			// No configured provider can serve this release: the probe reached a
+			// provider and got a genuine 430/423. REFUSE the add.
+			//
+			// This used to accept (200 + nzo_id) and record the failure on the
+			// reserved entry, so SABnzbd history would show it as Failed with a
+			// clear message. The reasoning was that refusing "surfaces as a raw
+			// HTTP error to Sonarr/Radarr (Failed to connect to SABnzbd)" — which
+			// was true, and is the actual bug: the shim answered 500, and the arr
+			// maps a 500 to DownloadClientUnavailable, marks the client DOWN, and
+			// defers every remaining candidate of the protocol to a later search
+			// cycle. Accepting was the better of two bad options.
+			//
+			// It is still bad. Accepting writes `grabbed` + `downloadFailed` + a
+			// blocklist row (autoRedownloadFailed) per attempt, and the release is
+			// only replaced on the NEXT search cycle. A dead magnet, by contrast,
+			// costs nothing: the debrid path refuses with 4xx, the arr catches it
+			// inside its loop over the ranked decision list, and tries the next
+			// approved release seconds later in the SAME cycle. On one production
+			// library 5,468 of 11,362 arr blocklist records were
+			// `articles missing on provider` — nearly all of which would never
+			// have been written had the add been refused.
+			//
+			// The refusal is only safe because the shim now answers 4xx with a
+			// body for this class (see sabnzbd.addNZBFile). Refusing with a 5xx
+			// would be strictly worse than accepting.
+			deleted, deleteErr := m.queue.DeleteCurrent(entry, func(*storage.Entry) error {
+				return m.usenet.DeleteForGeneration(req.Id, generation)
+			})
+			if deleteErr != nil || !deleted {
+				// The reservation could not be released. Fall back to the old
+				// accept-and-record behaviour rather than leaking a reservation
+				// that nothing will ever clean up: a Failed history entry is a
+				// smaller problem than an invisible queue row.
+				m.logger.Error().
+					AnErr("delete_error", deleteErr).
+					Bool("deleted", deleted).
 					Str("nzo_id", entry.InfoHash).
-					Str("name", req.Name).
-					Msg("NZB accepted but failed parse-time availability probe; recorded as failed")
-				return entry.InfoHash, nil
+					Msg("Could not release the reservation for an unservable NZB; accepting and recording it as failed instead")
+				entry.MarkAsError(err)
+				if updateErr := m.queue.Update(entry); updateErr == nil {
+					return entry.InfoHash, nil
+				}
+				return "", fmt.Errorf("%w: %w", ErrNZBUnavailable, err)
 			}
-			// The failure could not be persisted; fall through to the delete path
-			// so the reservation is not leaked.
-			m.logger.Error().
-				Err(updateErr).
-				Str("nzo_id", entry.InfoHash).
-				Msg("Failed to persist parse-time NZB failure; falling back to rejecting the add")
+			m.logger.Info().
+				Err(err).
+				Str("nzo_id", req.Id).
+				Str("name", req.Name).
+				Msg("Refused NZB at add time: no configured usenet provider can serve it")
+			return "", fmt.Errorf("%w: %w", ErrNZBUnavailable, err)
 		}
 		deleted, deleteErr := m.queue.DeleteCurrent(entry, func(*storage.Entry) error {
 			return m.usenet.DeleteForGeneration(req.Id, generation)

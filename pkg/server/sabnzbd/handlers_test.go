@@ -220,54 +220,55 @@ func fetchHistory(t *testing.T, s *SABnzbd) History {
 	return response.History
 }
 
-// A structurally valid NZB whose articles are already gone at parse time must
-// be accepted (200 + nzo_id) and recorded as a Failed history entry so the arr
-// blocklists the release natively, instead of surfacing a raw HTTP 500 that
-// Sonarr/Radarr report as "Failed to connect to SABnzbd".
-func TestAddFileProbeFailureIsAcceptedAndRecordedAsFailed(t *testing.T) {
+// A structurally valid NZB whose articles are already gone must be REFUSED at
+// add time, with 4xx and a body, leaving no trace behind.
+//
+// This reverses the previous contract, which accepted the add (200 + nzo_id)
+// and recorded a Failed history entry. That was chosen because refusing
+// surfaced as an HTTP 500 that Sonarr/Radarr report as "Failed to connect to
+// SABnzbd" — true at the time, and the actual defect: 500 maps to
+// DownloadClientUnavailable, so the arr marked the client down and deferred
+// every remaining candidate of the protocol to a LATER search cycle. Accepting
+// was the better of two bad options.
+//
+// It was still bad. Accepting writes `grabbed` + `downloadFailed` + a blocklist
+// row per attempt, and the release is only replaced on the next search cycle.
+// A dead magnet costs none of that: the debrid path refuses with 4xx, the arr
+// catches it inside its loop over the ranked decision list, and tries the next
+// approved release seconds later in the SAME cycle. On one production library
+// 5,468 of 11,362 arr blocklist records were `articles missing on provider`.
+//
+// So the status code is the whole point of this test, not an incidental
+// assertion: 4xx makes the arr skip to its next candidate, 5xx makes it shelve
+// the protocol.
+func TestAddFileUnservableReleaseIsRefusedAtAddTime(t *testing.T) {
 	server := newFakeNNTPServer(t, false) // STAT answers 430
 	s, m := newSABTestHarness(t, server)
 
 	recorder := postNZBFile(t, s, "movie.nzb", []byte(testNZB))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("addfile status = %d, want 200; body=%q", recorder.Code, recorder.Body.String())
+
+	if recorder.Code < 400 || recorder.Code >= 500 {
+		t.Fatalf("addfile status = %d, want 4xx: a 2xx accepts a release nothing can serve, "+
+			"and a 5xx tells the arr the client is down so it stops trying other candidates this cycle; "+
+			"body=%q", recorder.Code, recorder.Body.String())
 	}
+	if body := recorder.Body.String(); !strings.Contains(body, "articles missing on provider") {
+		t.Fatalf("refusal body = %q, want it to name the reason — the arr logs this as the rejection reason", body)
+	}
+
+	// Nothing may be left behind. A reservation that outlives a refused add is
+	// invisible to every listing but still blocks a re-add of the same infohash.
 	var response AddNZBResponse
-	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
-		t.Fatalf("decode addfile response: %v", err)
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err == nil && len(response.NzoIds) > 0 {
+		t.Fatalf("refused add still returned nzo_ids: %+v", response.NzoIds)
 	}
-	if !response.Status || len(response.NzoIds) != 1 || response.NzoIds[0] == "" {
-		t.Fatalf("addfile response = %+v, want status true with one nzo_id", response)
+	if history := fetchHistory(t, s); len(history.Slots) != 0 {
+		t.Fatalf("refused add wrote %d history slot(s); a refusal the arr never accepted must leave no history: %+v",
+			len(history.Slots), history.Slots)
 	}
-	nzoID := response.NzoIds[0]
-
-	entry, err := m.Queue().GetTorrent(nzoID)
-	if err != nil {
-		t.Fatalf("accepted NZB has no queue entry: %v", err)
-	}
-	if entry.State != storage.EntryStateError {
-		t.Fatalf("entry state = %q, want %q", entry.State, storage.EntryStateError)
-	}
-	if !strings.Contains(entry.LastError, "articles missing on provider") {
-		t.Fatalf("entry LastError = %q, want it to mention missing articles", entry.LastError)
-	}
-
-	history := fetchHistory(t, s)
-	var slot *HistorySlot
-	for i := range history.Slots {
-		if history.Slots[i].NzoId == nzoID {
-			slot = &history.Slots[i]
-			break
-		}
-	}
-	if slot == nil {
-		t.Fatalf("nzo_id %s missing from history: %+v", nzoID, history.Slots)
-	}
-	if slot.Status != StatusFailed {
-		t.Fatalf("history status = %q, want %q", slot.Status, StatusFailed)
-	}
-	if !strings.Contains(slot.FailMessage, "articles missing on provider") {
-		t.Fatalf("history fail_message = %q, want it to mention missing articles", slot.FailMessage)
+	entries := m.Queue().ListFilter("", "", "", nil, "", false)
+	if len(entries) != 0 {
+		t.Fatalf("refused add leaked %d queue entrie(s): %+v", len(entries), entries)
 	}
 }
 
