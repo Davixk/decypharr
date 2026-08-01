@@ -60,6 +60,9 @@ class RepairManager {
 
     async loadAll() {
         await Promise.all([this.loadRepairConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs()]);
+        // The recheck panel is inline rather than a modal, so it has no open
+        // hook to prefill from — do it once the configured policy is known.
+        this.applyConfiguredSubActionDefaults('#recheckSubActions');
     }
 
     async loadRepairConfig() {
@@ -84,6 +87,7 @@ class RepairManager {
         if (runRepair) runRepair.checked = this.repairConfig.repair !== false;
         if (runPrune) runPrune.checked = !!this.repairConfig.prune;
         if (runArrDelete) runArrDelete.checked = !!(this.repairConfig.arr_delete ?? this.repairConfig.regrab);
+        this.applyConfiguredSubActionDefaults('#runSubActions');
         const defaultProtocol = this.repairConfig.skip_nzb_repair ? 'torrent' : 'all';
         const protocol = document.querySelector(`input[name="runProtocol"][value="${defaultProtocol}"]`)
             || document.getElementById('runProtocolAll');
@@ -159,13 +163,17 @@ class RepairManager {
 
     // fixComponentMeta maps a component key to its display label + one-liner,
     // shared by the confirm dialogs and toasts so all surfaces read identically.
-    fixComponentMeta(component) {
-        // ARR-DELETE's description is built from the ticked sub-actions rather than
-        // asserting all three acts. The confirm dialog is the last thing shown
-        // before something destructive runs, so it has to name what will actually
-        // happen — "arr delete + blocklist + search" promised a permanent global
-        // ban on every run, including the ones that do not blocklist at all.
-        const arrSub = this.selectedArrSubActions(['arr_delete']);
+    // `subActions` must be the sub-actions that will ACTUALLY apply to the
+    // request being described — the caller's own ticked boxes when it sends
+    // overrides, the configured policy when it sends none. Callers pass it
+    // explicitly because guessing wrong here understates a destructive action in
+    // the last dialog shown before it runs.
+    fixComponentMeta(component, subActions) {
+        // ARR-DELETE's description is built from the sub-actions that will run
+        // rather than asserting all three acts: "arr delete + blocklist + search"
+        // promised a permanent global ban on every run, including the ones that
+        // do not blocklist at all.
+        const arrSub = subActions || {};
         const arrActs = ['arr delete']
             .concat(arrSub.search ? ['search'] : [])
             .concat(arrSub.blocklist ? ['blocklist (permanent, global)'] : []);
@@ -191,6 +199,8 @@ class RepairManager {
                 repair: !!$('recheckRepair')?.checked,
                 prune: !!$('recheckPrune')?.checked,
                 arr_delete: !!$('recheckArrDelete')?.checked,
+                ...this.selectedArrSubActions(
+                    $('recheckArrDelete')?.checked ? ['arr_delete'] : [], '#recheckSubActions'),
             },
         };
         const btn = $('recheckMediaBtn');
@@ -289,6 +299,7 @@ class RepairManager {
                     repair,
                     prune,
                     arr_delete: arrDelete,
+                    ...this.selectedArrSubActions(arrDelete ? ['arr_delete'] : [], '#runSubActions'),
                 }),
             });
             if (!res.ok) {
@@ -318,11 +329,37 @@ class RepairManager {
     // the request body. They are sent ONLY when ARR-DELETE itself is selected: on
     // their own they name no component, and the API ignores them in that case
     // rather than letting a sub-action manufacture an action set.
-    selectedArrSubActions(components) {
+    //
+    // `scope` is REQUIRED because three surfaces now carry these controls (the
+    // act-broken modal, the run modal, the recheck panel). It used to be
+    // hardcoded to #actBrokenModal, which meant every other surface reported the
+    // act-broken modal's checkboxes — unticked whenever that modal had not been
+    // opened — as if they were its own.
+    selectedArrSubActions(components, scope) {
         if (!components.includes('arr_delete')) return {};
         const read = (name) =>
-            !!document.querySelector(`#actBrokenModal [data-act-subaction="${name}"]`)?.checked;
+            !!document.querySelector(`${scope} [data-act-subaction="${name}"]`)?.checked;
         return {search: read('search'), blocklist: read('blocklist')};
+    }
+
+    // configuredArrSubActions is the truth for any request that sends NO
+    // sub-action overrides: the API falls back to the configured knobs, so a
+    // confirmation dialog describing such a request must describe those, not
+    // whatever some unrelated modal's checkboxes happen to say.
+    configuredArrSubActions() {
+        return {
+            search: !!this.repairConfig.arr_search,
+            blocklist: !!this.repairConfig.arr_blocklist,
+        };
+    }
+
+    // applyConfiguredSubActionDefaults prefills a surface's sub-action controls
+    // from configured policy, so what is shown is what would actually happen.
+    applyConfiguredSubActionDefaults(scope) {
+        const defaults = this.configuredArrSubActions();
+        document.querySelectorAll(`${scope} [data-act-subaction]`).forEach((cb) => {
+            cb.checked = !!defaults[cb.getAttribute('data-act-subaction')];
+        });
     }
 
     openActBrokenModal() {
@@ -341,13 +378,7 @@ class RepairManager {
         // so the modal shows what would actually happen. Components start
         // unticked (nothing is selected yet); sub-actions describe how ARR-DELETE
         // behaves if it is ticked, which is a standing setting, not a selection.
-        const subDefaults = {
-            search: !!this.repairConfig.arr_search,
-            blocklist: !!this.repairConfig.arr_blocklist,
-        };
-        document.querySelectorAll('#actBrokenModal [data-act-subaction]').forEach((cb) => {
-            cb.checked = !!subDefaults[cb.getAttribute('data-act-subaction')];
-        });
+        this.applyConfiguredSubActionDefaults('#actBrokenModal');
         const count = document.getElementById('actBrokenTargetCount');
         if (count) count.textContent = (this.latestStatus.health_counts || {}).broken || 0;
         this.setActBrokenStep('picker');
@@ -406,8 +437,9 @@ class RepairManager {
         if (!detail) return;
         const broken = (this.latestStatus.health_counts || {}).broken || 0;
         const destructive = components.filter((c) => c !== 'repair');
+        const subActions = this.selectedArrSubActions(components, '#actBrokenModal');
         const rows = components.map((c) => {
-            const meta = this.fixComponentMeta(c);
+            const meta = this.fixComponentMeta(c, subActions);
             return `<li><span class="font-semibold">${this.escape(meta.label)}</span> — ${this.escape(meta.desc)}</li>`;
         }).join('');
         detail.innerHTML = `
@@ -437,7 +469,7 @@ class RepairManager {
                         repair: list.includes('repair'),
                         prune: list.includes('prune'),
                         arr_delete: list.includes('arr_delete'),
-                        ...this.selectedArrSubActions(list),
+                        ...this.selectedArrSubActions(list, '#actBrokenModal'),
                     },
                 }),
             });
@@ -908,7 +940,12 @@ class RepairManager {
     }
 
     async fixOne(name, component) {
-        const meta = this.fixComponentMeta(component);
+        // This request sends no sub-action overrides, so the API applies the
+        // CONFIGURED knobs — which is what the confirmation must describe. It
+        // used to describe the act-broken modal's checkboxes, so an operator with
+        // arr_blocklist configured on was asked to confirm a plain "arr delete"
+        // and then got a permanent global blocklist.
+        const meta = this.fixComponentMeta(component, this.configuredArrSubActions());
         if (!confirm(`Run ${meta.label} on "${name}"?\n\n${meta.label} = ${meta.desc}.`)) return;
         try {
             const res = await fetch(`${this.api}/repair/fix`, {
@@ -1048,7 +1085,7 @@ class RepairManager {
 // attributes and must stay free of quotes and markup.
 RepairManager.STAT_TITLES = {
     repair_failed: 'REPAIR: re-acquire attempts that errored',
-    repair_skipped_unsupported: 'REPAIR declined: the entry protocol cannot be re-acquired (nzb entries can only be ARR-DELETEbed or PRUNEd)',
+    repair_skipped_unsupported: 'REPAIR declined: the entry protocol cannot be re-acquired (an nzb entry can only be ARR-DELETEd or PRUNEd)',
     prune_skipped_not_eligible: 'PRUNE declined: only some files in the entry are broken, so deleting the whole entry would be wrong',
     arr_delete_failed: 'ARR-DELETE: arr-side failures (arr file-record delete)',
     arr_skipped_no_link: 'ARR-DELETE declined: the entry has no resolved arr link to route through',

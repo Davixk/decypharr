@@ -124,19 +124,34 @@
                         <i class="bi bi-search mr-1 text-primary"></i>CHECK always runs
                         <span class="opacity-60 font-normal">— probe the resolved entries. Pick any actions to apply to whatever probes broken:</span>
                     </div>
-                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-2">
+                    <div id="recheckComponents" class="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-2">
                         <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
                             <input type="checkbox" class="checkbox checkbox-info checkbox-sm" id="recheckRepair">
                             <span class="label-text"><span class="font-semibold">REPAIR</span> <span class="opacity-60 text-xs">re-acquire</span></span>
                         </label>
                         <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
                             <input type="checkbox" class="checkbox checkbox-warning checkbox-sm" id="recheckPrune">
-                            <span class="label-text"><span class="font-semibold">PRUNE</span> <span class="opacity-60 text-xs">delete, arr re-searches</span></span>
+                            <span class="label-text"><span class="font-semibold">PRUNE</span> <span class="opacity-60 text-xs">delete decypharr-side only, no arr call</span></span>
                         </label>
                         <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
                             <input type="checkbox" class="checkbox checkbox-error checkbox-sm" id="recheckArrDelete">
-                            <span class="label-text"><span class="font-semibold">ARR-DELETE</span> <span class="opacity-60 text-xs">arr delete + search</span></span>
+                            <span class="label-text"><span class="font-semibold">ARR-DELETE</span> <span class="opacity-60 text-xs">delete the arr's file record</span></span>
                         </label>
+                    </div>
+                    <div id="recheckSubActions" class="ml-1 pl-4 border-l-2 border-base-300 mt-2">
+                        <span class="text-xs opacity-70">ARR-DELETE sub-actions &mdash; prefilled from your configured values; they do nothing unless ARR-DELETE is ticked.</span>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1">
+                            <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
+                                <input type="checkbox" class="checkbox checkbox-warning checkbox-sm" id="recheckArrSearch"
+                                       data-act-subaction="search">
+                                <span class="label-text"><span class="font-semibold">&hellip; and search</span> <span class="opacity-60 text-xs">ask the arr for a replacement</span></span>
+                            </label>
+                            <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
+                                <input type="checkbox" class="checkbox checkbox-error checkbox-sm" id="recheckArrBlocklist"
+                                       data-act-subaction="blocklist">
+                                <span class="label-text"><span class="font-semibold">&hellip; and blocklist</span> <span class="opacity-60 text-xs">permanent and global</span></span>
+                            </label>
+                        </div>
                     </div>
                 </div>
             </form>
@@ -172,9 +187,9 @@
                         <th>Status</th>
                         <th title="CHECK: entries probed">Checked</th>
                         <th title="CHECK: entries found dead">Broken</th>
-                        <th title="REPAIR: dead items re-acquired; (fail N) attempts that errored, (n/a N) declined because the protocol cannot be re-acquired — nzb entries can only be ARR-DELETEbed or PRUNEd">Repaired</th>
-                        <th title="PRUNE: entries deleted decypharr-side; (skipped N) declined because only some files in the entry are broken">Pruned</th>
-                        <th title="ARR-DELETE: arr delete + search; (fail N) arr-side failures, (no arr N) declined because the entry has no arr link">Re-grabbed</th>
+                        <th title="REPAIR: dead items re-acquired; (fail N) attempts that errored, (n/a N) declined because the protocol cannot be re-acquired — an nzb entry can only be ARR-DELETEd or PRUNEd">Repaired</th>
+                        <th title="PRUNE: entries deleted decypharr-side, no arr call; (skipped N) declined because only some files in the entry are broken">Pruned</th>
+                        <th title="ARR-DELETE: the arr's file record deleted; search and blocklist are separate opt-ins and may or may not have run. (fail N) arr-side failures, (no arr N) declined because the entry has no arr link">Arr-deleted</th>
                         <th title="Entries deleted this run (PRUNE + ARR-DELETE); (+N) left by the per-run cap">Deletions</th>
                         <th>Duration</th>
                         <th>Error</th>
@@ -258,19 +273,34 @@
                             <div class="text-sm opacity-70">Probe the selected candidates. Pick any actions to apply to whatever probes broken:</div>
                         </div>
                     </div>
-                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div id="runComponents" class="grid grid-cols-1 sm:grid-cols-3 gap-2">
                         <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
                             <input type="checkbox" class="checkbox checkbox-info checkbox-sm" id="runRepair">
                             <span class="label-text"><span class="font-semibold">REPAIR</span> <span class="opacity-60 text-xs">re-acquire</span></span>
                         </label>
                         <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
                             <input type="checkbox" class="checkbox checkbox-warning checkbox-sm" id="runPrune">
-                            <span class="label-text"><span class="font-semibold">PRUNE</span> <span class="opacity-60 text-xs">delete, arr re-searches</span></span>
+                            <span class="label-text"><span class="font-semibold">PRUNE</span> <span class="opacity-60 text-xs">delete decypharr-side only, no arr call</span></span>
                         </label>
                         <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
                             <input type="checkbox" class="checkbox checkbox-error checkbox-sm" id="runArrDelete">
-                            <span class="label-text"><span class="font-semibold">ARR-DELETE</span> <span class="opacity-60 text-xs">arr delete + search</span></span>
+                            <span class="label-text"><span class="font-semibold">ARR-DELETE</span> <span class="opacity-60 text-xs">delete the arr's file record</span></span>
                         </label>
+                    </div>
+                    <div id="runSubActions" class="ml-1 pl-4 border-l-2 border-base-300 mt-2">
+                        <span class="text-xs opacity-70">ARR-DELETE sub-actions &mdash; prefilled from your configured values; they do nothing unless ARR-DELETE is ticked.</span>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1">
+                            <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
+                                <input type="checkbox" class="checkbox checkbox-warning checkbox-sm" id="runArrSearch"
+                                       data-act-subaction="search">
+                                <span class="label-text"><span class="font-semibold">&hellip; and search</span> <span class="opacity-60 text-xs">ask the arr for a replacement</span></span>
+                            </label>
+                            <label class="label cursor-pointer justify-start gap-2 py-1 rounded border border-base-300 px-2">
+                                <input type="checkbox" class="checkbox checkbox-error checkbox-sm" id="runArrBlocklist"
+                                       data-act-subaction="blocklist">
+                                <span class="label-text"><span class="font-semibold">&hellip; and blocklist</span> <span class="opacity-60 text-xs">permanent and global</span></span>
+                            </label>
+                        </div>
                     </div>
                 </div>
             </div>

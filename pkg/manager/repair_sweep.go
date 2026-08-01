@@ -1757,7 +1757,7 @@ func (r *Repair) enumerateCandidates(ctx context.Context, cfg config.RepairConfi
 		if errors.Is(arrErr, context.Canceled) {
 			return out, arrErr
 		}
-		r.logger.Warn().Err(arrErr).Msg("Sweep: arr enumeration for ARR-DELETE targeting failed; dead items without an arr link can't be re-grabbed this run")
+		r.logger.Warn().Err(arrErr).Msg("Sweep: arr enumeration for ARR-DELETE targeting failed; dead items without an arr link can't be arr-deleted this run")
 		return out, nil
 	}
 	mergeArrContext(out, arrCands)

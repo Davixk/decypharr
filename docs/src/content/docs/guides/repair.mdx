@@ -270,7 +270,18 @@ Probes against debrid providers respect a separate rate limit so they don't star
 For Usenet probing, `nntp_connection_percent` (above) caps the share of NNTP connections the health checker uses.
 
 :::caution
-With `regrab: true`, a sweep deletes the broken Arr file records, blocklists the grab and triggers a search for replacements. Verification of those re-acquires happens later — the Arr import is asynchronous and the badge flips to `healthy` once the replacement file is in place. With `prune: true` the item is deleted decypharr-side only, and the Arr re-searches on its next disk scan.
+With `arr_delete: true` (formerly `regrab`), a sweep deletes the broken Arr file
+records — and **only** that. Blocklisting and searching are separate opt-ins
+(`arr_blocklist`, `arr_search`), both default-off and both subordinate to
+`arr_delete`. If you enable `arr_search`, verification of the resulting
+re-acquires happens later: the Arr import is asynchronous and the badge flips to
+`healthy` once the replacement file is in place.
+
+With `prune: true` the item is deleted **decypharr-side only and no Arr call is
+made at all**. Do not expect the Arr to notice: the Arr's file record still
+points at a symlink that is now dangling, and its cleanup scan compares paths
+without stat-ing them, so the record is kept and nothing is re-searched. PRUNE is
+the action that leaves the Arr alone — that is the point of it, not a caveat.
 :::
 
 ## Troubleshooting

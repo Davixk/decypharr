@@ -860,7 +860,11 @@ func notificationEventFor(status storage.RepairRunStatus) config.NotificationEve
 func discordContextFor(run *storage.RepairRun) string {
 	const dateFmt = "2006-01-02 15:04:05"
 	return fmt.Sprintf(
-		"\n**Run**: %s\n**Trigger**: %s\n**Source**: %s\n**Status**: %s\n**Started**: %s\n**Completed**: %s\n**Checked**: %d (broken: %d)\n**Actions**: re-acquired %d · pruned %d · re-grabbed %d\n",
+		// "re-grabbed" outlived the action it named: ARR-DELETE deletes the arr's
+		// file record and nothing else unless search/blocklist are opted into.
+		// This line goes to the operator, so it uses the same word as the log
+		// prefix and the run-history column.
+		"\n**Run**: %s\n**Trigger**: %s\n**Source**: %s\n**Status**: %s\n**Started**: %s\n**Completed**: %s\n**Checked**: %d (broken: %d)\n**Actions**: re-acquired %d · pruned %d · arr-deleted %d\n",
 		run.ID, run.Trigger, run.Source, run.Status,
 		run.StartedAt.Format(dateFmt), run.CompletedAt.Format(dateFmt),
 		run.Stats.Probed, run.Stats.Broken,

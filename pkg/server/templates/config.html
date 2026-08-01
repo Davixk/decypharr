@@ -1487,7 +1487,8 @@
                                 <span>
                                     <strong>CHECK</strong> always runs (detect + record). Enable any of
                                     <strong>REPAIR</strong> / <strong>PRUNE</strong> / <strong>ARR-DELETE</strong> below to act on dead items —
-                                    REPAIR re-acquires, PRUNE deletes decypharr-side (the arr keeps monitoring and re-searches),
+                                    REPAIR re-acquires, PRUNE deletes the entry decypharr-side and makes <em>no arr call at all</em>
+                                    (any arr symlink is left dangling and the arr will not self-heal it),
                                     ARR-DELETE goes through the arr (delete the file record; search and blocklist are separate opt-ins). Each is independent; with all
                                     three off the sweep is detect-only.
                                 </span>
