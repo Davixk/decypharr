@@ -274,10 +274,15 @@ func (ad *AllDebrid) doRequest(endpoint string, queryParams map[string]string, r
 	return resp, nil
 }
 
+// IsAvailable always returns an empty map: AllDebrid exposes no endpoint for
+// testing whether an infohash is already cached.
+//
+// ⚠️ An empty map means "no information", NOT "nothing is cached" — but a
+// caller doing `if !avail[hash]` cannot tell those apart and will conclude
+// every release is uncached. Do not wire this into an admission or gating
+// decision. See the contract note on common.Client.IsAvailable.
 func (ad *AllDebrid) IsAvailable(hashes []string) map[string]bool {
-	result := make(map[string]bool)
-	// AllDebrid does not support checking cached infohashes
-	return result
+	return make(map[string]bool)
 }
 
 func (ad *AllDebrid) doPostFile(endpoint string, fileData []byte, result any) (*http.Response, error) {

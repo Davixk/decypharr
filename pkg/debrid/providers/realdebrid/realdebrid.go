@@ -413,6 +413,19 @@ func (r *RealDebrid) getTorrentFiles(t *types.Torrent, data torrentInfo) map[str
 	return files
 }
 
+// IsAvailable is DEAD AT THE PROVIDER and must not be called.
+//
+// /torrents/instantAvailability was disabled by Real-Debrid. Probed against
+// three known-cached hashes on 2026-08-01, single and multi-hash forms, all
+// four calls identical:
+//
+//	HTTP 403  {"error":"disabled_endpoint","error_code":37}
+//
+// The loop below is retained rather than deleted so the endpoint and the
+// failure mode stay on the record, and because the errors are swallowed per
+// batch — a caller would receive a silently empty map, i.e. "nothing is
+// cached", which is a fabricated answer rather than an error. See the contract
+// note on common.Client.IsAvailable before considering any use of this.
 func (r *RealDebrid) IsAvailable(hashes []string) map[string]bool {
 	result := make(map[string]bool)
 
