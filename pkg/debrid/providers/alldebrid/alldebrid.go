@@ -104,9 +104,41 @@ func (ad *AllDebrid) Logger() zerolog.Logger {
 	return ad.logger
 }
 
+// AllDebrid limit codes. AllDebrid has no endpoint that reports remaining
+// capacity, so its errors ARE the capacity signal — a limit that is enforced
+// must be reported when exceeded, and this is where it arrives.
+//
+// The two below are NOT the same condition and must not be handled alike:
+//
+//	MAGNET_TOO_MANY_ACTIVE  documented: "Already have maximum allowed active
+//	                        magnets (30)". Concurrency. Clears as our own
+//	                        magnets finish, so a short retry is correct.
+//	MAGNET_TOO_MANY         UNDOCUMENTED — absent from AllDebrid's published
+//	                        error list. Observed in production as "Magnets
+//	                        limit reached (1000 accross all tabs)" (their
+//	                        typo), firing while ZERO magnets were active.
+//	                        Whatever it counts, it is not concurrency, and
+//	                        finishing work does not release it.
+//
+// Because MAGNET_TOO_MANY is undocumented, its exact meaning (daily add budget
+// vs lifetime storage cap) is unverified. The mapping below deliberately does
+// not depend on knowing: both readings agree it is not freed by our own
+// completions, which is the only property the retry cadence needs.
+const (
+	adErrMagnetTooManyActive = "MAGNET_TOO_MANY_ACTIVE"
+	adErrMagnetTooMany       = "MAGNET_TOO_MANY"
+)
+
 func newAllDebridAPIError(apiErr *errorResponse) error {
 	if apiErr == nil {
 		return fmt.Errorf("alldebrid API error: provider returned an error")
+	}
+
+	// Classify before formatting, so every endpoint that funnels through
+	// decodeAllDebridResponse gets typed limit errors rather than a string the
+	// caller has to re-parse. The original text is preserved by wrapping.
+	if typed := allDebridLimitError(apiErr); typed != nil {
+		return typed
 	}
 
 	switch {
@@ -118,6 +150,19 @@ func newAllDebridAPIError(apiErr *errorResponse) error {
 		return fmt.Errorf("alldebrid API error: %s", apiErr.Message)
 	default:
 		return fmt.Errorf("alldebrid API error: provider returned an error")
+	}
+}
+
+// allDebridLimitError maps AllDebrid's capacity codes onto the shared admission
+// errors, or returns nil when the code is not a capacity condition.
+func allDebridLimitError(apiErr *errorResponse) error {
+	switch apiErr.Code {
+	case adErrMagnetTooManyActive:
+		return fmt.Errorf("%w: alldebrid %s: %s", customerror.TooManyActiveDownloadsError, apiErr.Code, apiErr.Message)
+	case adErrMagnetTooMany:
+		return fmt.Errorf("%w: alldebrid %s: %s", customerror.ProviderAddQuotaExhaustedError, apiErr.Code, apiErr.Message)
+	default:
+		return nil
 	}
 }
 
@@ -619,8 +664,15 @@ func (ad *AllDebrid) CheckFile(ctx context.Context, _, link string) error {
 }
 
 func (ad *AllDebrid) GetAvailableSlots() (int, error) {
-	// AllDebrid does not provide available slots info
-	return config.DefaultAvailableSlots, nil
+	// AllDebrid exposes no endpoint reporting remaining magnet capacity —
+	// verified against the live API, not just this comment: /v4/user carries
+	// only per-file-hoster traffic quotas, and the limitSimuDl field the docs
+	// describe is absent from all 52 hosts in practice.
+	//
+	// Say so rather than guessing. Admission falls back to AllDebrid's own
+	// refusal (MAGNET_TOO_MANY_ACTIVE), which is authoritative and current in a
+	// way a local constant can never be.
+	return 0, types.ErrAvailableSlotsUnknown
 }
 
 func (ad *AllDebrid) GetProfile() (*types.Profile, error) {

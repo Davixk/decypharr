@@ -54,3 +54,22 @@ var ErrAvailabilityIndeterminate = &Error{
 	Message: "Availability check indeterminate",
 	Code:    "availability_indeterminate",
 }
+
+// ErrAvailableSlotsUnknown means the provider does NOT report how many
+// concurrent slots remain, so no prospective admission decision can be made for
+// it. Callers must fall back to the retrospective signal — submit, and let the
+// provider refuse — rather than inventing a number.
+//
+// This exists because the alternative was worse than a missing feature. Three
+// providers used to answer GetAvailableSlots with a hardcoded 100 while their
+// own comments admitted the provider reports nothing; AllDebrid's documented
+// active-magnet cap is 30, so that constant was a fabricated value 3.3x too
+// permissive, presented to any caller as a measurement. An admission gate fed
+// by it would have been confidently wrong in the direction of overload.
+//
+// "Unknown" must stay representable. A plausible integer is not a safer default
+// than an honest absence — it is the same failure with better camouflage.
+var ErrAvailableSlotsUnknown = &Error{
+	Message: "Provider does not report available slots",
+	Code:    "available_slots_unknown",
+}

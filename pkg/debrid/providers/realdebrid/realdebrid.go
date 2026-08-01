@@ -1033,7 +1033,21 @@ func (r *RealDebrid) GetAvailableSlots() (int, error) {
 		return 0, fmt.Errorf("realdebrid API error: Status: %d", resp.StatusCode)
 	}
 
-	return data.TotalSlots - data.ActiveSlots - r.config.MinimumFreeSlot, nil
+	// No local reserve is subtracted. minimum_free_slot used to take one here
+	// and has been removed rather than wired up.
+	//
+	// Its original purpose (upstream #83, comment: "Minimum number of active
+	// pots to maintain (used for cached stuffs, etc.)") was to keep headroom
+	// for OTHER add paths while a ticker-driven drainer filled the account from
+	// a queue. That asymmetry no longer exists — every add now passes through
+	// the same admission check, so there is no privileged path to reserve for.
+	//
+	// The one remaining argument, a race between this reading and the
+	// provider's own accounting, is already covered: lose the race and the
+	// provider refuses, and the refusal requeues the job. A standing reserve
+	// would permanently shrink a paid account to avoid an error that is
+	// already handled correctly.
+	return data.TotalSlots - data.ActiveSlots, nil
 }
 
 func (r *RealDebrid) AccountManager() *account.Manager {

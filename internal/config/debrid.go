@@ -18,7 +18,14 @@ type Debrid struct {
 	DownloadRateLimit            string   `json:"download_rate_limit,omitempty"`
 	Proxy                        string   `json:"proxy,omitempty"`
 	UnpackRar                    bool     `json:"unpack_rar,omitempty"`
-	MinimumFreeSlot              int      `json:"minimum_free_slot,omitempty"` // Minimum active pots to use this debrid
+	// minimum_free_slot was removed. It reserved slots inside RealDebrid's
+	// availability calculation for a drainer/direct-add asymmetry that no
+	// longer exists, and it had never executed here because nothing called
+	// GetAvailableSlots. It also meant three different things in three places:
+	// a subtracted reserve in code, "minimum required to enqueue" to the
+	// operator reading it, and "don't use this provider below N free" in the
+	// docs. An unknown key in an existing config.json is ignored on load and
+	// dropped on the next save.
 	Priority                     int      `json:"priority,omitempty"`          // Lower values are tried first; defaults to config order
 	ConfigOrder                  int      `json:"-"`                           // Stable tie-breaker derived from debrids[] order
 	Limit                        int      `json:"limit,omitempty"`             // Maximum number of total torrents

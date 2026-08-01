@@ -200,9 +200,58 @@ func newTorrentQueueEntry(importReq *ImportRequest, status debridTypes.TorrentSt
 	return torrent
 }
 
+// admitToProvider decides whether this provider can accept another item right
+// now, using whatever the provider itself will tell us.
+//
+// Two shapes, because providers differ and neither is a fallback for a missing
+// feature:
+//
+//	PROSPECTIVE   RealDebrid answers GET /torrents/activeCount with
+//	              {nb, limit}, so capacity is knowable before we spend an add.
+//	RETROSPECTIVE AllDebrid publishes no such endpoint, so it tells us by
+//	              refusing (MAGNET_TOO_MANY_ACTIVE). That refusal is
+//	              authoritative and current; a local constant is neither.
+//
+// A provider that reports nothing returns ErrAvailableSlotsUnknown and is
+// admitted here — its own refusal is the gate. Any other error asking is OUR
+// failure, not a verdict about capacity, so it must not manufacture a refusal:
+// declining an add because we could not reach an endpoint is the same mistake
+// as condemning a release because a probe timed out.
+func admitToProvider(db common.Client, providerName string) error {
+	slots, err := db.GetAvailableSlots()
+	switch {
+	case errors.Is(err, debridTypes.ErrAvailableSlotsUnknown):
+		return nil
+	case err != nil:
+		// Could not ask. Proceed and let the provider answer for itself.
+		logger := db.Logger()
+		logger.Debug().Err(err).
+			Str("Provider", providerName).
+			Msg("Could not read provider capacity; proceeding and relying on the provider to refuse if full")
+		return nil
+	case slots <= 0:
+		return fmt.Errorf("%w: provider %q reports no free slots", customerror.TooManyActiveDownloadsError, providerName)
+	default:
+		return nil
+	}
+}
+
+// isTooManyActiveDownloads reports provider CONCURRENCY exhaustion — slots that
+// free as active work finishes.
+//
+// Matched by sentinel identity rather than by Code string: a fallback chain
+// joins one error per provider, and errors.As returns the first *customerror.Error
+// in that tree, which may belong to a different provider that failed for an
+// unrelated reason. errors.Is tests the whole tree for THIS condition.
 func isTooManyActiveDownloads(err error) bool {
-	customErr, ok := errors.AsType[*customerror.Error](err)
-	return ok && customErr.Code == "too_many_active_downloads"
+	return errors.Is(err, customerror.TooManyActiveDownloadsError)
+}
+
+// isProviderAddQuotaExhausted reports an add/storage allowance being spent,
+// which our own completions do NOT release. Kept distinct from slot exhaustion
+// so the two cannot share a retry cadence.
+func isProviderAddQuotaExhausted(err error) bool {
+	return errors.Is(err, customerror.ProviderAddQuotaExhaustedError)
 }
 
 func (m *Manager) processQueuedEntries() {
@@ -605,6 +654,25 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		if providerName == "" {
 			providerName = dbConfig.Provider
 		}
+		// Provider admission: ask whether this provider has room BEFORE
+		// spending an add on it. A provider that cannot answer is not guessed
+		// at — it falls through and refuses for itself, which is the only
+		// signal AllDebrid has.
+		//
+		// A full provider is treated like any other per-provider decline: the
+		// chain advances, so a full AllDebrid does not stop a RealDebrid that
+		// has room. Only if EVERY provider declines does the joined error reach
+		// the caller — and it keeps its type through joinDebridErrors, so
+		// processJob requeues the job instead of failing it.
+		//
+		// This never blocks. Waiting here for capacity would rebuild, one level
+		// down, exactly the head-of-line blocking this layer exists to remove.
+		if err := admitToProvider(db, providerName); err != nil {
+			errs = append(errs, err)
+			logDebridAttemptFailure(db.Logger(), providerName, "admission", importRequest.Magnet.InfoHash, err)
+			continue
+		}
+
 		downloadUncached, uncachedVetoed := resolveDownloadUncached(dbConfig.DownloadUncached, importRequest.DownloadUncached)
 		debridTorrent := newDebridAttempt(importRequest, downloadUncached)
 

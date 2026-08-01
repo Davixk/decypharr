@@ -52,6 +52,8 @@ type fakeDebridClient struct {
 	submitFn        func(*debridTypes.Torrent) (*debridTypes.Torrent, error)
 	checkFn         func(*debridTypes.Torrent) (*debridTypes.Torrent, error)
 	deleteFn        func(string) error
+	slotsFn         func() (int, error)
+	slotCalls       int
 	mu              sync.Mutex
 	submitCalls     int
 	checkCalls      int
@@ -124,7 +126,22 @@ func (f *fakeDebridClient) RefreshDownloadLinks() error                     { re
 func (f *fakeDebridClient) CheckFile(context.Context, string, string) error { return nil }
 func (f *fakeDebridClient) AccountManager() *account.Manager                { return nil }
 func (f *fakeDebridClient) GetProfile() (*debridTypes.Profile, error)       { return nil, nil }
-func (f *fakeDebridClient) GetAvailableSlots() (int, error)                 { return 1, nil }
+func (f *fakeDebridClient) GetAvailableSlots() (int, error) {
+	f.mu.Lock()
+	f.slotCalls++
+	fn := f.slotsFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return 1, nil
+}
+
+func (f *fakeDebridClient) slotQueries() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.slotCalls
+}
 func (f *fakeDebridClient) SyncAccounts()                                   {}
 func (f *fakeDebridClient) DeleteLink(debridTypes.DownloadLink) error       { return nil }
 func (f *fakeDebridClient) SpeedTest(context.Context) debridTypes.SpeedTestResult {

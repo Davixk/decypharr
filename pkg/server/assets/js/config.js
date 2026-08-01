@@ -610,15 +610,6 @@ class ConfigManager {
                                 <span class="text-sm opacity-70">Custom User Agent for this debrid</span>
                             </div>
                             <div>
-                                <label class="label" for="debrid[${index}].minimum_free_slot">
-                                    <span class=" font-medium">Minimum Free Slot</span>
-                                </label>
-                                <input type="number" class="input w-full" 
-                                       name="debrid[${index}].minimum_free_slot" id="debrid[${index}].minimum_free_slot" 
-                                       placeholder="1" value="1">
-                                <span class="text-sm opacity-70">Minimum free slot for this debrid</span>
-                            </div>
-                            <div>
                                 <label class="label" for="debrid[${index}].priority">
                                     <span class="font-medium">Priority</span>
                                 </label>
@@ -1419,7 +1410,6 @@ class ConfigManager {
             const rateLimitInput = getField('rate_limit');
             const repairRateLimitInput = getField('repair_rate_limit');
             const downloadRateLimitInput = getField('download_rate_limit');
-            const minimumFreeSlotInput = getField('minimum_free_slot');
             const priorityInput = getField('priority');
             const proxyInput = getField('proxy');
             const downloadUncachedInput = getField('download_uncached');
@@ -1432,7 +1422,7 @@ class ConfigManager {
             const autoExpireLinksAfterInput = getField('auto_expire_links_after');
 
             if (!nameInput || !providerInput || !apiKeyInput || !rateLimitInput || !repairRateLimitInput || !downloadRateLimitInput ||
-                !minimumFreeSlotInput || !priorityInput || !proxyInput || !downloadUncachedInput || !unpackRarInput || !addSamplesInput ||
+                !priorityInput || !proxyInput || !downloadUncachedInput || !unpackRarInput || !addSamplesInput ||
                 !userAgentInput || !torrentsRefreshIntervalInput || !downloadLinksRefreshIntervalInput || !autoExpireLinksAfterInput) {
                 return;
             }
@@ -1444,7 +1434,6 @@ class ConfigManager {
                 rate_limit: rateLimitInput.value,
                 repair_rate_limit: repairRateLimitInput.value,
                 download_rate_limit: downloadRateLimitInput.value,
-                minimum_free_slot: parseInt(minimumFreeSlotInput.value) || 0,
                 priority: parseInt(priorityInput.value) || 0,
                 proxy: proxyInput.value,
                 unpack_rar: unpackRarInput.checked,

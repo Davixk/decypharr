@@ -612,8 +612,10 @@ func (pm *Premiumize) getClientProfile(client *request.Client) (*types.Profile, 
 }
 
 func (pm *Premiumize) GetAvailableSlots() (int, error) {
-	// Premiumize does not provide active slot info without listing transfers.
-	return config.DefaultAvailableSlots, nil
+	// Premiumize does not report active slots without listing transfers, so
+	// there is no cheap prospective answer. Admission falls back to the
+	// provider's own refusal.
+	return 0, types.ErrAvailableSlotsUnknown
 }
 
 func (pm *Premiumize) AccountManager() *account.Manager {

@@ -416,12 +416,32 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		if ctx.Err() != nil {
 			return
 		}
-		if isTooManyActiveDownloads(err) {
+		// Provider capacity. Both cadences put the entry back to Queued — so it
+		// reports queuedDL/Queued rather than pretending to download — and hand
+		// the job back to the queue instead of holding a worker.
+		//
+		// The two delays are deliberately different and must stay that way.
+		// Slot exhaustion clears as our OWN active work finishes, so a short
+		// retry is right. An add/storage allowance does not: AllDebrid's
+		// MAGNET_TOO_MANY was observed firing 6,715 times with ZERO active
+		// magnets, meaning nothing we finish releases it. Retrying that every
+		// 30s is a spin against a provider already saying no.
+		if isTooManyActiveDownloads(err) || isProviderAddQuotaExhausted(err) {
+			delay := providerSlotRetryDelay
+			reason := "provider slots are full"
+			if isProviderAddQuotaExhausted(err) {
+				delay = providerQuotaRetryDelay
+				reason = "provider add quota is exhausted; our own completions will not free it"
+			}
 			if job.Entry != nil {
 				job.Entry.Status = debridTypes.TorrentStatusQueued
 				_ = m.queue.Update(job.Entry)
 			}
-			m.jobQueue.Retry(job, 30*time.Second)
+			m.logger.Info().
+				Str("job_id", job.ID).
+				Dur("retry_in", delay).
+				Msgf("Requeued: %s", reason)
+			m.jobQueue.Retry(job, delay)
 			return
 		}
 		if errors.Is(err, parser.ErrProbeInfrastructure) {
@@ -474,6 +494,16 @@ func (m *Manager) resumeClaimedAction(entry *storage.Entry) {
 // downloadCompletionSlack pads the worst-case post-download pipeline (mount
 // visibility wait + usenet processing) when computing the defensive park cap
 // for waitForDownloadCompletion.
+// Retry cadences for the two provider-capacity conditions. Separate constants
+// because they describe different resources: slots come back as our own
+// downloads finish, an add allowance comes back on the provider's schedule and
+// not ours. Collapsing them into one number is how a polite retry becomes a
+// spin against a provider that has already refused.
+const (
+	providerSlotRetryDelay  = 30 * time.Second
+	providerQuotaRetryDelay = 15 * time.Minute
+)
+
 const downloadCompletionSlack = 5 * time.Minute
 
 // downloadCompletionParkCap bounds how long a single worker may stay parked on

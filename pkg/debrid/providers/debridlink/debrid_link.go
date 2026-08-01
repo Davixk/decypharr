@@ -635,8 +635,10 @@ func (dl *DebridLink) CheckFile(ctx context.Context, _, link string) error {
 }
 
 func (dl *DebridLink) GetAvailableSlots() (int, error) {
-	// AllDebrid does not provide available slots info
-	return config.DefaultAvailableSlots, nil
+	// DebridLink does not report remaining slots. (The comment here used to say
+	// "AllDebrid" — a copy-paste that survived because nothing ever called
+	// this.) Admission falls back to the provider's own refusal.
+	return 0, types.ErrAvailableSlotsUnknown
 }
 
 func (dl *DebridLink) GetProfile() (*types.Profile, error) {
