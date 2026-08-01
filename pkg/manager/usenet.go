@@ -114,7 +114,19 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 		}
 		entry.Size = meta.TotalSize
 		entry.Bytes = meta.TotalSize
-		entry.Status = debridTypes.TorrentStatusDownloading
+		// Status deliberately stays Queued here. This runs during the
+		// SYNCHRONOUS add, before the job is even submitted to the job queue —
+		// declaring "Downloading" at this point described an entry that was
+		// about to sit in a slice waiting for a worker.
+		//
+		// That was not cosmetic. It is what made a 17-minute admission wait
+		// indistinguishable from a slow download: 310 entries advertised
+		// "Downloading, 0 B, 0%" while doing nothing at all, and the backlog was
+		// only found by log forensics because no surface would admit to it.
+		//
+		// processNZBJob promotes to Downloading when a worker actually picks the
+		// job up. Until then both shims report the truth for free — SABnzbd
+		// "Queued", qBittorrent "queuedDL" — states the arrs already understand.
 		entry.ActiveProvider = "usenet"
 		if meta.Generation != entry.NZBGeneration {
 			return fmt.Errorf("parsed NZB generation %q does not match reserved generation %q", meta.Generation, entry.NZBGeneration)
@@ -395,6 +407,21 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 	}
 	if job.Request != nil {
 		job.Request.Status = "started"
+	}
+	// A worker now holds this job, so the entry is genuinely being worked and
+	// "Downloading" is true for the first time. Everything before this point —
+	// the synchronous parse and the wait for a worker — reports Queued.
+	//
+	// Best-effort: a failed write here loses a status update, not the work. The
+	// generation was already checked by RefreshSnapshot above, so a failure
+	// means the row moved under us and the next pass will correct it.
+	if job.Entry.Status == debridTypes.TorrentStatusQueued {
+		job.Entry.Status = debridTypes.TorrentStatusDownloading
+		if err := m.queue.Update(job.Entry); err != nil {
+			m.logger.Debug().Err(err).
+				Str("infohash", job.Entry.InfoHash).
+				Msg("Could not persist the queued->downloading transition")
+		}
 	}
 	if job.ResumeExisting && job.NZBMeta.Status == usenet.NZBStatusCompleted {
 		return m.processNZB(ctx, job.Entry, job.NZBMeta)
