@@ -100,12 +100,15 @@ no master on/off gate:
 | Component | Effect | \*arr? | Destructive |
 |---|---|---|---|
 | `repair` | Re-acquire the dead item from the same provider, falling back to other configured debrids. | no | **No** |
-| `prune` | Delete decypharr-side **only**: provider placements + symlink/download folder + db entry. **Never calls the \*arr** — the \*arr keeps the item monitored and re-searches on its own next disk scan. | no | **Yes** |
-| `regrab` | Through the \*arr: delete the file record, **blocklist** the grab, trigger a search. The only \*arr-coupled component. | yes | **Yes** |
+| `prune` | Delete decypharr-side **only**: provider placements + symlink/download folder + db entry. **Never calls the \*arr — and do not expect the \*arr to notice.** Its file record still points at the now-dangling symlink, and `MediaFileTableCleanupService` compares paths without stat-ing them, so the record is kept and nothing is re-searched. PRUNE is the component that leaves the \*arr alone. | no | **Yes** |
+| `arr_delete` | Through the \*arr: delete the file record. **That is all it does by itself** — `arr_search` and `arr_blocklist` are separate, default-off sub-actions, both subordinate to this one. The only \*arr-coupled component. Formerly `regrab`, still accepted as an alias. | yes | **Yes** |
+| ↳ `arr_search` | Sub-action of `arr_delete`: ask the \*arr for a replacement after the delete. Off by default; does nothing on its own. | yes | no |
+| ↳ `arr_blocklist` | Sub-action of `arr_delete`: mark the grab failed, which bans the release **globally and permanently**. Off by default; does nothing on its own. Reserve for bad releases, not missing bytes. | yes | no |
 
-Config knobs (`repair.repair` / `repair.prune` / `repair.regrab`): `repair` is a `*bool` that
-**defaults to `true` when unset**; `prune` and `regrab` default to `false`. So out of the box a
-sweep detects and re-acquires, and deletes nothing.
+Config knobs (`repair.repair` / `repair.arr_delete` / `repair.prune`, in the order a sweep runs
+them): `repair` is a `*bool` that **defaults to `true` when unset**; `arr_delete` and `prune`
+default to `false`, as do the two sub-actions. So out of the box a sweep detects and re-acquires,
+and deletes nothing.
 
 :::note[`repair.auto_repair` is DEPRECATED and ignored]
 The old `auto_repair` **config** field no longer gates anything — the resolver never reads it. It is
@@ -342,14 +345,20 @@ silently returns an empty list rather than erroring.
 | `candidates` · `skipped_fresh` · `probed` | Entries selected / skipped as too recently checked / actually probed. |
 | `healthy` · `broken` · `unknown` | CHECK verdicts. |
 | `reacquired` | REPAIR: dead entries successfully re-acquired. |
-| `repair_failed` | REPAIR: re-acquire attempts that **errored**. Arr-side re-grab failures are **not** counted here — they have their own `regrab_failed`. |
+| `repair_failed` | REPAIR: re-acquire attempts that **errored**. Arr-side failures are **not** counted here — they have their own `arr_delete_failed`. |
 | `repair_skipped_unsupported` | REPAIR **declined**: the entry's protocol cannot be re-acquired (nzb — see below). |
 | `pruned` | PRUNE: entries deleted decypharr-side. |
 | `prune_skipped_not_eligible` | PRUNE **declined**: only *some* files in the entry are broken, so deleting the whole entry would be wrong. |
-| `regrabbed` | RE-GRAB: entries put through arr delete + blocklist + search. |
-| `regrab_failed` | RE-GRAB: arr-side failures. |
-| `regrab_skipped_no_arr_link` | RE-GRAB **declined**: the entry has no resolved arr link to route through. |
-| `deletions` · `deletion_cap_skipped` | Destructive-deletion slots consumed this run (PRUNE + RE-GRAB) / broken entries left un-deleted because `max_deletions_per_run` was exhausted. |
+| `arr_deleted` | ARR-DELETE: entries whose \*arr file record was deleted. Search and blocklist are separate opt-ins and may or may not have run. |
+| `arr_delete_failed` | ARR-DELETE: arr-side failures. |
+| `arr_skipped_no_link` | ARR-DELETE **declined**: the entry has no resolved arr link to route through. |
+| `deletions` · `deletion_cap_skipped` | Destructive-deletion slots consumed this run (PRUNE + ARR-DELETE) / broken entries left un-deleted because `max_deletions_per_run` was exhausted. |
+
+:::note[These three counters were renamed]
+`regrabbed` / `regrab_failed` / `regrab_skipped_no_arr_link` are now
+`arr_deleted` / `arr_delete_failed` / `arr_skipped_no_link`. Anything parsing run
+records by the old key names reads zero, not an error.
+:::
 
 The three `*_skipped_*` counters exist to separate a component that **declined on principle**
 from one that **silently broke**: `reacquired: 0` alone reads as "REPAIR is broken", when the
@@ -362,8 +371,9 @@ The matching per-entry reason lands on the health record as `EntryHealth.action_
 REPAIR (re-acquire) applies to **torrent entries only** — `Entry.CanBeFixed()` is
 `return e.IsTorrent()`. Re-acquisition for usenet is not sound: re-parsing the staged NZB asks
 the same providers for the same message-ids, so it cannot resurrect a missing or payload-less
-article. A dead nzb entry is recoverable only via **RE-GRAB** (fetch a fresh NZB through the
-\*arr) or **PRUNE** (delete decypharr-side and let the \*arr re-search).
+article. A dead nzb entry is actionable only via **ARR-DELETE** (delete the \*arr's file record,
+optionally with `arr_search` to ask for a replacement) or **PRUNE** (delete decypharr-side —
+which recovers nothing, it only stops decypharr serving a dead entry).
 
 Running a REPAIR-only configuration against an nzb-heavy library therefore fixes **nothing**.
 Watch `repair_skipped_unsupported` — that is the count of entries REPAIR declined for this

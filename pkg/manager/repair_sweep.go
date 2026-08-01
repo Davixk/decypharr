@@ -1431,7 +1431,7 @@ func (r *Repair) actOnDeadEntry(ctx context.Context, run *storage.RepairRun, sta
 	wantPrune := actions.prune && pruneSkip == ""
 
 	if arrSkip != "" {
-		r.logger.Debug().Str("component", "ARR-DELETE").Str("entry", name).Msg("ARR-DELETE: no arr link resolved for dead item; cannot re-grab it")
+		r.logger.Debug().Str("component", "ARR-DELETE").Str("entry", name).Msg("ARR-DELETE: no arr link resolved for dead item; cannot arr-delete it")
 	}
 	if pruneSkip != "" {
 		r.logger.Debug().Str("component", "PRUNE").Str("entry", name).

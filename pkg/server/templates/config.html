@@ -1494,41 +1494,48 @@
                                 </span>
                             </div>
 
-                            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <!-- Presented as a LADDER, in the order the sweep actually runs them:
+                                 REPAIR (inline during the probe) -> ARR-DELETE (arr-side) ->
+                                 PRUNE (decypharr-side, terminal). See repair_sweep.go's
+                                 repairDeadEntry, which calls arrDeleteDeadEntry before
+                                 pruneDeadEntry. A three-across grid put PRUNE in the middle and
+                                 told the operator a different story than the code. -->
+                            <div class="space-y-1">
                                 <label class="label cursor-pointer justify-start gap-3">
                                     <input type="checkbox" class="checkbox checkbox-info checkbox-sm"
                                            id="repair.repair" name="repair.repair" checked>
                                     <span class="label-text font-medium">REPAIR <span class="opacity-60 font-normal">re-acquire (non-destructive, default on)</span></span>
                                 </label>
                                 <label class="label cursor-pointer justify-start gap-3">
-                                    <input type="checkbox" class="checkbox checkbox-warning checkbox-sm"
-                                           id="repair.prune" name="repair.prune">
-                                    <span class="label-text font-medium">PRUNE <span class="opacity-60 font-normal">delete decypharr-side only, makes no arr call</span></span>
-                                </label>
-                                <label class="label cursor-pointer justify-start gap-3">
                                     <input type="checkbox" class="checkbox checkbox-error checkbox-sm"
                                            id="repair.arr_delete" name="repair.arr_delete">
                                     <span class="label-text font-medium">ARR-DELETE <span class="opacity-60 font-normal">delete the arr's file record (arr-coupled)</span></span>
                                 </label>
-                            </div>
 
-                            <div class="ml-1 pl-4 border-l-2 border-base-300 space-y-2">
-                                <span class="label-text-alt opacity-70">ARR-DELETE sub-actions &mdash; both off by default, and both do nothing unless ARR-DELETE is on.</span>
-                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    <label class="label cursor-pointer justify-start gap-3">
-                                        <input type="checkbox" class="checkbox checkbox-warning checkbox-sm"
-                                               id="repair.arr_search" name="repair.arr_search">
-                                        <span class="label-text font-medium">&hellip; and search <span class="opacity-60 font-normal">ask the arr for a replacement after the delete</span></span>
-                                    </label>
-                                    <label class="label cursor-pointer justify-start gap-3">
-                                        <input type="checkbox" class="checkbox checkbox-error checkbox-sm"
-                                               id="repair.arr_blocklist" name="repair.arr_blocklist">
-                                        <span class="label-text font-medium">&hellip; and blocklist <span class="opacity-60 font-normal">ban the release globally and permanently</span></span>
-                                    </label>
+                                <div id="repair.arr_subactions" class="ml-1 pl-4 border-l-2 border-base-300 space-y-2 py-1">
+                                    <span class="label-text-alt opacity-70">ARR-DELETE sub-actions &mdash; both off by default, and both do nothing unless ARR-DELETE is on.</span>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <label class="label cursor-pointer justify-start gap-3">
+                                            <input type="checkbox" class="checkbox checkbox-warning checkbox-sm"
+                                                   id="repair.arr_search" name="repair.arr_search">
+                                            <span class="label-text font-medium">&hellip; and search <span class="opacity-60 font-normal">ask the arr for a replacement after the delete</span></span>
+                                        </label>
+                                        <label class="label cursor-pointer justify-start gap-3">
+                                            <input type="checkbox" class="checkbox checkbox-error checkbox-sm"
+                                                   id="repair.arr_blocklist" name="repair.arr_blocklist">
+                                            <span class="label-text font-medium">&hellip; and blocklist <span class="opacity-60 font-normal">ban the release globally and permanently</span></span>
+                                        </label>
+                                    </div>
+                                    <div class="alert alert-warning alert-soft text-sm">
+                                        <span><strong>Blocklisting is for bad releases, not for missing bytes.</strong> A sample-only file, wrong content, or an <code>.exe</code> masquerading as an episode is a permanent fact about the release &mdash; ban it. An article purged from one news server, or a debrid refusing one release, is provider-scoped and provisional; a global ban there destroys a release another provider may serve fine, and the arr records it as &ldquo;Manually marked as failed&rdquo; with no reason attached, so it cannot be audited afterwards. Blocklisting is also not what makes the arr try again &mdash; on an add failure it walks its own ranked candidate list either way.</span>
+                                    </div>
                                 </div>
-                                <div class="alert alert-warning alert-soft text-sm">
-                                    <span><strong>Blocklisting is for bad releases, not for missing bytes.</strong> A sample-only file, wrong content, or an <code>.exe</code> masquerading as an episode is a permanent fact about the release &mdash; ban it. An article purged from one news server, or a debrid refusing one release, is provider-scoped and provisional; a global ban there destroys a release another provider may serve fine, and the arr records it as &ldquo;Manually marked as failed&rdquo; with no reason attached, so it cannot be audited afterwards. Blocklisting is also not what makes the arr try again &mdash; on an add failure it walks its own ranked candidate list either way.</span>
-                                </div>
+
+                                <label class="label cursor-pointer justify-start gap-3">
+                                    <input type="checkbox" class="checkbox checkbox-warning checkbox-sm"
+                                           id="repair.prune" name="repair.prune">
+                                    <span class="label-text font-medium">PRUNE <span class="opacity-60 font-normal">delete decypharr-side only, makes no arr call</span></span>
+                                </label>
                             </div>
 
                             <div class="max-w-sm">

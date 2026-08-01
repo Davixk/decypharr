@@ -178,11 +178,45 @@ class ConfigManager {
         // by new damage.
         if ($('repair.arr_search')) $('repair.arr_search').checked = !!repair.arr_search;
         if ($('repair.arr_blocklist')) $('repair.arr_blocklist').checked = !!repair.arr_blocklist;
+        this.syncRepairSubActionGate();
         // Deletion cap. Blank shows the default (100); -1 (unlimited) is shown
         // verbatim so it round-trips. 0/unset → blank so the placeholder reads.
         if ($('repair.max_deletions_per_run')) {
             $('repair.max_deletions_per_run').value = repair.max_deletions_per_run ? repair.max_deletions_per_run : '';
         }
+    }
+
+    // syncRepairSubActionGate enforces ARR-DELETE's subordination in the surface
+    // rather than only asserting it in the text beside the boxes. Both
+    // sub-actions are disabled while ARR-DELETE is off, because a control that
+    // can be ticked into a state it cannot have is the same defect as a label
+    // describing something that does not happen.
+    //
+    // Disable, never uncheck: disabling is a statement about availability,
+    // unchecking is a statement about intent, and only the operator gets to make
+    // the second one. The values survive the round trip because the save path
+    // reads .checked directly — disabled inputs keep their checked property, and
+    // nothing here relies on native form serialization, which would drop them and
+    // silently write false for a sub-action he never turned off.
+    syncRepairSubActionGate() {
+        const parent = document.getElementById('repair.arr_delete');
+        const block = document.getElementById('repair.arr_subactions');
+        if (!parent || !block) return;
+        const apply = () => {
+            const on = !!parent.checked;
+            block.classList.toggle('opacity-50', !on);
+            ['repair.arr_search', 'repair.arr_blocklist'].forEach((id) => {
+                const cb = document.getElementById(id);
+                if (!cb) return;
+                cb.disabled = !on;
+                cb.closest('label')?.classList.toggle('cursor-not-allowed', !on);
+            });
+        };
+        if (!parent.dataset.subactionGateBound) {
+            parent.addEventListener('change', apply);
+            parent.dataset.subactionGateBound = '1';
+        }
+        apply();
     }
 
     collectRepairConfig() {

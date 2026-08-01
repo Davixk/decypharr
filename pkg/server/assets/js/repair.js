@@ -63,6 +63,7 @@ class RepairManager {
         // The recheck panel is inline rather than a modal, so it has no open
         // hook to prefill from — do it once the configured policy is known.
         this.applyConfiguredSubActionDefaults('#recheckSubActions');
+        this.syncSubActionGates();
     }
 
     async loadRepairConfig() {
@@ -88,6 +89,7 @@ class RepairManager {
         if (runPrune) runPrune.checked = !!this.repairConfig.prune;
         if (runArrDelete) runArrDelete.checked = !!(this.repairConfig.arr_delete ?? this.repairConfig.regrab);
         this.applyConfiguredSubActionDefaults('#runSubActions');
+        this.syncSubActionGates(document.getElementById('runRepairModal'));
         const defaultProtocol = this.repairConfig.skip_nzb_repair ? 'torrent' : 'all';
         const protocol = document.querySelector(`input[name="runProtocol"][value="${defaultProtocol}"]`)
             || document.getElementById('runProtocolAll');
@@ -362,6 +364,44 @@ class RepairManager {
         });
     }
 
+    // syncSubActionGates wires every ARR-DELETE checkbox carrying
+    // data-subaction-gate="<selector>" to the sub-action block it governs, so the
+    // subordination is ENFORCED by the control and not merely asserted in prose
+    // beside it. A box that can be ticked into a state it cannot have is the same
+    // defect as a label describing something that does not happen.
+    //
+    // Disable, never uncheck. Disabling states that the sub-action is
+    // unavailable; unchecking states that the operator does not want it, which is
+    // not ours to say and cannot be undone by re-ticking the parent — he would
+    // have to remember what he had set. Values are preserved and come back on
+    // re-enable.
+    //
+    // Safe because nothing here is read via native form serialization (which
+    // DROPS disabled fields): every consumer reads .checked directly, and
+    // selectedArrSubActions omits the keys entirely when ARR-DELETE is unticked,
+    // so a disabled sub-action is never submitted as an explicit false. That
+    // distinction is the same unset-vs-false trap as the provider checkbox.
+    syncSubActionGates(root) {
+        (root || document).querySelectorAll('[data-subaction-gate]').forEach((parent) => {
+            const block = document.querySelector(parent.getAttribute('data-subaction-gate'));
+            if (!block) return;
+            const apply = () => {
+                const on = !!parent.checked;
+                block.classList.toggle('opacity-50', !on);
+                block.querySelectorAll('input[data-act-subaction]').forEach((cb) => {
+                    cb.disabled = !on;
+                    const label = cb.closest('label');
+                    if (label) label.classList.toggle('cursor-not-allowed', !on);
+                });
+            };
+            if (!parent.dataset.subactionGateBound) {
+                parent.addEventListener('change', apply);
+                parent.dataset.subactionGateBound = '1';
+            }
+            apply();
+        });
+    }
+
     openActBrokenModal() {
         // The button is never inert: when the action is unavailable, say why
         // instead of silently doing nothing.
@@ -379,6 +419,7 @@ class RepairManager {
         // unticked (nothing is selected yet); sub-actions describe how ARR-DELETE
         // behaves if it is ticked, which is a standing setting, not a selection.
         this.applyConfiguredSubActionDefaults('#actBrokenModal');
+        this.syncSubActionGates(document.getElementById('actBrokenModal'));
         const count = document.getElementById('actBrokenTargetCount');
         if (count) count.textContent = (this.latestStatus.health_counts || {}).broken || 0;
         this.setActBrokenStep('picker');
@@ -789,8 +830,8 @@ class RepairManager {
                             <i class="bi bi-search-heart"></i>
                         </button>
                         <button class="btn btn-xs btn-info btn-outline font-semibold" data-action="fix" data-component="repair" data-name="${this.escapeAttr(h.entry_name)}" title="REPAIR — re-acquire on same/backup provider" aria-label="Repair ${this.escape(h.entry_name)}">R</button>
-                        <button class="btn btn-xs btn-warning btn-outline font-semibold" data-action="fix" data-component="prune" data-name="${this.escapeAttr(h.entry_name)}" title="PRUNE — delete decypharr-side, arr keeps monitoring" aria-label="Prune ${this.escape(h.entry_name)}">P</button>
-                        <button class="btn btn-xs btn-error btn-outline font-semibold" data-action="fix" data-component="arr_delete" data-name="${this.escapeAttr(h.entry_name)}" title="ARR-DELETE — delete the arr's file record" aria-label="Arr-delete ${this.escape(h.entry_name)}">G</button>
+                        <button class="btn btn-xs btn-error btn-outline font-semibold" data-action="fix" data-component="arr_delete" data-name="${this.escapeAttr(h.entry_name)}" title="ARR-DELETE — delete the arr's file record" aria-label="Arr-delete ${this.escape(h.entry_name)}">D</button>
+                        <button class="btn btn-xs btn-warning btn-outline font-semibold" data-action="fix" data-component="prune" data-name="${this.escapeAttr(h.entry_name)}" title="PRUNE — delete decypharr-side only, makes no arr call" aria-label="Prune ${this.escape(h.entry_name)}">P</button>
                     </div>
                 </td>
             `;
