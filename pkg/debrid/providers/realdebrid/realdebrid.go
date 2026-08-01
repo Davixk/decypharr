@@ -1033,21 +1033,20 @@ func (r *RealDebrid) GetAvailableSlots() (int, error) {
 		return 0, fmt.Errorf("realdebrid API error: Status: %d", resp.StatusCode)
 	}
 
-	// No local reserve is subtracted. minimum_free_slot used to take one here
-	// and has been removed rather than wired up.
+	// minimum_free_slot holds back capacity for other consumers of this
+	// account. Defaults to 0, so it is inert unless deliberately set.
 	//
-	// Its original purpose (upstream #83, comment: "Minimum number of active
-	// pots to maintain (used for cached stuffs, etc.)") was to keep headroom
-	// for OTHER add paths while a ticker-driven drainer filled the account from
-	// a queue. That asymmetry no longer exists — every add now passes through
-	// the same admission check, so there is no privileged path to reserve for.
+	// Its ORIGINAL purpose (upstream #83: "Minimum number of active pots to
+	// maintain (used for cached stuffs, etc.)") was headroom for privileged add
+	// paths while a ticker-driven drainer filled the account — that asymmetry
+	// is gone, since every add now passes one admission check. The surviving
+	// purpose is different and still real: an account decypharr does not own
+	// exclusively.
 	//
-	// The one remaining argument, a race between this reading and the
-	// provider's own accounting, is already covered: lose the race and the
-	// provider refuses, and the refusal requeues the job. A standing reserve
-	// would permanently shrink a paid account to avoid an error that is
-	// already handled correctly.
-	return data.TotalSlots - data.ActiveSlots, nil
+	// It is not a race guard. If this reading loses a race with the provider's
+	// own accounting, the provider refuses and the job requeues, which is
+	// already correct without any reserve.
+	return data.TotalSlots - data.ActiveSlots - r.config.MinimumFreeSlot, nil
 }
 
 func (r *RealDebrid) AccountManager() *account.Manager {

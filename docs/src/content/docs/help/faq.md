@@ -102,22 +102,18 @@ Or add multiple API keys for rotation:
 
 ### What happens when Debrid slots are full?
 
-Configure `minimum_free_slot` to switch to backup provider:
+Nothing you need to configure. Decypharr asks each provider whether it has room
+before sending it an add, and moves to the next provider in the chain if it does
+not. If every provider is full the item goes back to the queue and is retried,
+reporting `Queued` (SABnzbd) / `queuedDL` (qBittorrent) meanwhile. Nothing fails
+and nothing is lost.
 
-```json
-{
-  "debrids": [
-    {
-      "provider": "realdebrid",
-      "minimum_free_slot": 5
-    },
-    {
-      "provider": "alldebrid",
-      "minimum_free_slot": 0
-    }
-  ]
-}
-```
+Providers report capacity in two ways and both are handled: RealDebrid publishes
+its remaining slots up front, while AllDebrid has no such endpoint and reports by
+refusing the add — equally authoritative, just later.
+
+`minimum_free_slot` is **not** the knob for this. It reserves slots for *other
+users of the same account* and defaults to `0`.
 
 If RD has <5 free slots, Decypharr uses All Debrid.
 

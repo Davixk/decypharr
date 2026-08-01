@@ -89,7 +89,7 @@ Array of Debrid services:
 | `download_rate_limit`             | string | Separate limit for downloads                                                   | Same as `rate_limit`            |
 | `proxy`                           | string | HTTP(S) proxy URL                                                              | `""`                            |
 | `unpack_rar`                      | bool   | Auto-extract RAR archives                                                      | `true`                          |
-| `minimum_free_slot`               | int    | Minimum free torrent slots to use this provider                                | `0`                             |
+| `minimum_free_slot`               | int    | Slots reserved for **other users of this account** (another client, or your own manual use). Subtracted from the capacity decypharr admits against. Leave at `0` if decypharr is the only consumer | `0`                             |
 | `limit`                           | int    | Max torrents allowed on this provider                                          | `0` (unlimited)                 |
 | `workers`                         | int    | Concurrent API workers                                                         | Auto (CPU * 50 / num_providers) |
 | `torrents_refresh_interval`       | string | How often to refresh torrent list                                              | `5m`                            |

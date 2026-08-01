@@ -20,6 +20,7 @@ type DebridClientInfo struct {
 	Name             string `json:"name"`
 	Provider         string `json:"provider"`
 	DownloadUncached bool   `json:"download_uncached"`
+	MinimumFreeSlot  int    `json:"minimum_free_slot"`
 }
 
 // DebridChainDiagnosis reports the provider chain a torrent add would actually
@@ -61,6 +62,7 @@ func (m *Manager) RegisteredDebridClients() []DebridClientInfo {
 			Name:             dc.Name,
 			Provider:         dc.Provider,
 			DownloadUncached: dc.DownloadsUncached(),
+			MinimumFreeSlot:  dc.MinimumFreeSlot,
 		})
 	}
 	return infos

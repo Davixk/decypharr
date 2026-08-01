@@ -102,7 +102,11 @@ Set minimum free slots before using this provider:
 }
 ```
 
-- `minimum_free_slot`: Don't use if fewer than N slots free
+- `minimum_free_slot`: Slots to **reserve for other users of this account** — another
+  client, or your own manual use. Decypharr subtracts it from the capacity it will
+  admit against, so it never fills an account it does not exclusively own. Defaults
+  to `0`; leave it there if decypharr is the only consumer. It is **not** a minimum
+  required to enqueue, and **not** a threshold for skipping the provider.
 - `limit`: Max torrents allowed on this account
 
 ## Multiple Providers
