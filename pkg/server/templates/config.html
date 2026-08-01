@@ -344,7 +344,15 @@
                                 </label>
                                 <input type="number" class="input w-full" name="max_active_downloads"
                                        id="max_active_downloads" min="1" placeholder="5">
-                                <span class="text-sm opacity-70">Shared active limit for torrent and NZB downloads</span>
+                                <span class="text-sm opacity-70">Concurrent post-download work &mdash; mount waits, local fetches, symlink creation. Local I/O only; it does not limit how many items a provider will accept.</span>
+                            </div>
+                            <div>
+                                <label class="label" for="max_concurrent_jobs">
+                                    <span class="font-medium">Maximum Concurrent Jobs</span>
+                                </label>
+                                <input type="number" class="input w-full" name="max_concurrent_jobs"
+                                       id="max_concurrent_jobs" min="1" placeholder="500">
+                                <span class="text-sm opacity-70"><strong>Job slots, not downloads.</strong> A machine-overhead ceiling so a burst cannot swamp the host. Download parallelism is set by each provider's own reported capacity, not by this. Raise it only if you see jobs waiting with providers idle.</span>
                             </div>
                         </div>
                     </div>

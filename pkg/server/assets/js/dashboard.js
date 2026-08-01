@@ -347,13 +347,26 @@ class TorrentDashboard {
         `;
     }
 
+    // The complete set of states the qBittorrent shim emits. Anything missing
+    // here falls through and renders its raw protocol token to the operator.
+    //
+    // queuedDL was missing, and used to be unreachable so nobody noticed: the
+    // entry status was advanced to Downloading during the synchronous add, so
+    // an item waiting for a worker claimed to be transferring. Now that waiting
+    // items report the truth, this is the badge that says so — and without the
+    // entry below, the fix would have surfaced as a literal "queuedDL" in the
+    // table.
+    //
+    // pausedDL was missing for the same undramatic reason. 'queued' and
+    // 'paused' were in this map and are not states the shim can produce; they
+    // were dead entries implying a vocabulary that does not exist.
     renderStateBadge(state) {
         const stateMap = {
-            'pausedUP': {class: 'badge-success', text: 'Completed'},
             'downloading': {class: 'badge-info', text: 'Downloading'},
-            'error': {class: 'badge-error', text: 'Error'},
-            'queued': {class: 'badge-ghost', text: 'Queued'},
-            'paused': {class: 'badge-warning', text: 'Paused'}
+            'queuedDL': {class: 'badge-ghost', text: 'Queued'},
+            'pausedDL': {class: 'badge-warning', text: 'Paused'},
+            'pausedUP': {class: 'badge-success', text: 'Completed'},
+            'error': {class: 'badge-error', text: 'Error'}
         };
 
         const s = stateMap[state] || {class: 'badge-ghost', text: state};

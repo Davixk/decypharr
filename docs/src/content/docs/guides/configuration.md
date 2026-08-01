@@ -42,11 +42,26 @@ Password is bcrypt-hashed. API token is auto-generated.
 
 ```json
 {
-  "max_active_downloads": 5
+  "max_active_downloads": 5,
+  "max_concurrent_jobs": 500
 }
 ```
 
-`max_active_downloads` is the shared active-processing limit for torrent and NZB downloads. Additional imports remain queued until an active download completes.
+`max_active_downloads` bounds concurrent **post-download work** — mount waits, local
+fetches and symlink creation. It is local I/O only and does not limit how many items
+a provider will accept.
+
+`max_concurrent_jobs` bounds how many import **jobs** may be in flight. These are
+**job slots, not downloads**: it is a machine-overhead ceiling so a burst cannot
+swamp the host, not a stand-in for any provider's limit.
+
+Neither is what limits downloads. Decypharr asks each debrid provider for its own
+capacity and admits against that, per provider — RealDebrid publishes its remaining
+slots, AllDebrid reports by refusing an add. Items that cannot be admitted go back
+to the queue and report `Queued` / `queuedDL` until they can.
+
+NZB imports are not subject to provider admission at all. Linking an NZB consumes no
+provider download slot, so there is no such resource to budget against.
 
 ## Debrid Providers
 

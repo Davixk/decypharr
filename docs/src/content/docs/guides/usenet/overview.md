@@ -119,8 +119,13 @@ Prefetch buffer for smoother playback. Higher = smoother but more memory.
 }
 ```
 
-- `max_active_downloads`: Shared active-download limit for torrents and NZBs
+- `max_active_downloads`: concurrent post-download work (mount waits, symlink
+  creation). Local I/O only &mdash; **not** a limit on NZB imports
 - `processing_timeout`: Mark as bad if processing exceeds this
+
+NZB processing concurrency is `floor(total provider connections /
+usenet.processing_max_connections)`, not either job knob. NZB imports consume no
+provider download slot, so they are not subject to provider admission at all.
 
 ### Stream Read Timeout
 
@@ -199,7 +204,10 @@ See [Sabnzbd Integration](./sabnzbd/) for details.
 
 - Increase `processing_timeout` for large files
 - Reduce `availability_sample_percent` for faster checks
-- Increase `max_active_downloads` if the system and providers have capacity
+- To raise NZB processing concurrency, raise the providers' `max_connections` or
+  **lower** `usenet.processing_max_connections` &mdash; the gate is
+  `floor(pool / processing_max_connections)`, so raising that value *reduces* how
+  many NZBs process at once. `max_active_downloads` does not affect it.
 
 ### Incomplete Downloads
 
