@@ -242,3 +242,12 @@ Enable `download_uncached` per-Arr:
 :::caution
 Uncached downloads use Debrid provider's cache slots and may take time to download.
 :::
+
+:::note
+A provider can refuse uncached downloads regardless of this setting. Setting
+`"download_uncached": false` on an entry in `debrids[]` is a hard veto that no
+Arr can override — useful for keeping a provider with few active slots
+cache-only while another provider handles uncached grabs. Omitting the key on a
+provider leaves the decision to each Arr. See
+[How the two `download_uncached` settings combine](../configuration/#how-the-two-download_uncached-settings-combine).
+:::

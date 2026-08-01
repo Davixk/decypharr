@@ -594,12 +594,6 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		return nil, joinDebridErrors(errs)
 	}
 
-	// Provider download_uncached=false only acts as a ceiling while walking a
-	// multi-provider fallback chain, where a cache-only provider merely probes
-	// its cache before the chain moves on. On the default path the import
-	// request keeps its original precedence over provider config.
-	fallbackChain := importRequest.FallbackOnFailure && len(clients) > 1
-
 	for _, db := range clients {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("debrid request canceled: %w", err))
@@ -611,13 +605,23 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		if providerName == "" {
 			providerName = dbConfig.Provider
 		}
-		downloadUncached := resolveDownloadUncached(dbConfig.DownloadsUncached(), importRequest.DownloadUncached, fallbackChain)
+		downloadUncached, uncachedVetoed := resolveDownloadUncached(dbConfig.DownloadUncached, importRequest.DownloadUncached)
 		debridTorrent := newDebridAttempt(importRequest, downloadUncached)
 
 		_logger := db.Logger()
 		arrName := ""
 		if importRequest.Arr != nil {
 			arrName = importRequest.Arr.Name
+		}
+		if uncachedVetoed {
+			// The whole failure mode this guards against is silence: without
+			// this line, "why is this provider never taking uncached grabs?"
+			// has no answer anywhere in the logs.
+			_logger.Info().
+				Str("Provider", providerName).
+				Str("Arr", arrName).
+				Str("Hash", debridTorrent.InfoHash).
+				Msgf("Provider %q has download_uncached=false; ignoring the Arr's download_uncached=true and probing its cache only", providerName)
 		}
 		_logger.Info().
 			Str("Provider", providerName).
@@ -744,19 +748,40 @@ func newDebridAttempt(importRequest *ImportRequest, downloadUncached bool) *debr
 }
 
 // resolveDownloadUncached decides whether an attempt may start an uncached
-// download. On the default path (fallback disabled or a single candidate) the
-// import request's override wins outright over provider config, matching the
-// pre-fallback behavior. While walking a multi-provider fallback chain,
-// provider download_uncached=false is a hard ceiling: the cache-only provider
-// only probes its cache before the chain advances.
-func resolveDownloadUncached(providerAllows bool, requestOverride *bool, fallbackChain bool) bool {
-	if requestOverride != nil && !fallbackChain {
-		return *requestOverride
+// download, and reports whether a provider-level veto is what said no.
+//
+// Both inputs are tri-state on purpose, and the provider's nil is the load-
+// bearing one:
+//
+//	provider explicit false -> hard veto. No Arr-level value can lift it, on
+//	                           any path. A per-provider "no" that a client can
+//	                           override is not a per-provider setting.
+//	provider nil            -> no opinion. The Arr decides; with no Arr value
+//	                           either, the historical default (false) stands.
+//	provider explicit true  -> permitted. The Arr still decides, so an Arr
+//	                           false blocks.
+//
+// Do NOT "simplify" this to providerAllows && requestOverride using
+// Debrid.DownloadsUncached(): that collapses nil to false, and every
+// long-standing config that sets download_uncached only on the Arr — with no
+// debrids[].download_uncached key at all — would silently stop downloading
+// uncached releases. That failure presents as absence, which is the kind
+// nobody notices for weeks.
+//
+// This resolver is deliberately path-independent. It used to take a
+// fallbackChain flag and apply the veto only while walking a multi-provider
+// chain, which meant a provider's "no" survived only as a side effect of the
+// Arr's unrelated fallback_on_failure toggle.
+func resolveDownloadUncached(providerSetting, requestOverride *bool) (allowed, vetoed bool) {
+	if providerSetting != nil && !*providerSetting {
+		// Only worth reporting as a veto when something actually asked for
+		// uncached; otherwise nothing was overridden.
+		return false, requestOverride != nil && *requestOverride
 	}
-	if !providerAllows {
-		return false
+	if requestOverride != nil {
+		return *requestOverride, false
 	}
-	return requestOverride == nil || *requestOverride
+	return providerSetting != nil && *providerSetting, false
 }
 
 func providerStageError(providerName, stage string, err error) error {

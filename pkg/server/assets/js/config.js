@@ -631,14 +631,16 @@ class ConfigManager {
                 </div>
                 <div class="grid grid-cols-2 lg:grid-cols-3 gap-4 mt-6">
                     <div>
-                        <label class="label cursor-pointer justify-start gap-2">
-                            <input type="checkbox" class="checkbox checkbox-primary" 
-                                   name="debrid[${index}].download_uncached" id="debrid[${index}].download_uncached">
-                            <div>
-                                <span class="font-medium">Download Uncached</span>
-                                <div class="label-text-alt">Download uncached files</div>
-                            </div>
+                        <label class="label" for="debrid[${index}].download_uncached">
+                            <span class="font-medium">Download Uncached</span>
                         </label>
+                        <select class="select w-full"
+                                name="debrid[${index}].download_uncached" id="debrid[${index}].download_uncached">
+                            <option value="">Default (each Arr decides)</option>
+                            <option value="false">Never — refuse uncached here</option>
+                            <option value="true">Allow (Arr still decides)</option>
+                        </select>
+                        <span class="text-sm opacity-70">"Never" is a hard veto no Arr can override — use it to keep a provider cache-only</span>
                     </div>
 
                     <div>
@@ -1411,11 +1413,20 @@ class ConfigManager {
                 minimum_free_slot: parseInt(minimumFreeSlotInput.value) || 0,
                 priority: parseInt(priorityInput.value) || 0,
                 proxy: proxyInput.value,
-                download_uncached: downloadUncachedInput.checked,
                 unpack_rar: unpackRarInput.checked,
                 add_samples: addSamplesInput.checked,
                 user_agent: userAgentInput.value
             };
+
+            // download_uncached is deliberately tri-state and must stay absent
+            // when unset. A checkbox here would post an explicit false on every
+            // save, and an explicit false is a hard veto: any setup that only
+            // ever set download_uncached on the Arr would silently stop
+            // downloading uncached releases the first time someone opened this
+            // page and hit Save.
+            if (downloadUncachedInput.value !== '') {
+                debrid.download_uncached = downloadUncachedInput.value === 'true';
+            }
 
             // Handle download API keys
             if (downloadKeysTextarea && downloadKeysTextarea.value.trim()) {

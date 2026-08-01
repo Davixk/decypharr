@@ -82,7 +82,7 @@ Array of Debrid services:
 | `name`                            | string | Display name                                                                   | Provider type                   |
 | `api_key`                         | string | API key from provider dashboard                                                | **Required**                    |
 | `download_api_keys`               | array  | Additional keys for download rotation                                          | `[api_key]`                     |
-| `download_uncached`               | bool   | Download torrents not in provider cache                                        | `false`                         |
+| `download_uncached`               | bool   | Download torrents not in provider cache. Setting it to `false` explicitly is a hard veto no Arr can override; omitting the key leaves the decision to the Arr | Unset (Arr decides; `false` if neither sets it) |
 | `priority`                        | int    | Provider add priority (lower runs first; unset follows `debrids[]` order — reorder the array to reprioritize) | Unset (config order)            |
 | `rate_limit`                      | string | API rate limit (`200/minute`, `10/second`)                                     | `200/minute`                    |
 | `repair_rate_limit`               | string | Separate limit for repair operations                                           | Same as `rate_limit`            |
@@ -321,19 +321,37 @@ See the [Health Checker & Repair guide](/guides/repair/) for the full model, API
 | `host`                | Arr URL                                                               | Required    |
 | `token`               | Arr API key                                                           | Required    |
 | `skip_repair`         | Skip repair for this Arr                                              | `false`     |
-| `download_uncached`   | Allow uncached downloads when the chosen provider also allows them    | `false`     |
+| `download_uncached`   | Allow uncached downloads, unless the provider explicitly vetoes them  | `false`     |
 | `selected_debrid`     | Preferred Debrid provider; pinned when fallback is disabled           | `""` (auto) |
 | `fallback_on_failure` | Try remaining providers in priority order after the preferred fails   | `false`     |
 | `source`              | Config source (`auto`, `config`)                                      | `config`    |
 
 With `fallback_on_failure: false`, a non-empty `selected_debrid` keeps the
-existing pin behavior, and the Arr's `download_uncached` setting keeps its
-original precedence over the provider's. When fallback is enabled, the selected
-provider is still tried first; only a rejection or failure advances to the
-remaining providers. While walking a multi-provider fallback chain, a provider
-with `download_uncached: false` only probes its cache: an uncached release is
-submitted, detected as not cached, cleaned up, and the chain advances — it
-cannot start an uncached download even when the Arr permits uncached downloads.
+existing pin behavior. When fallback is enabled, the selected provider is still
+tried first; only a rejection or failure advances to the remaining providers.
+
+### How the two `download_uncached` settings combine
+
+`download_uncached` exists both per-Arr and per-provider, and the provider's
+copy is three-state — the difference between "set to `false`" and "not set at
+all" is what decides the outcome. This is evaluated **per provider**, on every
+path; enabling or disabling `fallback_on_failure` does not change it.
+
+| `debrids[].download_uncached` | Meaning                | Result                                            |
+|-------------------------------|------------------------|---------------------------------------------------|
+| `false` (explicit)            | Hard veto              | Never uncached, whatever the Arr asks for         |
+| absent                        | No opinion             | The Arr decides; `false` if the Arr is silent too |
+| `true` (explicit)             | Permitted              | The Arr decides — an Arr `false` still blocks     |
+
+So a provider you want to keep cache-only needs `"download_uncached": false`
+written explicitly; leaving the key out delegates the decision to each Arr.
+When a provider's explicit `false` overrides an Arr's `true`, decypharr logs it
+at INFO naming the provider, so the refusal is never silent.
+
+A provider vetoed this way still **probes its cache**: the release is
+submitted, detected as not cached, cleaned up, and the chain advances. It
+therefore occupies one slot on that provider transiently before moving on, and
+cannot start an uncached download.
 
 ## Queue Cleanup
 

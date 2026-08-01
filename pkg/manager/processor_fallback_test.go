@@ -363,7 +363,13 @@ func TestSendToDebridCachedBackupKeepsUncachedDisabled(t *testing.T) {
 	}
 }
 
-func TestSendToDebridDefaultPathRequestUncachedOverridesProvider(t *testing.T) {
+// This case used to assert the opposite: with fallback disabled, an Arr-level
+// download_uncached=true overrode a provider's explicit false outright. That
+// made a per-provider setting hold only while an unrelated toggle
+// (fallback_on_failure) happened to be on. An explicit provider "no" is now a
+// veto on every path, so a single pinned cache-only provider probes its cache
+// and refuses, exactly as it would mid-chain.
+func TestSendToDebridProviderVetoHoldsWithFallbackDisabled(t *testing.T) {
 	primary := &fakeDebridClient{
 		cfg: config.Debrid{Name: "primary", DownloadUncached: boolPointer(false)},
 		checkFn: func(torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
@@ -372,23 +378,23 @@ func TestSendToDebridDefaultPathRequestUncachedOverridesProvider(t *testing.T) {
 		},
 	}
 
-	torrent, err := fallbackTestManager(primary).SendToDebrid(context.Background(), fallbackTestRequest("primary", false, boolPointer(true)))
-	if err != nil {
-		t.Fatalf("SendToDebrid returned error: %v", err)
+	_, err := fallbackTestManager(primary).SendToDebrid(context.Background(), fallbackTestRequest("primary", false, boolPointer(true)))
+	if err == nil {
+		t.Fatal("expected the cache-only provider to refuse an uncached release even with fallback disabled")
 	}
-	if torrent.Status != debridTypes.TorrentStatusDownloading {
-		t.Fatalf("unexpected torrent status: %q", torrent.Status)
+	if !strings.Contains(err.Error(), "not cached and uncached downloads are disabled") {
+		t.Fatalf("missing uncached refusal: %v", err)
 	}
 	submit, _, available := primary.counts()
 	if submit != 1 || available != 0 {
 		t.Fatalf("default path calls: submit=%d available=%d", submit, available)
 	}
 	snapshots := primary.snapshots()
-	if len(snapshots) != 1 || !snapshots[0].downloadUncached {
-		t.Fatalf("request-level uncached override was lost: %+v", snapshots)
+	if len(snapshots) != 1 || snapshots[0].downloadUncached {
+		t.Fatalf("provider download_uncached=false was overridden by the Arr: %+v", snapshots)
 	}
-	if deleted := primary.deleted(); len(deleted) != 0 {
-		t.Fatalf("accepted torrent was deleted: %v", deleted)
+	if deleted := primary.deleted(); len(deleted) != 1 || deleted[0] != "primary-id" {
+		t.Fatalf("vetoed probe was not cleaned up: %v", deleted)
 	}
 }
 
@@ -465,31 +471,41 @@ func TestSendToDebridJoinsErrorsFromEveryAttempt(t *testing.T) {
 	}
 }
 
+// The complete truth table. There is no longer a "default path" and a "chain
+// path" — the resolver is path-independent, so these nine rows are the whole
+// behavior for every request shape.
 func TestResolveDownloadUncachedPrecedence(t *testing.T) {
 	tests := []struct {
 		name            string
-		providerAllows  bool
+		providerSetting *bool
 		requestOverride *bool
-		fallbackChain   bool
 		want            bool
+		wantVetoed      bool
 	}{
-		// Default path: the import request wins outright over provider config.
-		{name: "default provider disabled request nil", providerAllows: false, want: false},
-		{name: "default provider disabled request enabled", providerAllows: false, requestOverride: boolPointer(true), want: true},
-		{name: "default provider enabled request disabled", providerAllows: true, requestOverride: boolPointer(false), want: false},
-		{name: "default provider enabled request nil", providerAllows: true, want: true},
-		// Fallback chain: provider download_uncached=false is a hard ceiling.
-		{name: "chain provider disabled request nil", providerAllows: false, fallbackChain: true, want: false},
-		{name: "chain provider disabled request enabled", providerAllows: false, requestOverride: boolPointer(true), fallbackChain: true, want: false},
-		{name: "chain provider enabled request disabled", providerAllows: true, requestOverride: boolPointer(false), fallbackChain: true, want: false},
-		{name: "chain provider enabled request nil", providerAllows: true, fallbackChain: true, want: true},
-		{name: "chain provider enabled request enabled", providerAllows: true, requestOverride: boolPointer(true), fallbackChain: true, want: true},
+		// Provider says nothing: the Arr decides, and with neither set the
+		// historical default (false) stands.
+		{name: "provider nil request nil", want: false},
+		{name: "provider nil request disabled", requestOverride: boolPointer(false), want: false},
+		{name: "provider nil request enabled", requestOverride: boolPointer(true), want: true},
+		// Provider explicitly refuses: a hard veto nothing can lift.
+		{name: "provider disabled request nil", providerSetting: boolPointer(false), want: false},
+		{name: "provider disabled request disabled", providerSetting: boolPointer(false), requestOverride: boolPointer(false), want: false},
+		{name: "provider disabled request enabled", providerSetting: boolPointer(false), requestOverride: boolPointer(true), want: false, wantVetoed: true},
+		// Provider explicitly permits: the Arr still decides.
+		{name: "provider enabled request nil", providerSetting: boolPointer(true), want: true},
+		{name: "provider enabled request disabled", providerSetting: boolPointer(true), requestOverride: boolPointer(false), want: false},
+		{name: "provider enabled request enabled", providerSetting: boolPointer(true), requestOverride: boolPointer(true), want: true},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := resolveDownloadUncached(test.providerAllows, test.requestOverride, test.fallbackChain); got != test.want {
-				t.Fatalf("resolveDownloadUncached() = %v, want %v", got, test.want)
+			got, vetoed := resolveDownloadUncached(test.providerSetting, test.requestOverride)
+			if got != test.want {
+				t.Fatalf("resolveDownloadUncached() allowed = %v, want %v", got, test.want)
+			}
+			if vetoed != test.wantVetoed {
+				t.Fatalf("resolveDownloadUncached() vetoed = %v, want %v: the veto is only reported when an "+
+					"Arr-level request for uncached was actually overridden", vetoed, test.wantVetoed)
 			}
 		})
 	}
