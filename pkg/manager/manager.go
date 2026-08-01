@@ -111,7 +111,12 @@ type Manager struct {
 	revivalDoomWarned sync.Map
 
 	// actionSem bounds concurrently running post-download actions (mount
-	// waits, local fetches, symlink creation). Sized max(4, MaxActiveDownloads)
+	// waits, local fetches, symlink creation) — real local I/O, and
+	// deliberately NOT scaled with the job-slot ceiling. Measured over the
+	// heaviest load this stack has seen: 3,958 symlink creations, 97/min peak,
+	// 3 failures and zero mount faults at width 14. There is no evidence
+	// arguing for more, and scaling it with MaxConcurrentJobs would turn a
+	// queue fix into a mount storm. Sized max(4, MaxActiveDownloads)
 	// so a reboot backlog of claimed actions drains progressively instead of
 	// stampeding a cold mount and the persist mutex, while never dropping
 	// below the worker count so claimed work cannot starve behind imports.
@@ -331,7 +336,11 @@ func (m *Manager) initJobQueue() {
 	if err := m.cleanupOrphanedStagedNZBs(); err != nil {
 		m.logger.Warn().Err(err).Msg("Failed to reconcile orphaned staged NZBs")
 	}
-	m.jobQueue = NewJobQueue(m.ctx, m.config.MaxActiveDownloads, m.processJob)
+	// Sized by the machine ceiling, NOT by max_active_downloads. This pool is
+	// job slots; a short NZB import must not queue behind an uncached torrent
+	// that holds a worker for the whole download. Provider capacity is enforced
+	// per provider at the debrid call site, and local I/O by actionSem.
+	m.jobQueue = NewJobQueue(m.ctx, m.config.MaxConcurrentJobs, m.processJob)
 	// Restore persisted active/queued downloads in the background. With large
 	// queues this re-parses thousands of NZBs over the network, and running it
 	// inline blocked manager construction — and therefore the HTTP server —

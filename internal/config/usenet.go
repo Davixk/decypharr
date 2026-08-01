@@ -214,23 +214,29 @@ func (c *Config) UsenetConnectionBudgetWarning() string {
 		return ""
 	}
 	totalProviderConns := c.UsenetProviderConnectionTotal()
-	if totalProviderConns <= 0 || c.MaxActiveDownloads <= 0 || c.Usenet.ProcessingMaxConnections <= 0 {
+	pmc := c.Usenet.ProcessingMaxConnections
+	if totalProviderConns <= 0 || pmc <= 0 {
 		return ""
 	}
-	demand := c.MaxActiveDownloads * c.Usenet.ProcessingMaxConnections
-	budget := 2 * totalProviderConns
-	if demand <= budget {
-		return ""
+
+	// This used to warn when max_active_downloads x processing_max_connections
+	// exceeded twice the provider pool. That formula no longer describes
+	// anything: NNTP passes are bounded by processSem = floor(pool / pmc), so
+	// gate x pmc <= pool holds BY CONSTRUCTION and the old demand figure can
+	// never be reached. max_active_downloads does not size the job pool either
+	// — it bounds post-download local I/O.
+	//
+	// The misconfiguration that IS still possible, and is invisible otherwise:
+	// a per-pass connection budget larger than the entire pool clamps the gate
+	// to 1, silently serialising every NZB import. That is worth saying out
+	// loud, because the symptom is slowness with nothing in the logs.
+	if pmc > totalProviderConns {
+		return fmt.Sprintf(
+			"usenet.processing_max_connections (%d) exceeds the total provider connection budget (%d), so concurrent NZB processing is clamped to 1 and imports run fully serialised. Lower processing_max_connections to at most %d, or raise the providers' max_connections",
+			pmc, totalProviderConns, totalProviderConns,
+		)
 	}
-	recommendedActive := budget / c.Usenet.ProcessingMaxConnections
-	if recommendedActive < 1 {
-		recommendedActive = 1
-	}
-	return fmt.Sprintf(
-		"max_active_downloads (%d) x usenet.processing_max_connections (%d) = %d demanded connections exceeds 2x the total provider connection budget (2 x %d = %d); parallel imports can exhaust provider connections and wedge the NNTP substrate. Keep max_active_downloads x processing_max_connections <= %d (e.g. max_active_downloads <= %d)",
-		c.MaxActiveDownloads, c.Usenet.ProcessingMaxConnections, demand,
-		totalProviderConns, budget, budget, recommendedActive,
-	)
+	return ""
 }
 
 func validateUsenet(providers []UsenetProvider) error {

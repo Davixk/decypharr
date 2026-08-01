@@ -19,7 +19,13 @@ var (
 	DefaultDFSDiskCacheSize = "500MB"
 
 	DefaultAccountSyncInterval = "10m"
-	DefaultAvailableSlots      = 100 // This is for providers that does not provide available slots info
+
+	// DefaultMaxConcurrentJobs bounds in-flight import JOBS, not downloads. It
+	// is a machine-overhead ceiling — the point at which goroutine fan-out
+	// threatens the host — not a stand-in for any provider's limit. Provider
+	// capacity is asked for per provider; local I/O is bounded by
+	// max_active_downloads. Neither is this number.
+	DefaultMaxConcurrentJobs = 500
 
 	DefaultRetryDelay    = 500 * time.Millisecond
 	DefaultRetryDelayMax = 30 * time.Second

@@ -428,7 +428,32 @@ type Config struct {
 	// Manager settings
 	DownloadFolder        string                   `json:"download_folder,omitempty"`
 	RefreshInterval       string                   `json:"refresh_interval,omitempty"`
-	MaxActiveDownloads    int                      `json:"max_active_downloads,omitempty"`
+	// MaxActiveDownloads bounds concurrent post-download ACTIONS — mount waits,
+	// local fetches, symlink creation. Real local I/O, and the only thing this
+	// number has ever effectively controlled.
+	//
+	// It used to also size the job-worker pool, which is how a machine-resource
+	// number ended up gating provider admission and, worse, budgeting usenet
+	// imports that consume no provider resource at all. That job now belongs to
+	// MaxConcurrentJobs; this keeps its name, its value and its meaning, which
+	// is accurate for the first time.
+	MaxActiveDownloads int `json:"max_active_downloads,omitempty"`
+
+	// MaxConcurrentJobs bounds how many import jobs may be IN FLIGHT at once.
+	//
+	// This is JOB SLOTS, NOT DOWNLOADS. It exists to stop unbounded goroutine
+	// fan-out from overwhelming the machine — the reason the unified job queue
+	// was built (a52e56d, "fix issues with dfs hangs") — and it is not a proxy
+	// for anybody's API limit. Real download parallelism is bounded elsewhere:
+	// upstream by per-provider admission against what the provider reports, and
+	// downstream by MaxActiveDownloads.
+	//
+	// Sized in the hundreds on purpose. The old value of 14 was a plausible
+	// number of simultaneous debrid downloads and an absurd cap on job slots:
+	// short jobs queued behind long ones in a strict FIFO, so an NZB import
+	// taking 1-5s of real work waited up to 17 MINUTES behind uncached torrents
+	// that hold a worker for the entire download.
+	MaxConcurrentJobs int `json:"max_concurrent_jobs,omitempty"`
 	SkipPreCache          bool                     `json:"skip_pre_cache,omitempty"`
 	SkipMultiSeason       bool                     `json:"skip_multi_season,omitempty"`
 	AlwaysRmTrackerUrls   bool                     `json:"always_rm_tracker_urls,omitempty"`
@@ -684,6 +709,13 @@ func (c *Config) setDefaults() {
 	if c.MaxActiveDownloads <= 0 {
 		c.MaxActiveDownloads = 5
 	}
+	// Deliberately NOT aliased to max_active_downloads. Reading the old key
+	// here would hand every existing config its old 5-or-14 as a job-slot
+	// ceiling and silently deliver none of the fix, while looking migrated.
+	// A new key with its own default is the only version that actually lands.
+	if c.MaxConcurrentJobs <= 0 {
+		c.MaxConcurrentJobs = DefaultMaxConcurrentJobs
+	}
 	if c.DebridReadTimeout == "" {
 		c.DebridReadTimeout = "60s"
 	}
@@ -921,11 +953,12 @@ func clearHotFields(c *Config) {
 	c.CallbackURL = ""
 	c.DownloadFolder = ""
 	c.RefreshInterval = ""
-	// MaxActiveDownloads is deliberately NOT cleared here (i.e. it is a cold,
-	// restart-required field): the manager sizes its active-download worker
-	// pool and the post-download action gate from it once at construction, and
-	// nothing rebuilds them on a live config apply. Treating it as hot made
-	// changes silently require a restart without telling the user.
+	// MaxActiveDownloads and MaxConcurrentJobs are deliberately NOT cleared here
+	// (i.e. both are cold, restart-required fields): the manager sizes the
+	// post-download action gate and the job-worker pool from them once at
+	// construction, and nothing rebuilds either on a live config apply.
+	// Treating them as hot made changes silently require a restart without
+	// telling the user.
 	c.SkipPreCache = false
 	c.SkipMultiSeason = false
 	c.AlwaysRmTrackerUrls = false

@@ -52,6 +52,11 @@ func (c *Config) applyEnvOverrides() {
 			c.MaxActiveDownloads = v
 		}
 	}
+	if val := getEnv("MAX_CONCURRENT_JOBS"); val != "" {
+		if v, err := strconv.Atoi(val); err == nil {
+			c.MaxConcurrentJobs = v
+		}
+	}
 	if val := getEnv("SKIP_PRE_CACHE"); val != "" {
 		c.SkipPreCache = parseBool(val)
 	}
