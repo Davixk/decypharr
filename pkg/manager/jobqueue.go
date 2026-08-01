@@ -53,9 +53,10 @@ func NewJob(jobType JobType, req *ImportRequest) *Job {
 	}
 }
 
-// JobQueue is a unified, unbounded, thread-safe job queue with a fixed worker pool.
-// It replaces the separate ImportRequest queue, nzbJobQueue, and unbounded goroutine
-// fan-out with a single queue that processes both torrent and NZB jobs.
+// JobQueue is a unified, unbounded, thread-safe job queue with a worker pool
+// that GROWS ON DEMAND up to maxWorkers. It replaces the separate
+// ImportRequest queue, nzbJobQueue, and unbounded goroutine fan-out with a
+// single queue that processes both torrent and NZB jobs.
 type JobQueue struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -63,6 +64,8 @@ type JobQueue struct {
 	closed bool
 
 	maxWorkers int
+	running    int // workers alive; guarded by mu
+	idle       int // workers parked in pop(); guarded by mu
 	logger     zerolog.Logger
 	wg         sync.WaitGroup
 	active     atomic.Int64
@@ -73,7 +76,20 @@ type JobQueue struct {
 	cancel      context.CancelFunc
 }
 
-// NewJobQueue creates a new unified job queue with the given number of workers
+// NewJobQueue creates a job queue that will run at most maxWorkers jobs at once.
+//
+// Workers are started ON DEMAND rather than all at construction. maxWorkers is a
+// machine-overhead CEILING — the point past which fan-out threatens the host —
+// and a ceiling should bound what may be allocated, not allocate it. Spawning
+// the full pool up front made an idle queue pay for its own worst case: at the
+// current default that is 500 goroutines parked on a condvar for an instance
+// that may never run five jobs.
+//
+// It also had a sharp edge that only showed under load in CI, where several
+// managers exist at once: thousands of goroutines created at startup shifted
+// scheduling enough to lose a race that had always been latent. The eager pool
+// did not cause that bug, but it made the machine ceiling expensive to raise —
+// which is exactly the property a ceiling must not have.
 func NewJobQueue(ctx context.Context, maxWorkers int, processFunc func(ctx context.Context, job *Job)) *JobQueue {
 	if maxWorkers <= 0 {
 		maxWorkers = 5
@@ -90,13 +106,7 @@ func NewJobQueue(ctx context.Context, maxWorkers int, processFunc func(ctx conte
 	}
 	q.cond = sync.NewCond(&q.mu)
 
-	// Start worker goroutines
-	for i := 0; i < maxWorkers; i++ {
-		q.wg.Add(1)
-		go q.worker(i)
-	}
-
-	q.logger.Info().Int("workers", maxWorkers).Msg("Job queue started")
+	q.logger.Info().Int("max_workers", maxWorkers).Msg("Job queue started (workers start on demand)")
 	return q
 }
 
@@ -110,13 +120,32 @@ func (q *JobQueue) Submit(job *Job) error {
 	}
 
 	q.jobs = append(q.jobs, job)
+
+	// Grow the pool only when no parked worker can take this job and we are
+	// under the ceiling. Workers persist once started, so the pool settles at
+	// the high-water mark of real concurrent demand rather than at maxWorkers.
+	if q.idle == 0 && q.running < q.maxWorkers {
+		q.running++
+		q.wg.Add(1)
+		go q.worker(q.running)
+	}
+
 	q.cond.Signal() // Wake one waiting worker
 	q.logger.Debug().
 		Str("id", job.ID).
 		Str("type", string(job.Type)).
 		Int("queued", len(q.jobs)).
+		Int("workers", q.running).
 		Msg("Job submitted")
 	return nil
+}
+
+// Workers returns the number of worker goroutines currently alive. Exposed for
+// tests asserting that the pool grows on demand rather than up front.
+func (q *JobQueue) Workers() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.running
 }
 
 // Len returns the current number of pending jobs
@@ -212,8 +241,13 @@ func (q *JobQueue) pop() *Job {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	// idle is what Submit consults to decide whether growing the pool would
+	// actually buy anything. It must bracket the Wait exactly: a worker is only
+	// available to take new work while it is parked here.
 	for len(q.jobs) == 0 && !q.closed {
+		q.idle++
 		q.cond.Wait()
+		q.idle--
 	}
 
 	if q.closed {
