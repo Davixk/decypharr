@@ -103,3 +103,28 @@ func TestAverageSpeedIsZeroWhenUncomputable(t *testing.T) {
 		})
 	}
 }
+
+// Entry.Progress is a 0..1 fraction; CachedTorrent.Progress is the provider's
+// 0-100 scale, copied verbatim from debridTypes.Torrent. The live add path
+// divides by 100; the migration path did not, so a migrated entry landed 100x
+// high — which reads as "downloaded 100x the file size" and clamps the
+// remainder to zero, silently reporting an unknown ETA for everything.
+//
+// The two scales are the reason the field carried a wrong doc comment for so
+// long: both readings are true, of different structs.
+func TestMigratedProgressIsConvertedToAFraction(t *testing.T) {
+	ct := &CachedTorrent{Size: 1000, Progress: 34, Status: "downloading"}
+
+	entry := ct.ToManagedTorrent()
+
+	if entry.Progress > 1 {
+		t.Fatalf("Entry.Progress = %v, want a 0..1 fraction: the provider's 0-100 scale must be converted "+
+			"on the migration path exactly as it is on the live path", entry.Progress)
+	}
+	if got := entry.DownloadedBytes(); got != 340 {
+		t.Fatalf("DownloadedBytes() = %d, want 340", got)
+	}
+	if got := entry.RemainingBytes(); got != 660 {
+		t.Fatalf("RemainingBytes() = %d, want 660 — an unconverted scale clamps this to 0", got)
+	}
+}

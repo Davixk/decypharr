@@ -226,7 +226,10 @@ type ProviderEntry struct {
 	AddedAt   time.Time                 `msgpack:"added_at" json:"added_at"`                         // When added to this debrid
 	RemovedAt *time.Time                `msgpack:"removed_at,omitempty" json:"removed_at,omitempty"` // When removed (if archived)
 	Status    debridTypes.TorrentStatus `msgpack:"status" json:"status"`                             // ProviderEntry status
-	Progress  float64                   `msgpack:"progress" json:"progress"`                         // Download progress on this debrid (0-100)
+	// FRACTION in 0..1, despite what this comment used to say. It is assigned
+	// from Entry.Progress (processor.go: placement.Progress = entry.Progress),
+	// which is already divided by 100 on the way in from the provider.
+	Progress float64 `msgpack:"progress" json:"progress"`
 
 	// Provider-specific file information
 	Files map[string]*ProviderFile `msgpack:"files" json:"files"` // filename -> debrid-specific file info
@@ -606,10 +609,17 @@ func (ct *CachedTorrent) ToManagedTorrent() *Entry {
 		Magnet:           "",
 		ActiveProvider:   ct.Debrid,
 		Providers:        make(map[string]*ProviderEntry),
-		Status:           debridTypes.TorrentStatus(ct.Status),
-		Progress:         ct.Progress,
-		Speed:            ct.Speed,
-		Seeders:          ct.Seeders,
+		Status: debridTypes.TorrentStatus(ct.Status),
+		// CachedTorrent.Progress is on the PROVIDER's 0-100 scale (it is copied
+		// verbatim from debridTypes.Torrent), while Entry.Progress is a 0..1
+		// fraction. The live path divides by 100 (processor.go:
+		// entry.Progress = debridTorrent.Progress / 100.0); this migration path
+		// did not, so every migrated entry landed 100x high — enough to make
+		// DownloadedBytes report 100x the file size and RemainingBytes clamp to
+		// zero.
+		Progress: ct.Progress / 100.0,
+		Speed:    ct.Speed,
+		Seeders:  ct.Seeders,
 		IsComplete:       ct.IsComplete,
 		Bad:              ct.Bad,
 		Category:         category,
