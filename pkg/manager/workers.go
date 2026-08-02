@@ -130,6 +130,24 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		}
 	}
 
+	// Stall prune. Always scheduled; the sweep itself no-ops when
+	// stall_prune_after is empty, which is what lets the knob be hot — an
+	// operator who set it too aggressively can disable it without a restart,
+	// and this pass deletes data so that matters.
+	if jd, err := utils.ConvertToJobDef(stallPruneSweepInterval); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to convert stall prune interval to job definition")
+	} else {
+		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
+			if pruned := m.pruneStalledDownloads(ctx, stallPruneSweepLimit); pruned > 0 {
+				m.logger.Info().Int("pruned", pruned).Msg("Stall prune released provider slots held by stalled torrents")
+			}
+		}), gocron.WithContext(ctx), gocron.WithName("stall-prune")); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to create stall prune job")
+		} else {
+			m.logger.Debug().Msgf("Stall prune job scheduled for every %s", stallPruneSweepInterval)
+		}
+	}
+
 	// NZB refresh job for pending archives (every 5 minutes)
 	if m.usenet != nil {
 		if jd, err := utils.ConvertToJobDef("10m"); err != nil {

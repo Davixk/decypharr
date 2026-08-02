@@ -454,6 +454,19 @@ type Config struct {
 	// taking 1-5s of real work waited up to 17 MINUTES behind uncached torrents
 	// that hold a worker for the entire download.
 	MaxConcurrentJobs int `json:"max_concurrent_jobs,omitempty"`
+
+	// StallPruneAfter deletes a torrent that has transferred ZERO bytes for
+	// this long, releasing the provider slot it was holding. Empty (the
+	// default) disables it entirely.
+	//
+	// Off by default and on purpose: it deletes data, and the right threshold
+	// depends on a library's own ETA distribution rather than on a number we
+	// can pick for everyone.
+	//
+	// If you set it, do not go below ~30m. AllDebrid prunes its own no-peer
+	// magnets at 30 minutes, and a shorter window here just races the provider
+	// to the same delete while risking torrents that are merely slow to start.
+	StallPruneAfter string `json:"stall_prune_after,omitempty"`
 	SkipPreCache          bool                     `json:"skip_pre_cache,omitempty"`
 	SkipMultiSeason       bool                     `json:"skip_multi_season,omitempty"`
 	AlwaysRmTrackerUrls   bool                     `json:"always_rm_tracker_urls,omitempty"`
@@ -959,6 +972,11 @@ func clearHotFields(c *Config) {
 	// construction, and nothing rebuilds either on a live config apply.
 	// Treating them as hot made changes silently require a restart without
 	// telling the user.
+	// Read live by every stall-prune sweep, so a change takes effect on the
+	// next pass without a restart. That matters specifically for this knob:
+	// it deletes data, and an operator who has set it too aggressively must be
+	// able to turn it off immediately rather than waiting for a restart window.
+	c.StallPruneAfter = ""
 	c.SkipPreCache = false
 	c.SkipMultiSeason = false
 	c.AlwaysRmTrackerUrls = false
