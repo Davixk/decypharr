@@ -71,9 +71,13 @@ type Entry struct {
 	State TorrentState `msgpack:"state" json:"state"` // This is for QBitTorrent compatibility
 	// Provider State (from active providerEntry)
 	Status   debridTypes.TorrentStatus `msgpack:"status" json:"status"`     // downloaded, downloading, queued, error
-	Progress float64                   `msgpack:"progress" json:"progress"` // Download progress (0-100)
-	Speed    int64                     `msgpack:"speed" json:"speed"`       // Download speed
-	Seeders  int                       `msgpack:"seeders" json:"seeders"`   // Number of seeders
+	// Progress is a FRACTION in 0..1, NOT a percentage. This comment said
+	// 0-100 while every consumer multiplied by it directly and live responses
+	// carry values like 0.034 — the doc was wrong, not the code. Prefer
+	// DownloadedBytes() / RemainingBytes() over open-coding the arithmetic.
+	Progress float64                   `msgpack:"progress" json:"progress"`
+	Speed    int64                     `msgpack:"speed" json:"speed"`     // Instantaneous bytes/sec; see AverageSpeed() for the lifetime rate
+	Seeders  int                       `msgpack:"seeders" json:"seeders"` // Number of seeders
 
 	IsComplete bool `msgpack:"is_complete" json:"is_complete"` // Ready for use
 	Bad        bool `msgpack:"bad" json:"bad"`                 // Marked as bad/corrupted

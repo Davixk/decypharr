@@ -408,9 +408,16 @@ func convertToQBitTorrentTorrent(t *storage.Entry) Torrent {
 		Name:         t.Name,
 		Size:         t.Size,
 		Progress:     t.Progress,
-		Dlspeed:      t.Speed,
-		Eta:          int64(0), // ETA not tracked
-		NumSeeds:     t.Seeders,
+		Dlspeed: t.Speed,
+		// Real ETA at the current rate, or storage.EtaUnknown (8640000) when
+		// there is nothing to extrapolate from. This was hardcoded 0, and 0 in
+		// the qBittorrent contract means "arriving now" rather than "unknown" —
+		// so every consumer read a confident wrong value. Sonarr computes its
+		// own estimate and does not simply echo this, so fixing it does not
+		// necessarily change the arr UI; it stops OUR API asserting something
+		// untrue.
+		Eta:      t.ETASeconds(),
+		NumSeeds: t.Seeders,
 		State:        t.State,
 		Category:     t.Category,
 		SavePath:     t.SavePath,
@@ -419,8 +426,8 @@ func convertToQBitTorrentTorrent(t *storage.Entry) Torrent {
 		CompletionOn: 0,
 		Debrid:       t.ActiveProvider,
 		DebridID:     "",
-		AmountLeft:   int64(float64(t.Size) * (1 - t.Progress)),
-		Downloaded:   int64(float64(t.Size) * t.Progress),
+		AmountLeft:   t.RemainingBytes(),
+		Downloaded:   t.DownloadedBytes(),
 		MagnetURI:    t.Magnet,
 		Files:        getTorrentFiles(t),
 
