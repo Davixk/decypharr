@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -211,5 +212,39 @@ func TestOmittedSafetyKnobsGetDefaultsRatherThanZero(t *testing.T) {
 	}
 	if s.noProgressAfter != 0 {
 		t.Fatal("stage 1 must stay disabled when only MaxETA was configured — stages are independent")
+	}
+}
+
+// The operator's requirement, in his words: "if you just PRUNE it without
+// reporting it as FAILED, the arr doesnt see a failure and can't react to it."
+//
+// An earlier version of this feature called DeleteEntry, which freed the
+// provider slot and told the arr nothing. The arr kept a queue row for a
+// download that no longer existed anywhere, believed it was still progressing,
+// and would never re-grab — turning a stalled torrent into a permanently
+// missing episode. That is worse than leaving the stall in place, because a
+// stall is at least visible.
+//
+// MarkAsError is the path every other failure in decypharr takes to reach the
+// arr: it sets EntryStateError, which the qBittorrent shim reports as state
+// "error". This asserts the entry ends up in exactly that state rather than
+// being deleted out from under the arr.
+func TestPrunedEntryIsFailedSoTheArrCanSeeIt(t *testing.T) {
+	entry := stallEntry(nil)
+
+	entry.MarkAsError(fmt.Errorf("stall prune: no bytes transferred in 2h"))
+
+	if entry.State != storage.EntryStateError {
+		t.Fatalf("State = %q, want %q: the qbit shim reports State verbatim, and it is the only signal "+
+			"the arr has that this download failed", entry.State, storage.EntryStateError)
+	}
+	if entry.Status != debridTypes.TorrentStatusError {
+		t.Fatalf("Status = %q, want error", entry.Status)
+	}
+	if entry.LastError == "" {
+		t.Fatal("LastError must record why, or the operator cannot tell a stall prune from any other failure")
+	}
+	if entry.IsDownloading {
+		t.Fatal("a failed entry must not still claim to be downloading")
 	}
 }

@@ -116,19 +116,26 @@ func prunableReason(e *storage.Entry, s stallPruneSettings, now time.Time) strin
 	return ""
 }
 
-// pruneStalledDownloads deletes torrents that will not finish and releases the
+// pruneStalledDownloads FAILS torrents that will not finish, and releases the
 // provider slot each one was holding.
 //
-// This exists because provider slots are finite and a stalled torrent holds one
-// indefinitely. Once admission is metered against provider-reported capacity, a
-// pool slowly filling with entries that will never finish quietly converts a
-// working account into a full one — so the admission layer ends up carefully
-// metering access to a resource that is being wasted.
+// It fails them rather than deleting them, and that distinction is the whole
+// feature. An earlier version called DeleteEntry, which freed the slot and told
+// the *arr nothing — leaving the *arr holding a queue row for a download that no
+// longer existed anywhere, believing it was still progressing. It would never
+// re-grab, so a stalled torrent became a permanently missing episode instead of
+// a retried one. That is WORSE than leaving the stall in place, because a stall
+// is at least visible.
 //
-// Deletion goes through DeleteEntry(removePlacements: true) precisely so the
-// PROVIDER placement is removed, not just the local record. A prune that leaves
-// the remote torrent behind converts a stalled slot into a leaked one, which is
-// strictly worse than doing nothing.
+// So the order is: release the provider placement (the slot is the resource we
+// are reclaiming), then mark the entry errored. MarkAsError sets
+// EntryStateError, which the qBittorrent shim reports as state "error" — the
+// same path every other failure in decypharr takes to reach the *arr. The *arr
+// sees a failed download, applies its own policy, and re-searches.
+//
+// The entry is deliberately NOT deleted here. Deleting it would remove the very
+// row the *arr must observe to learn the download failed; cleanup is the *arr's
+// and the queue-cleanup policy's job, on their own schedule.
 func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPruneSettings) int {
 	if !settings.enabled() {
 		return 0
@@ -171,12 +178,26 @@ func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPrune
 			Str("name", current.Name).
 			Str("provider", current.ActiveProvider).
 			Str("reason", reason).
-			Msg("Stall prune: deleting a torrent that will not finish, and releasing its provider slot")
+			Msg("Stall prune: failing a torrent that will not finish, and releasing its provider slot")
 
-		if err := m.DeleteEntry(current.InfoHash, true); err != nil {
+		// Release the provider placement first — that is the resource being
+		// reclaimed, and it must happen even if the local update later fails.
+		if err := m.RemoveTorrentPlacements(current); err != nil {
 			m.logger.Error().Err(err).
 				Str("infohash", current.InfoHash).
-				Msg("Stall prune: delete failed; the provider slot is still held")
+				Msg("Stall prune: could not release the provider placement; leaving the entry alone rather " +
+					"than failing it while the slot is still held")
+			continue
+		}
+
+		// Then fail it, so the *arr actually learns. Without this the *arr keeps
+		// a queue row for a download that no longer exists and never re-grabs.
+		current.MarkAsError(fmt.Errorf("stall prune: %s", reason))
+		if err := m.queue.Update(current); err != nil {
+			m.logger.Error().Err(err).
+				Str("infohash", current.InfoHash).
+				Msg("Stall prune: released the provider slot but could not record the failure; the arr may " +
+					"not see this as a failed download")
 			continue
 		}
 		pruned++
