@@ -436,21 +436,31 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		// magnets, meaning nothing we finish releases it. Retrying that every
 		// 30s is a spin against a provider already saying no.
 		if isTooManyActiveDownloads(err) || isProviderAddQuotaExhausted(err) {
-			delay := providerSlotRetryDelay
-			reason := "provider slots are full"
-			if isProviderAddQuotaExhausted(err) {
-				delay = providerQuotaRetryDelay
-				reason = "provider add quota is exhausted; our own completions will not free it"
-			}
 			if job.Entry != nil {
 				job.Entry.Status = debridTypes.TorrentStatusQueued
 				_ = m.queue.Update(job.Entry)
 			}
+			if isProviderAddQuotaExhausted(err) {
+				// WARN, not INFO, and worded as a standing condition. This does
+				// not clear by waiting: measured on a live account, the same
+				// refusal repeated for 54.6 hours across two midnights because
+				// the provider's stored-item cap was full. An operator reading
+				// INFO "requeued, retrying" would reasonably assume it passes.
+				m.logger.Warn().
+					Err(err).
+					Str("job_id", job.ID).
+					Dur("retry_in", providerQuotaRetryDelay).
+					Msg("Provider is refusing NEW items because its add/storage allowance is exhausted. " +
+						"This does NOT clear on its own — nothing decypharr finishes or deletes locally frees it. " +
+						"Delete entries on the provider to recover. Retrying slowly meanwhile.")
+				m.jobQueue.Retry(job, providerQuotaRetryDelay)
+				return
+			}
 			m.logger.Info().
 				Str("job_id", job.ID).
-				Dur("retry_in", delay).
-				Msgf("Requeued: %s", reason)
-			m.jobQueue.Retry(job, delay)
+				Dur("retry_in", providerSlotRetryDelay).
+				Msg("Requeued: provider slots are full; they free as active downloads finish")
+			m.jobQueue.Retry(job, providerSlotRetryDelay)
 			return
 		}
 		if errors.Is(err, parser.ErrProbeInfrastructure) {
@@ -505,12 +515,25 @@ func (m *Manager) resumeClaimedAction(entry *storage.Entry) {
 // for waitForDownloadCompletion.
 // Retry cadences for the two provider-capacity conditions. Separate constants
 // because they describe different resources: slots come back as our own
-// downloads finish, an add allowance comes back on the provider's schedule and
-// not ours. Collapsing them into one number is how a polite retry becomes a
-// spin against a provider that has already refused.
+// downloads finish, an add allowance does not come back on our schedule at all.
+// Collapsing them into one number is how a polite retry becomes a spin against
+// a provider that has already refused.
+//
+// The quota delay was 15 minutes, chosen when we believed AllDebrid's
+// MAGNET_TOO_MANY was a daily add budget and would therefore clear on its own
+// within hours. Measured 2026-08-02: the account was 4,998 of a 5,000
+// TOTAL-STORED cap and had been refusing every add for 54.6 continuous hours,
+// across two candidate midnight boundaries, with no reset.
+//
+// So the condition does not self-clear at all — it clears when a human deletes
+// something. A 15-minute cadence was not merely too fast, it asserted the wrong
+// shape: it presents in the logs as a transient blip recurring forever, when
+// the truth is a standing condition requiring action. One hour still recovers
+// promptly if some other provider's quota really is time-based, while making
+// the permanent case cheap and visible rather than noisy.
 const (
 	providerSlotRetryDelay  = 30 * time.Second
-	providerQuotaRetryDelay = 15 * time.Minute
+	providerQuotaRetryDelay = time.Hour
 )
 
 const downloadCompletionSlack = 5 * time.Minute
