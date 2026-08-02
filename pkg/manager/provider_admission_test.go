@@ -127,10 +127,17 @@ func TestUnreadableCapacityDoesNotManufactureARefusal(t *testing.T) {
 	}
 }
 
-// The two provider-capacity conditions describe different resources and must
-// not share a retry cadence. Slot exhaustion clears as our own work finishes;
-// an add allowance does not, so retrying it on the slot cadence is a spin
-// against a provider that has already refused.
+// The two provider-capacity conditions stay separately identifiable so their
+// log lines can say different, true things — slot exhaustion clears as our own
+// downloads finish, an exhausted add allowance does not clear at all until
+// someone deletes entries on the provider.
+//
+// Neither is retried any more. This test used to assert that the quota retry
+// delay exceeded the slot one; both delays are gone, because the question
+// nobody had asked was whether to retry at all. Failing is free: on a live
+// Sonarr, 8,243 blocklisted entries contain exactly four torrents against many
+// thousands of add rejections, so a failed add costs no release and burns no
+// candidate list. The arr's own re-search is the retry.
 func TestSlotAndQuotaExhaustionAreDistinctConditions(t *testing.T) {
 	slots := customerror.TooManyActiveDownloadsError
 	quota := customerror.ProviderAddQuotaExhaustedError
@@ -139,11 +146,7 @@ func TestSlotAndQuotaExhaustionAreDistinctConditions(t *testing.T) {
 		t.Fatal("slot exhaustion must classify as slots only")
 	}
 	if !isProviderAddQuotaExhausted(quota) || isTooManyActiveDownloads(quota) {
-		t.Fatal("quota exhaustion must classify as quota only — sharing the slot cadence would spin")
-	}
-	if providerQuotaRetryDelay <= providerSlotRetryDelay {
-		t.Fatalf("quota retry %v must be longer than slot retry %v: our own completions never free a quota",
-			providerQuotaRetryDelay, providerSlotRetryDelay)
+		t.Fatal("quota exhaustion must classify as quota only")
 	}
 
 	// Both must survive being joined with unrelated provider failures, which is
@@ -156,6 +159,29 @@ func TestSlotAndQuotaExhaustionAreDistinctConditions(t *testing.T) {
 		quota,
 	})
 	if !isProviderAddQuotaExhausted(joined) {
-		t.Fatal("quota exhaustion lost through a joined multi-provider error; the job would be failed instead of requeued")
+		t.Fatal("quota exhaustion lost through a joined multi-provider error: the operator would then get a " +
+			"generic failure instead of the one message that names what is wrong and what fixes it")
+	}
+}
+
+// The add path must NOT answer a capacity failure by reporting success.
+//
+// It used to: TooManyActiveDownloads was special-cased into a silent requeue
+// that returned nil, so the *arr was told the add succeeded while decypharr
+// held a job no provider had accepted. The *arr then sat on a queue item it
+// believed was progressing and never tried its next candidate — accept-then-
+// fail-later, the pattern rejected everywhere else in this codebase.
+func TestCapacityFailureIsReportedToTheArrNotSwallowed(t *testing.T) {
+	full := &fakeDebridClient{
+		cfg:     config.Debrid{Name: "full", DownloadUncached: boolPointer(true)},
+		slotsFn: func() (int, error) { return 0, nil },
+	}
+
+	_, err := fallbackTestManager(full).SendToDebrid(context.Background(), fallbackTestRequest("full", false, nil))
+	if err == nil {
+		t.Fatal("a capacity failure must surface as an error, never as a silent success")
+	}
+	if !isTooManyActiveDownloads(err) {
+		t.Fatalf("error = %v, want it to remain identifiable as slot exhaustion so the log line can say so", err)
 	}
 }

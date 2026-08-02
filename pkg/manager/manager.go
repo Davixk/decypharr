@@ -435,33 +435,34 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		// MAGNET_TOO_MANY was observed firing 6,715 times with ZERO active
 		// magnets, meaning nothing we finish releases it. Retrying that every
 		// 30s is a spin against a provider already saying no.
-		if isTooManyActiveDownloads(err) || isProviderAddQuotaExhausted(err) {
-			if job.Entry != nil {
-				job.Entry.Status = debridTypes.TorrentStatusQueued
-				_ = m.queue.Update(job.Entry)
-			}
-			if isProviderAddQuotaExhausted(err) {
-				// WARN, not INFO, and worded as a standing condition. This does
-				// not clear by waiting: measured on a live account, the same
-				// refusal repeated for 54.6 hours across two midnights because
-				// the provider's stored-item cap was full. An operator reading
-				// INFO "requeued, retrying" would reasonably assume it passes.
-				m.logger.Warn().
-					Err(err).
-					Str("job_id", job.ID).
-					Dur("retry_in", providerQuotaRetryDelay).
-					Msg("Provider is refusing NEW items because its add/storage allowance is exhausted. " +
-						"This does NOT clear on its own — nothing decypharr finishes or deletes locally frees it. " +
-						"Delete entries on the provider to recover. Retrying slowly meanwhile.")
-				m.jobQueue.Retry(job, providerQuotaRetryDelay)
-				return
-			}
-			m.logger.Info().
-				Str("job_id", job.ID).
-				Dur("retry_in", providerSlotRetryDelay).
-				Msg("Requeued: provider slots are full; they free as active downloads finish")
-			m.jobQueue.Retry(job, providerSlotRetryDelay)
-			return
+		// Provider capacity failures are NOT retried. They fall through to the
+		// ordinary error path, which surfaces the failure to the *arr.
+		//
+		// Both cadences were deleted rather than re-tuned. The question nobody
+		// had asked was whether to retry at ALL, and the answer is no: the
+		// *arr's own re-search cycle is the retry, it is better informed than
+		// we are about which release to try next, and it costs us no held
+		// state and no invented interval.
+		//
+		// Failing is free, which is the measurement that settles it. On a live
+		// Sonarr, 8,243 blocklisted entries contain exactly FOUR torrents,
+		// against many thousands of add rejections across 12+ days — a failed
+		// ADD is treated as a download-client problem, not a release problem.
+		// Nothing is blocklisted, no candidate list is burned.
+		//
+		// The quota case is the clearest: it was observed refusing every add
+		// for 54.6 continuous hours because the provider's stored-item cap was
+		// full. No cadence recovers from that; only deleting entries on the
+		// provider does. Holding a job for it helped nobody and hid it.
+		if isTooManyActiveDownloads(err) {
+			m.logger.Warn().Err(err).Str("job_id", job.ID).
+				Msg("Provider slots are full; failing the job so the arr can move on rather than holding it")
+		}
+		if isProviderAddQuotaExhausted(err) {
+			m.logger.Warn().Err(err).Str("job_id", job.ID).
+				Msg("Provider is refusing NEW items: its add/storage allowance is exhausted. This does NOT " +
+					"clear on its own — nothing decypharr finishes or deletes locally frees it. Delete " +
+					"entries on the provider to recover.")
 		}
 		if errors.Is(err, parser.ErrProbeInfrastructure) {
 			// The availability probe failed on the NNTP substrate, not on the
@@ -513,29 +514,6 @@ func (m *Manager) resumeClaimedAction(entry *storage.Entry) {
 // downloadCompletionSlack pads the worst-case post-download pipeline (mount
 // visibility wait + usenet processing) when computing the defensive park cap
 // for waitForDownloadCompletion.
-// Retry cadences for the two provider-capacity conditions. Separate constants
-// because they describe different resources: slots come back as our own
-// downloads finish, an add allowance does not come back on our schedule at all.
-// Collapsing them into one number is how a polite retry becomes a spin against
-// a provider that has already refused.
-//
-// The quota delay was 15 minutes, chosen when we believed AllDebrid's
-// MAGNET_TOO_MANY was a daily add budget and would therefore clear on its own
-// within hours. Measured 2026-08-02: the account was 4,998 of a 5,000
-// TOTAL-STORED cap and had been refusing every add for 54.6 continuous hours,
-// across two candidate midnight boundaries, with no reset.
-//
-// So the condition does not self-clear at all — it clears when a human deletes
-// something. A 15-minute cadence was not merely too fast, it asserted the wrong
-// shape: it presents in the logs as a transient blip recurring forever, when
-// the truth is a standing condition requiring action. One hour still recovers
-// promptly if some other provider's quota really is time-based, while making
-// the permanent case cheap and visible rather than noisy.
-const (
-	providerSlotRetryDelay  = 30 * time.Second
-	providerQuotaRetryDelay = time.Hour
-)
-
 const downloadCompletionSlack = 5 * time.Minute
 
 // downloadCompletionParkCap bounds how long a single worker may stay parked on

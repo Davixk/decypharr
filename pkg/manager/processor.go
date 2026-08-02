@@ -48,10 +48,21 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 		return m.queue.Update(torrent)
 	}()
 	if err != nil {
-		if isTooManyActiveDownloads(err) {
-			m.logger.Warn().Msgf("Too many active downloads, marking as queued: %s", importReq.Magnet.Name)
-			return m.queueTorrentRetry(importReq, torrent)
-		}
+		// Capacity failures are NOT special-cased into a silent requeue any
+		// more. This branch used to answer TooManyActiveDownloads by returning
+		// nil — telling the *arr the add SUCCEEDED while holding a job that had
+		// not been accepted by any provider.
+		//
+		// That is accept-then-fail-later, the pattern this codebase rejects
+		// everywhere else, and it is strictly worse than failing: the *arr sits
+		// on a queue item it believes is progressing and never tries its next
+		// candidate.
+		//
+		// Failing is free. Measured on a live Sonarr: of 8,243 blocklisted
+		// entries only FOUR are torrents, against many thousands of add
+		// rejections over 12+ days — a failed ADD is treated as a
+		// download-client problem, not a release problem, so nothing is
+		// blocklisted and no candidate is burned. The *arr simply moves on.
 		if deleted, deleteErr := m.queue.DeleteCurrent(torrent, nil); deleteErr != nil {
 			return errors.Join(fmt.Errorf("failed to submit torrent to debrid: %w", err), fmt.Errorf("delete failed reservation: %w", deleteErr))
 		} else if !deleted {
@@ -141,21 +152,6 @@ func (m *Manager) cleanupStaleSubmittedTorrent(torrent *debridTypes.Torrent) {
 		Str("debrid", torrent.Debrid).
 		Str("torrent_id", torrent.Id).
 		Msg("Retained stale submission because exclusive remote ownership cannot be proven")
-}
-
-func (m *Manager) queueTorrentRetry(importReq *ImportRequest, torrent *storage.Entry) error {
-	importReq.Status = "queued"
-	importReq.CompletedAt = time.Time{}
-	importReq.Error = ""
-	job := NewJob(JobTypeTorrent, importReq)
-	job.ID = torrent.InfoHash
-	job.Entry = torrent
-	if err := m.SubmitJob(job); err != nil {
-		torrent.MarkAsError(err)
-		_ = m.queue.Update(torrent)
-		return fmt.Errorf("failed to queue torrent: %w", err)
-	}
-	return nil
 }
 
 func newTorrentQueueEntry(importReq *ImportRequest, status debridTypes.TorrentStatus) *storage.Entry {
