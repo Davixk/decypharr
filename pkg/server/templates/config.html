@@ -355,6 +355,54 @@
                                 <span class="text-sm opacity-70"><strong>Job slots, not downloads.</strong> A machine-overhead ceiling so a burst cannot swamp the host. Download parallelism is set by each provider's own reported capacity, not by this. Raise it only if you see jobs waiting with providers idle.</span>
                             </div>
                         </div>
+
+                        <div class="divider text-sm opacity-70">Stall pruning</div>
+                        <div class="rounded-box border border-base-300 p-4 space-y-4">
+                            <div class="alert alert-warning alert-soft text-sm leading-relaxed">
+                                <span>
+                                    <strong>These delete torrents and release the provider slots they hold.</strong>
+                                    Both stages are <strong>off unless you set a value</strong>, and each works on its own.
+                                    A value that cannot be read also leaves its stage off &mdash; a destructive setting
+                                    never falls back to a guess. Changes apply on the next sweep, so you can switch a
+                                    stage off immediately without restarting.
+                                </span>
+                            </div>
+
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="label" for="stall_prune.no_progress_after">
+                                        <span class="font-medium">Delete after no progress for</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="stall_prune.no_progress_after"
+                                           id="stall_prune.no_progress_after" placeholder="e.g. 45m &mdash; empty = off">
+                                    <span class="text-sm opacity-70"><strong>Stage 1, the reliable one.</strong> Deletes a torrent that has transferred <em>zero</em> bytes for this long &mdash; not "slow", zero. Don't go below <strong>30m</strong>: AllDebrid prunes its own no-peer magnets at 30 minutes, and anything shorter races it while risking torrents that are merely slow to start.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="stall_prune.max_eta">
+                                        <span class="font-medium">Delete if it would take longer than</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="stall_prune.max_eta"
+                                           id="stall_prune.max_eta" placeholder="e.g. 24h &mdash; empty = off">
+                                    <span class="text-sm opacity-70"><strong>Stage 2, a projection &mdash; it can be wrong.</strong> Estimates completion from the torrent's <em>average</em> speed since it was added, not its current speed, so a dead torrent that briefly spikes can't look healthy. Some genuinely slow torrents do finish; this cannot tell them apart. Set it from what you actually see, not from intuition.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="stall_prune.min_age">
+                                        <span class="font-medium">Grace period before estimating</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="stall_prune.min_age"
+                                           id="stall_prune.min_age" placeholder="30m">
+                                    <span class="text-sm opacity-70">Stage 2 only. An average over a few seconds projects to an absurd time-remaining, so without this every new torrent would be deleted on arrival. Stage 1 doesn't need it &mdash; its own window is the grace period.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="stall_prune.max_per_sweep">
+                                        <span class="font-medium">Max deletions per sweep</span>
+                                    </label>
+                                    <input type="number" min="1" class="input w-full" name="stall_prune.max_per_sweep"
+                                           id="stall_prune.max_per_sweep" placeholder="25">
+                                    <span class="text-sm opacity-70">Blast-radius cap. If a threshold is set too aggressively, this makes it drain visibly over several sweeps instead of emptying the account in one tick.</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 

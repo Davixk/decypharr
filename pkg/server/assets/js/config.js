@@ -291,6 +291,19 @@ class ConfigManager {
             'always_rm_tracker_urls', 'default_download_action', 'debrid_read_timeout'
         ];
 
+        // Stall pruning is nested, so it does not fit the flat loop below.
+        // Blank means "this stage is off" and must render as blank rather than
+        // as a value the operator could mistake for an active setting.
+        const stall = config.stall_prune || {};
+        const setStall = (key, value) => {
+            const el = document.querySelector(`[name="stall_prune.${key}"]`);
+            if (el) el.value = value || '';
+        };
+        setStall('no_progress_after', stall.no_progress_after);
+        setStall('max_eta', stall.max_eta);
+        setStall('min_age', stall.min_age);
+        setStall('max_per_sweep', stall.max_per_sweep);
+
         fields.forEach(field => {
             const element = document.querySelector(`[name="${field}"]`);
             if (element && config[field] !== undefined) {
@@ -1302,6 +1315,16 @@ class ConfigManager {
             // the aliasing the backend deliberately avoids, and doing it in the
             // form would reintroduce the old bottleneck through the UI.
             max_concurrent_jobs: parseInt(document.querySelector('[name="max_concurrent_jobs"]')?.value) || 0,
+            // Submitted verbatim, including empty strings. An empty threshold
+            // means "this stage is off" and the backend treats it that way, so
+            // the form must not substitute a default for a blank field — for a
+            // destructive setting, silence has to stay silence.
+            stall_prune: {
+                no_progress_after: document.querySelector('[name="stall_prune.no_progress_after"]')?.value?.trim() || "",
+                max_eta: document.querySelector('[name="stall_prune.max_eta"]')?.value?.trim() || "",
+                min_age: document.querySelector('[name="stall_prune.min_age"]')?.value?.trim() || "",
+                max_per_sweep: parseInt(document.querySelector('[name="stall_prune.max_per_sweep"]')?.value) || 0,
+            },
             skip_pre_cache: document.querySelector('[name="skip_pre_cache"]').checked,
             always_rm_tracker_urls: document.querySelector('[name="always_rm_tracker_urls"]').checked,
             folder_naming: document.querySelector('[name="folder_naming"]')?.value || "",

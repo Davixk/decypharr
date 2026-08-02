@@ -138,7 +138,8 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		m.logger.Error().Err(err).Msg("Failed to convert stall prune interval to job definition")
 	} else {
 		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
-			if pruned := m.pruneStalledDownloads(ctx, stallPruneSweepLimit); pruned > 0 {
+			settings := resolveStallPruneSettings(config.Get().StallPrune)
+			if pruned := m.pruneStalledDownloads(ctx, settings); pruned > 0 {
 				m.logger.Info().Int("pruned", pruned).Msg("Stall prune released provider slots held by stalled torrents")
 			}
 		}), gocron.WithContext(ctx), gocron.WithName("stall-prune")); err != nil {
