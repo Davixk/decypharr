@@ -76,6 +76,10 @@ func (c *lifecycleDebridClient) GetTorrent(id string) (*debridTypes.Torrent, err
 	return nil, fmt.Errorf("unexpected GetTorrent call")
 }
 
+func (c *lifecycleDebridClient) GetAllTorrents() ([]*debridTypes.Torrent, error) {
+	return c.GetTorrents()
+}
+
 func (c *lifecycleDebridClient) GetTorrents() ([]*debridTypes.Torrent, error) {
 	if c.getAll != nil {
 		return c.getAll()

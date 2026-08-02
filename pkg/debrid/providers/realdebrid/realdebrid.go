@@ -902,6 +902,14 @@ func (r *RealDebrid) getTorrents(offset int, limit int) (int, []*types.Torrent, 
 	return totalItems, torrents, nil
 }
 
+// GetAllTorrents is identical to GetTorrents here: RealDebrid's /torrents
+// paginates every status, so the list already includes error and magnet_error
+// entries. Kept as a distinct method so callers state which contract they rely
+// on rather than depending on this happening to be true.
+func (r *RealDebrid) GetAllTorrents() ([]*types.Torrent, error) {
+	return r.GetTorrents()
+}
+
 func (r *RealDebrid) GetTorrents() ([]*types.Torrent, error) {
 	limit := 1000
 	if r.config.Limit != 0 {

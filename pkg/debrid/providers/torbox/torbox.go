@@ -564,6 +564,12 @@ func (tb *Torbox) fetchDownloadLink(account *account.Account, id string, file *t
 	return dl, nil
 }
 
+// GetAllTorrents delegates, and its completeness is UNVERIFIED for Torbox.
+// Callers must only act on positive findings, never on absence.
+func (tb *Torbox) GetAllTorrents() ([]*types.Torrent, error) {
+	return tb.GetTorrents()
+}
+
 func (tb *Torbox) GetTorrents() ([]*types.Torrent, error) {
 	offset := 0
 	allTorrents := make([]*types.Torrent, 0)

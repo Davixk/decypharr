@@ -39,7 +39,30 @@ type Client interface {
 	IsAvailable(infohashes []string) map[string]bool
 	UpdateTorrent(torrent *types.Torrent) error
 	GetTorrent(torrentId string) (*types.Torrent, error)
+	// GetTorrents lists torrents the provider considers usable. Its exact scope
+	// is PROVIDER-SPECIFIC — AllDebrid asks for status=ready, RealDebrid pages
+	// everything — so it must not be used to reason about broken or in-flight
+	// items. Use GetAllTorrents for that.
 	GetTorrents() ([]*types.Torrent, error)
+
+	// GetAllTorrents lists EVERY torrent the provider holds, across all
+	// statuses, in as few calls as it can manage.
+	//
+	// This exists because the provider is authoritative about its own state and
+	// will hand over the whole picture in bulk far more cheaply than we can
+	// rediscover it one entry at a time. Measured on a live account: 8,997
+	// entries fully status-classified in 41 requests and ~9 seconds, including
+	// 381 already-known-broken.
+	//
+	// ⚠️ ABSENCE IS NOT EVIDENCE. Providers differ in what they will enumerate,
+	// and the ones not in daily service here delegate to GetTorrents, whose
+	// scope is narrower. A caller may act on POSITIVE findings — "this hash is
+	// present and the provider says it failed" — and must NEVER infer anything
+	// from a hash being missing. Treating absence as "not broken" or "gone"
+	// would turn an incomplete enumeration into a confident wrong answer, which
+	// is the failure mode that produced GetAvailableSlots' fabricated 100 and
+	// IsAvailable's empty map.
+	GetAllTorrents() ([]*types.Torrent, error)
 	Config() config.Debrid
 	Logger() zerolog.Logger
 	RefreshDownloadLinks() error

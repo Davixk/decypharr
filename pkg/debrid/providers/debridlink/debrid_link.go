@@ -432,6 +432,13 @@ func (dl *DebridLink) GetDownloadUncached() bool {
 	return dl.DownloadUncached
 }
 
+// GetAllTorrents delegates, and its completeness is UNVERIFIED for DebridLink.
+// Callers must therefore only act on positive findings — a hash present with a
+// failed status — and never infer anything from a hash being absent.
+func (dl *DebridLink) GetAllTorrents() ([]*types.Torrent, error) {
+	return dl.GetTorrents()
+}
+
 func (dl *DebridLink) GetTorrents() ([]*types.Torrent, error) {
 	page := 0
 	perPage := 100

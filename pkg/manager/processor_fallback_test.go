@@ -53,6 +53,7 @@ type fakeDebridClient struct {
 	checkFn         func(*debridTypes.Torrent) (*debridTypes.Torrent, error)
 	deleteFn        func(string) error
 	slotsFn         func() (int, error)
+	allTorrentsFn   func() ([]*debridTypes.Torrent, error)
 	slotCalls       int
 	mu              sync.Mutex
 	submitCalls     int
@@ -122,6 +123,18 @@ func (f *fakeDebridClient) GetDownloadLink(string, *debridTypes.File) (debridTyp
 func (f *fakeDebridClient) UpdateTorrent(*debridTypes.Torrent) error        { return nil }
 func (f *fakeDebridClient) GetTorrent(string) (*debridTypes.Torrent, error) { return nil, nil }
 func (f *fakeDebridClient) GetTorrents() ([]*debridTypes.Torrent, error)    { return nil, nil }
+
+// allTorrents lets a test stand in for provider-side truth: what the provider
+// says it holds, independent of what our own store believes.
+func (f *fakeDebridClient) GetAllTorrents() ([]*debridTypes.Torrent, error) {
+	f.mu.Lock()
+	fn := f.allTorrentsFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return nil, nil
+}
 func (f *fakeDebridClient) RefreshDownloadLinks() error                     { return nil }
 func (f *fakeDebridClient) CheckFile(context.Context, string, string) error { return nil }
 func (f *fakeDebridClient) AccountManager() *account.Manager                { return nil }

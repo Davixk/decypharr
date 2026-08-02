@@ -310,6 +310,12 @@ func (pm *Premiumize) IsAvailable(infohashes []string) map[string]bool {
 	return result
 }
 
+// GetAllTorrents delegates, and its completeness is UNVERIFIED for Premiumize.
+// Callers must only act on positive findings, never on absence.
+func (pm *Premiumize) GetAllTorrents() ([]*types.Torrent, error) {
+	return pm.GetTorrents()
+}
+
 func (pm *Premiumize) GetTorrents() ([]*types.Torrent, error) {
 	transfers, err := pm.listTransfers()
 	if err != nil {
