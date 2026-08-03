@@ -415,20 +415,52 @@
                                     <span class="text-sm opacity-70">Applies only to an <strong>uncached</strong> release the provider has just started downloading &mdash; a cached hit never reaches it. Below this, the transfer is deleted and the grab is failed so the *arr moves on immediately. Measured on 107 live transfers: 0 seeders stalls 79% of the time, 1&ndash;2 stalls 24%, 3+ stalls 27%. The cliff is entirely between 0 and 1, so <strong>1</strong> is the useful value; higher refuses far more without predicting any better. <strong>Empty or 0 = off.</strong></span>
                                 </div>
                                 <div>
+                                    <label class="label" for="seeder_gate.sources">
+                                        <span class="font-medium">Seeder count source(s)</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="seeder_gate.sources"
+                                           id="seeder_gate.sources" placeholder="udp_scrape, bitmagnet &mdash; empty = off">
+                                    <span class="text-sm opacity-70">Comma-separated, <strong>in priority order</strong> &mdash; the first one that can answer wins, and one that can't falls through to the next. <code>udp_scrape</code> asks the torrent's own trackers for the <strong>live</strong> swarm. <code>bitmagnet</code> reads a local index, which is fast but was measured at a median of <strong>58 hours stale</strong> &mdash; good enough to rescue a release the scrape couldn't reach, never good enough to condemn one, so put it second if you use it. <strong>If nothing can answer, the grab is ALLOWED.</strong> Empty disables the feature.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.scrape_bind_addr">
+                                        <span class="font-medium">Scrape bind address</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="seeder_gate.scrape_bind_addr"
+                                           id="seeder_gate.scrape_bind_addr" placeholder="e.g. 10.2.0.2:0 &mdash; empty = default route">
+                                    <span class="text-sm opacity-70"><strong>⚠️ A tracker scrape reveals this host's IP to every tracker it contacts.</strong> Nothing else in decypharr talks to a tracker at all &mdash; the point of a debrid service is that the <em>provider</em> faces the swarm and you never do. Turning on <code>udp_scrape</code> gives that up for one packet per uncached grab. Set this to a VPN interface's local address to send those packets the same way your other indexing tools go. Left empty it uses the container's default route. An address that doesn't resolve makes the scrape <em>fail</em> rather than quietly fall back.</span>
+                                </div>
+                                <div>
                                     <label class="label" for="seeder_gate.bitmagnet_url">
                                         <span class="font-medium">Bitmagnet GraphQL URL</span>
                                     </label>
                                     <input type="text" class="input w-full" name="seeder_gate.bitmagnet_url"
-                                           id="seeder_gate.bitmagnet_url" placeholder="http://host:3333/graphql &mdash; empty = off">
-                                    <span class="text-sm opacity-70">Where the seeder count comes from. It must be <strong>local and fast</strong>, because the lookup runs inside a request your *arr is blocked on. <strong>If it has no record, no count, or does not answer, the grab is ALLOWED</strong> &mdash; roughly half of all releases have no data, and refusing on ignorance would reject half of everything. Empty disables the whole feature.</span>
+                                           id="seeder_gate.bitmagnet_url" placeholder="http://host:3333/graphql">
+                                    <span class="text-sm opacity-70">Only used if <code>bitmagnet</code> is listed as a source above.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.fallback_trackers">
+                                        <span class="font-medium">Fallback trackers</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="seeder_gate.fallback_trackers"
+                                           id="seeder_gate.fallback_trackers" placeholder="udp://tracker.example:1337/announce, ...">
+                                    <span class="text-sm opacity-70">Comma-separated. Used <strong>only</strong> when a magnet carries no trackers of its own (a DHT-only magnet). Note that <strong>"Always remove tracker URLs"</strong> strips every magnet's tracker list, so with that on the scrape has nobody to ask unless you fill this in &mdash; and with nobody to ask it always allows.</span>
                                 </div>
                                 <div>
                                     <label class="label" for="seeder_gate.timeout">
-                                        <span class="font-medium">Lookup timeout</span>
+                                        <span class="font-medium">Total lookup timeout</span>
                                     </label>
                                     <input type="text" class="input w-full" name="seeder_gate.timeout"
-                                           id="seeder_gate.timeout" placeholder="2s">
-                                    <span class="text-sm opacity-70">How long to wait for that lookup before giving up and allowing the grab. A typical answer takes 1&ndash;3ms.</span>
+                                           id="seeder_gate.timeout" placeholder="3s">
+                                    <span class="text-sm opacity-70">Bounds the <em>whole</em> lookup &mdash; every source and every tracker. On expiry the grab is allowed.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.scrape_timeout">
+                                        <span class="font-medium">Per-tracker timeout</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="seeder_gate.scrape_timeout"
+                                           id="seeder_gate.scrape_timeout" placeholder="1s">
+                                    <span class="text-sm opacity-70">Bounds one tracker's connect+scrape exchange. Trackers are queried in parallel, so this isn't multiplied by how many there are.</span>
                                 </div>
                             </div>
                         </div>

@@ -1,3 +1,11 @@
+// Splits a comma-separated field into an array, dropping blanks so an
+// all-empty field yields [] rather than [""] — an empty string would reach the
+// backend as a source name nothing matches, which reads as a typo rather than
+// as "unset". Used by both the load and save paths, hence file scope.
+function splitList(raw) {
+    return (raw || '').split(',').map(part => part.trim()).filter(Boolean);
+}
+
 // Configuration management for Decypharr
 class ConfigManager {
     constructor() {
@@ -313,6 +321,10 @@ class ConfigManager {
         };
         setGate('bitmagnet_url', gate.bitmagnet_url);
         setGate('timeout', gate.timeout);
+        setGate('scrape_bind_addr', gate.scrape_bind_addr);
+        setGate('scrape_timeout', gate.scrape_timeout);
+        setGate('sources', Array.isArray(gate.sources) ? gate.sources.join(', ') : '');
+        setGate('fallback_trackers', Array.isArray(gate.fallback_trackers) ? gate.fallback_trackers.join(', ') : '');
         // TRI-STATE. Absent and an explicit 0 both mean OFF, but they must
         // still render differently: blank is "never configured", 0 is "turned
         // off deliberately", and collapsing one into the other loses intent.
@@ -1353,9 +1365,16 @@ class ConfigManager {
                 min_age: document.querySelector('[name="stall_prune.min_age"]')?.value?.trim() || "",
                 max_per_sweep: parseInt(document.querySelector('[name="stall_prune.max_per_sweep"]')?.value) || 0,
             },
+            // Comma-separated text fields that reach the backend as arrays. An
+            // all-blank field must become [] and not [""], because an empty
+            // string would register as a source name the backend cannot match.
             seeder_gate: {
                 bitmagnet_url: document.querySelector('[name="seeder_gate.bitmagnet_url"]')?.value?.trim() || "",
                 timeout: document.querySelector('[name="seeder_gate.timeout"]')?.value?.trim() || "",
+                scrape_bind_addr: document.querySelector('[name="seeder_gate.scrape_bind_addr"]')?.value?.trim() || "",
+                scrape_timeout: document.querySelector('[name="seeder_gate.scrape_timeout"]')?.value?.trim() || "",
+                sources: splitList(document.querySelector('[name="seeder_gate.sources"]')?.value),
+                fallback_trackers: splitList(document.querySelector('[name="seeder_gate.fallback_trackers"]')?.value),
                 // TRI-STATE, so `|| 0` would be wrong: blank must reach the
                 // backend as null ("never configured") and an explicit 0 must
                 // survive as 0 ("turned off deliberately"). Both disable the

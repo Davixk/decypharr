@@ -1,16 +1,15 @@
 package manager
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
+	"github.com/sirrobot01/decypharr/pkg/swarm"
 )
 
 // THE GRAB-TIME SEEDER GATE.
@@ -20,124 +19,85 @@ import (
 // list. See config.SeederGateConfig for why that timing is the entire feature
 // and why this can never wait for anything.
 //
-// EVERY UNCERTAINTY ALLOWS. Coverage of the only usable source is ~53%, so
-// roughly half of all grabs arrive here with no answer available. Refusing on
-// ignorance would silently reject half of everything the arrs ask for, which is
-// a far larger harm than letting a dead torrent through — the stall sweep still
-// catches those later, just at the async price this gate exists to avoid.
+// This file contains POLICY only — the threshold, the confirm-never-condemn
+// rule for provider counts, and the fail-open discipline. WHERE the swarm
+// reading comes from lives behind swarm.Source, so the backend can be replaced
+// without touching any of it. That separation is deliberate: the first version
+// of this feature was welded to one backend, and when that backend's data
+// turned out to be 58 hours stale there was no seam to swap it at.
 
 type seederGateSettings struct {
 	minSeeders int
-	endpoint   string
 	timeout    time.Duration
+	source     swarm.Source
 }
 
 func (s seederGateSettings) enabled() bool {
-	return s.minSeeders > 0 && s.endpoint != ""
+	return s.minSeeders > 0 && s.source != nil
 }
 
 func resolveSeederGate(cfg config.SeederGateConfig) seederGateSettings {
-	s := seederGateSettings{endpoint: strings.TrimSpace(cfg.BitmagnetURL)}
-	// TRI-STATE, and absent means OFF. An earlier version of this feature
-	// pointed absent at 1, so an operator who had never heard of it got a live
-	// gate. For anything that deletes, silence must mean do nothing.
+	s := seederGateSettings{timeout: parseDurationOr(cfg.Timeout, config.DefaultSeederGateTimeout)}
+
+	// TRI-STATE, and absent means OFF. An earlier version pointed absent at 1,
+	// so an operator who had never heard of the feature got a live gate that
+	// deletes transfers. For anything destructive, silence must mean do nothing.
 	if cfg.MinSeeders != nil && *cfg.MinSeeders > 0 {
 		s.minSeeders = *cfg.MinSeeders
 	}
-	if d, err := utils.ParseDuration(cfg.Timeout); err == nil && d > 0 {
-		s.timeout = d
-	} else if d, err := utils.ParseDuration(config.DefaultSeederGateTimeout); err == nil {
-		s.timeout = d
+	if s.minSeeders <= 0 {
+		return s
+	}
+
+	var chain swarm.Chain
+	for _, name := range cfg.Sources {
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case config.SwarmSourceUDPScrape:
+			chain = append(chain, &swarm.UDPScrape{
+				BindAddr:   cfg.ScrapeBindAddr,
+				PerTracker: parseDurationOr(cfg.ScrapeTimeout, config.DefaultSeederGateScrapeTimeout),
+				Fallback:   cfg.FallbackTrackers,
+			})
+		case config.SwarmSourceBitmagnet:
+			if endpoint := strings.TrimSpace(cfg.BitmagnetURL); endpoint != "" {
+				chain = append(chain, &swarm.Bitmagnet{Endpoint: endpoint})
+			}
+		}
+		// An unrecognised name contributes nothing rather than failing the
+		// whole gate. A typo should not silently arm a different backend, and
+		// it must not turn the gate into a refuse-everything either — with no
+		// usable source the gate is simply off.
+	}
+	if len(chain) > 0 {
+		s.source = chain
 	}
 	return s
 }
 
-// isInfoHash reports whether s is a bare 40-character hex infohash.
-//
-// This is also the injection guard. The hash is interpolated into a GraphQL
-// document below, and an infohash arrives from a magnet link written by
-// somebody else — so it is untrusted input reaching a query language. Rejecting
-// anything that is not hex makes the interpolation provably inert, and the
-// rejection path allows the grab, so a strange hash costs nothing.
-func isInfoHash(s string) bool {
-	if len(s) != 40 {
-		return false
+func parseDurationOr(raw, fallback string) time.Duration {
+	if d, err := utils.ParseDuration(raw); err == nil && d > 0 {
+		return d
 	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
-			return false
-		}
-	}
-	return true
+	d, _ := utils.ParseDuration(fallback)
+	return d
 }
 
-type bitmagnetResponse struct {
-	Data struct {
-		TorrentContent struct {
-			Search struct {
-				Items []struct {
-					InfoHash string `json:"infoHash"`
-					Torrent  struct {
-						// Pointer because bitmagnet returns null for a torrent
-						// it knows but has no swarm reading for. A null is
-						// ABSENCE, and must not decode to a confident 0 — that
-						// would turn "we don't know" into the exact value that
-						// triggers a refusal.
-						Seeders *int `json:"seeders"`
-					} `json:"torrent"`
-				} `json:"items"`
-			} `json:"search"`
-		} `json:"torrentContent"`
-	} `json:"data"`
-}
-
-// bitmagnetSeeders returns the indexed swarm size for a hash.
+// magnetTrackers pulls the announce list out of a magnet link.
 //
-// The second return is KNOWN. False never means "zero seeders"; it means the
-// question could not be answered, and every caller must read it as allow.
-func (m *Manager) bitmagnetSeeders(ctx context.Context, endpoint, infoHash string, timeout time.Duration) (int, bool) {
-	if !isInfoHash(infoHash) {
-		return 0, false
+// ⚠️ always_rm_tracker_urls strips these on the way in, so with that setting on
+// every magnet arrives here with an empty list and the scrape has nobody to ask
+// — which is an absence, and therefore allows. That is the safe direction, but
+// it does mean the two settings together silently disable the gate unless
+// fallback_trackers is populated.
+func magnetTrackers(magnetLink string) []string {
+	if magnetLink == "" {
+		return nil
 	}
-
-	query := fmt.Sprintf(
-		`{"query":"{ torrentContent { search(input:{infoHashes:[\"%s\"], limit:1}) { items { infoHash torrent { seeders } } } } }"}`,
-		strings.ToLower(infoHash),
-	)
-
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(query))
+	parsed, err := url.Parse(magnetLink)
 	if err != nil {
-		return 0, false
+		return nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, false
-	}
-
-	var decoded bitmagnetResponse
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		return 0, false
-	}
-	for _, item := range decoded.Data.TorrentContent.Search.Items {
-		if !strings.EqualFold(item.InfoHash, infoHash) {
-			continue
-		}
-		if item.Torrent.Seeders == nil {
-			return 0, false
-		}
-		return *item.Torrent.Seeders, true
-	}
-	return 0, false
+	return parsed.Query()["tr"]
 }
 
 // seederGateRefusal reports why an uncached grab should be refused, or "" to
@@ -146,9 +106,12 @@ func (m *Manager) bitmagnetSeeders(ctx context.Context, endpoint, infoHash strin
 // providerSeeders is whatever the provider itself reported on the transfer it
 // just created. It may CONFIRM and may never CONDEMN: a provider has not had
 // time to discover peers on a transfer that is seconds old, so a zero from it
-// is ignorance rather than a verdict. Non-zero is real evidence and short-
-// circuits the lookup entirely.
-func (m *Manager) seederGateRefusal(ctx context.Context, infoHash string, providerSeeders int) string {
+// is ignorance rather than a verdict. Non-zero is real evidence and
+// short-circuits the lookup entirely.
+//
+// That rule lives HERE and not inside a source, because it is a policy about
+// how much to trust a provider's own reading — not a way of looking up a swarm.
+func (m *Manager) seederGateRefusal(ctx context.Context, infoHash, magnetLink string, providerSeeders int) string {
 	settings := resolveSeederGate(config.Get().SeederGate)
 	if !settings.enabled() {
 		return ""
@@ -156,14 +119,27 @@ func (m *Manager) seederGateRefusal(ctx context.Context, infoHash string, provid
 	if providerSeeders >= settings.minSeeders {
 		return ""
 	}
+	if !swarm.IsInfoHash(infoHash) {
+		return ""
+	}
 
-	seeders, known := m.bitmagnetSeeders(ctx, settings.endpoint, infoHash, settings.timeout)
+	// One budget for the whole lookup, every source and every tracker inside
+	// it. The caller is an arr blocked on an add; it must not be able to wait
+	// longer than this however many backends are configured.
+	ctx, cancel := context.WithTimeout(ctx, settings.timeout)
+	defer cancel()
+
+	md, known := settings.source.Lookup(ctx, infoHash, magnetTrackers(magnetLink))
 	if !known {
-		// FAIL OPEN. ~47% of grabs land here and every one must proceed.
+		// FAIL OPEN. No source could answer — no record, no tracker, a
+		// timeout, a malformed reply. None of those are evidence about the
+		// swarm, and refusing on ignorance would reject a large share of
+		// everything the arrs ask for.
 		return ""
 	}
-	if seeders >= settings.minSeeders {
+	if md.Seeders >= settings.minSeeders {
 		return ""
 	}
-	return fmt.Sprintf("uncached release has %d seeders, below the minimum of %d", seeders, settings.minSeeders)
+	return fmt.Sprintf("uncached release has %d seeders per %s, below the minimum of %d",
+		md.Seeders, md.Source, settings.minSeeders)
 }

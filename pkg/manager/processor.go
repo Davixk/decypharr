@@ -779,7 +779,11 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		// A cached hit never reaches this branch, and neither does a provider
 		// with download_uncached=false — that case is refused above.
 		if downloadUncached && torrent.Status != debridTypes.TorrentStatusDownloaded {
-			if reason := m.seederGateRefusal(ctx, debridTorrent.InfoHash, torrent.Seeders); reason != "" {
+			magnetLink := ""
+			if importRequest.Magnet != nil {
+				magnetLink = importRequest.Magnet.Link
+			}
+			if reason := m.seederGateRefusal(ctx, debridTorrent.InfoHash, magnetLink, torrent.Seeders); reason != "" {
 				cleanupID := torrent.Id
 				if cleanupID == "" {
 					cleanupID = dbt.Id
