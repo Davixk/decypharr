@@ -48,21 +48,33 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 		return m.queue.Update(torrent)
 	}()
 	if err != nil {
-		// Capacity failures are NOT special-cased into a silent requeue any
-		// more. This branch used to answer TooManyActiveDownloads by returning
-		// nil — telling the *arr the add SUCCEEDED while holding a job that had
-		// not been accepted by any provider.
+		// WHY a capacity failure may be held rather than failed.
 		//
-		// That is accept-then-fail-later, the pattern this codebase rejects
-		// everywhere else, and it is strictly worse than failing: the *arr sits
-		// on a queue item it believes is progressing and never tries its next
-		// candidate.
+		// A CONTENT refusal is refused: this release is unservable, another
+		// candidate may not be, and the arr is still holding its result set so
+		// taking the next one costs nothing.
 		//
-		// Failing is free. Measured on a live Sonarr: of 8,243 blocklisted
-		// entries only FOUR are torrents, against many thousands of add
-		// rejections over 12+ days — a failed ADD is treated as a
-		// download-client problem, not a release problem, so nothing is
-		// blocklisted and no candidate is burned. The *arr simply moves on.
+		// A TRANSIENT CAPACITY refusal is different in kind — it says nothing
+		// about this release, only that the provider is busy or its daily
+		// allowance is spent. decypharr's own queue is not bounded by the
+		// provider's, so the entry is accepted and held until capacity exists.
+		// The hold has no deadline: stall pruning continuously reclaims
+		// provider slots, so this is a queue with a working drain, and failing
+		// a held entry on a timer would fail work that was going to succeed —
+		// at the cost of a full arr search each, since an async failure
+		// discards the arr's candidate list where a sync refusal does not.
+		//
+		// A STANDING capacity refusal (a stored-item cap that is full) is
+		// refused like content, because nothing decypharr does frees it. That
+		// is the case fork.34 held forever, producing the 15.2-hour spin.
+		if refusal := m.classifyAddRefusal(err); refusal.hold {
+			return m.holdTorrentForCapacity(importReq, torrent, refusal, err)
+		} else if refusal.standingCondition != "" {
+			m.logger.Error().
+				Str("provider", refusal.provider).
+				Str("hash", torrent.InfoHash).
+				Msg(refusal.standingCondition)
+		}
 		if deleted, deleteErr := m.queue.DeleteCurrent(torrent, nil); deleteErr != nil {
 			return errors.Join(fmt.Errorf("failed to submit torrent to debrid: %w", err), fmt.Errorf("delete failed reservation: %w", deleteErr))
 		} else if !deleted {
@@ -848,11 +860,33 @@ func resolveDownloadUncached(providerSetting, requestOverride *bool) (allowed, v
 	return providerSetting != nil && *providerSetting, false
 }
 
+// providerError carries WHICH provider failed as structured data rather than
+// only in the message text.
+//
+// The name matters to more than logging now: classifying an AllDebrid
+// MAGNET_TOO_MANY requires resolving that provider's configured cap against
+// that provider's fill, and a chain error joins every provider's refusal
+// together. Recovering the name by parsing the formatted string would be the
+// same mistake as reading AllDebrid's own message to decide which limit it hit
+// — the message said "1000 accross all tabs" while the binding constraint was
+// the 5,000 stored cap.
+type providerError struct {
+	provider string
+	stage    string
+	err      error
+}
+
+func (e *providerError) Error() string {
+	return fmt.Sprintf("provider %q %s failed: %v", e.provider, e.stage, e.err)
+}
+
+func (e *providerError) Unwrap() error { return e.err }
+
 func providerStageError(providerName, stage string, err error) error {
 	if err == nil {
 		err = errors.New("unknown provider error")
 	}
-	return fmt.Errorf("provider %q %s failed: %w", providerName, stage, err)
+	return &providerError{provider: providerName, stage: stage, err: err}
 }
 
 func cleanupDebridAttempt(client common.Client, providerName, torrentID string) error {

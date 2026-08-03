@@ -31,6 +31,43 @@ type Debrid struct {
 	// docs) while the code did neither, because nothing called
 	// GetAvailableSlots and the field had never once executed. It does now.
 	MinimumFreeSlot int `json:"minimum_free_slot,omitempty"`
+
+	// MaxMagnets is how many items this provider will STORE on the account
+	// before it refuses new ones. It is the only threshold that can tell
+	// AllDebrid's two opposite meanings of MAGNET_TOO_MANY apart:
+	//
+	//	fill BELOW the cap -> the DAILY add allowance is spent. Transient; it
+	//	                      resets on the provider's own boundary, so a held
+	//	                      item will eventually be submitted.
+	//	fill AT the cap    -> the STORED-item cap is full. Permanent; nothing we
+	//	                      finish or wait for frees it, only deletion does.
+	//
+	// AllDebrid returns the SAME error code for both, and its message cannot be
+	// trusted to disambiguate either: the observed text said "Magnets limit
+	// reached (1000 accross all tabs)" while the binding constraint was the
+	// 5,000 stored cap. So neither the code nor the string is a source of truth
+	// — the account's own fill level is.
+	//
+	// A KNOB, not a constant, because the limit belongs to the provider and can
+	// change without notice.
+	//
+	// TRI-STATE, and it has to be. *int, not int, so the three states stay
+	// distinct across a save round-trip:
+	//
+	//	nil (absent)  -> use the provider's default cap (AllDebrid 5000)
+	//	explicit 0    -> UNLIMITED, an operator override that must survive
+	//	explicit N    -> cap at N
+	//
+	// With a plain int, "unlimited" and "absent" are both 0, so an operator who
+	// deliberately uncapped AllDebrid would silently have 5000 written back on
+	// the next save. That is the same defect as the download_uncached checkbox
+	// that armed vetoes nobody chose.
+	//
+	// Unlimited means exactly that: with no cap there is no threshold to be at,
+	// so a quota refusal resolves to the TRANSIENT case rather than being
+	// judged against an invented number. Never guess a provider's limit — the
+	// discipline that removed the fabricated DefaultAvailableSlots of 100.
+	MaxMagnets *int `json:"max_magnets,omitempty"`
 	Priority                     int      `json:"priority,omitempty"`          // Lower values are tried first; defaults to config order
 	ConfigOrder                  int      `json:"-"`                           // Stable tie-breaker derived from debrids[] order
 	Limit                        int      `json:"limit,omitempty"`             // Maximum number of total torrents
@@ -59,6 +96,41 @@ type Debrid struct {
 // a save round-trip instead of being stripped by omitempty.
 func (d *Debrid) DownloadsUncached() bool {
 	return d.DownloadUncached != nil && *d.DownloadUncached
+}
+
+// MagnetCap resolves the stored-item cap for this provider.
+//
+// Returns (cap, true) when a real ceiling applies, and (0, false) for
+// UNLIMITED — which covers both an explicit 0 and a provider with no known
+// cap. Callers must treat !ok as "there is no threshold here", never as "the
+// cap is zero", and must not substitute a number of their own.
+func (d *Debrid) MagnetCap() (int, bool) {
+	if d.MaxMagnets != nil {
+		if *d.MaxMagnets <= 0 {
+			return 0, false
+		}
+		return *d.MaxMagnets, true
+	}
+	if cap, ok := defaultMagnetCaps[d.Provider]; ok {
+		return cap, true
+	}
+	return 0, false
+}
+
+// defaultMagnetCaps carries a cap ONLY for providers whose ceiling has been
+// observed on a live account. Everything absent from this map is unlimited
+// until an operator says otherwise, which is the honest default: a provider we
+// have not measured is one whose limit we do not know.
+//
+// AllDebrid: 5,000 stored items, measured at 4,998/5,000 refusing every add for
+// 54.6 continuous hours across two midnight boundaries.
+//
+// RealDebrid is deliberately ABSENT rather than listed as unlimited: it bounds
+// CONCURRENT active downloads (reported by /torrents/activeCount and handled by
+// the admission check), not stored items, so a stored-item cap would be a
+// category error, not merely a wrong number.
+var defaultMagnetCaps = map[string]int{
+	"alldebrid": 5000,
 }
 
 func (c *Config) updateDebrid(index int, d Debrid) Debrid {

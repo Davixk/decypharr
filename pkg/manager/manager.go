@@ -36,6 +36,10 @@ type Manager struct {
 	migrator     *Migrator
 	repair       *Repair
 	clients      *xsync.Map[string, debrid.Client]
+	// fillCache memoizes per-provider stored-item counts, used to tell
+	// AllDebrid's transient daily allowance apart from its permanent
+	// stored-item cap. Both raise the same error code.
+	fillCache    *providerFillCache
 	arr          *arr.Storage
 	logger       zerolog.Logger
 	ready        chan struct{}
@@ -190,6 +194,7 @@ func New() *Manager {
 	instance := &Manager{
 		storage:                strg,
 		clients:                xsync.NewMap[string, debrid.Client](),
+		fillCache:              newProviderFillCache(),
 		logger:                 _logger,
 		migrationJobs:          xsync.NewMap[string, *storage.SwitcherJob](),
 		config:                 cfg,
@@ -454,15 +459,32 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		// for 54.6 continuous hours because the provider's stored-item cap was
 		// full. No cadence recovers from that; only deleting entries on the
 		// provider does. Holding a job for it helped nobody and hid it.
-		if isTooManyActiveDownloads(err) {
-			m.logger.Warn().Err(err).Str("job_id", job.ID).
-				Msg("Provider slots are full; failing the job so the arr can move on rather than holding it")
-		}
-		if isProviderAddQuotaExhausted(err) {
-			m.logger.Warn().Err(err).Str("job_id", job.ID).
-				Msg("Provider is refusing NEW items: its add/storage allowance is exhausted. This does NOT " +
-					"clear on its own — nothing decypharr finishes or deletes locally frees it. Delete " +
-					"entries on the provider to recover.")
+		// Same classification as the synchronous add path, and it must stay the
+		// same: a held entry re-attempted here has to reach the identical
+		// verdict, or an entry accepted at grab time would be failed on its
+		// first retry.
+		if refusal := m.classifyAddRefusal(err); refusal.hold {
+			if job.Entry != nil {
+				job.Entry.Status = debridTypes.TorrentStatusQueued
+				if updateErr := m.queue.Update(job.Entry); updateErr != nil {
+					m.logger.Debug().Err(updateErr).Str("job_id", job.ID).Msg("Failed to persist capacity hold")
+				}
+			}
+			m.logger.Info().
+				Str("job_id", job.ID).
+				Str("provider", refusal.provider).
+				Dur("retry_in", providerCapacityRetryDelay).
+				Msgf("Still holding: %s", refusal.detail)
+			m.jobQueue.Retry(job, providerCapacityRetryDelay)
+			return
+		} else if refusal.standingCondition != "" {
+			// LOUD and operator-addressed. This is the one capacity condition
+			// no amount of waiting resolves, so it must not read like the
+			// transient ones above.
+			m.logger.Error().
+				Str("job_id", job.ID).
+				Str("provider", refusal.provider).
+				Msg(refusal.standingCondition)
 		}
 		if errors.Is(err, parser.ErrProbeInfrastructure) {
 			// The availability probe failed on the NNTP substrate, not on the

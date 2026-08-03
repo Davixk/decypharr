@@ -632,6 +632,15 @@ class ConfigManager {
                                 <span class="text-sm opacity-70">Slots to leave free for other users of this account (another client, or your own manual use). Leave at 0 if decypharr is the only consumer.</span>
                             </div>
                             <div>
+                                <label class="label" for="debrid[${index}].max_magnets">
+                                    <span class="font-medium">Max Stored Items</span>
+                                </label>
+                                <input type="number" min="0" class="input w-full"
+                                       name="debrid[${index}].max_magnets" id="debrid[${index}].max_magnets"
+                                       placeholder="Provider default">
+                                <span class="text-sm opacity-70">How many items this provider stores before refusing new ones (AllDebrid defaults to 5000). Used to tell a temporary daily limit apart from a permanently full account. Leave empty for the provider default, or 0 for unlimited.</span>
+                            </div>
+                            <div>
                                 <label class="label" for="debrid[${index}].priority">
                                     <span class="font-medium">Priority</span>
                                 </label>
@@ -1448,6 +1457,7 @@ class ConfigManager {
             const repairRateLimitInput = getField('repair_rate_limit');
             const downloadRateLimitInput = getField('download_rate_limit');
             const minimumFreeSlotInput = getField('minimum_free_slot');
+            const maxMagnetsInput = getField('max_magnets');
             const priorityInput = getField('priority');
             const proxyInput = getField('proxy');
             const downloadUncachedInput = getField('download_uncached');
@@ -1488,6 +1498,20 @@ class ConfigManager {
             // page and hit Save.
             if (downloadUncachedInput.value !== '') {
                 debrid.download_uncached = downloadUncachedInput.value === 'true';
+            }
+
+            // max_magnets is tri-state for the same reason, and the states are
+            // NOT interchangeable: absent means "use the provider default"
+            // (AllDebrid 5000), while an explicit 0 means UNLIMITED. Coercing an
+            // empty box to 0 with `|| 0` — as the numeric fields above do —
+            // would silently uncap every provider on the first save, and a
+            // provider with no cap can never be recognised as permanently full,
+            // which is the condition that produced the 15.2-hour hold loop.
+            if (maxMagnetsInput && maxMagnetsInput.value.trim() !== '') {
+                const parsedMaxMagnets = parseInt(maxMagnetsInput.value, 10);
+                if (Number.isFinite(parsedMaxMagnets) && parsedMaxMagnets >= 0) {
+                    debrid.max_magnets = parsedMaxMagnets;
+                }
             }
 
             // Handle download API keys
