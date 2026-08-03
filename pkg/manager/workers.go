@@ -113,6 +113,30 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		}
 	}
 
+	// Capacity admission controller. Entries accepted at grab time that no
+	// provider had room for are normally admitted the instant a slot frees — an
+	// event this process witnesses and usually causes. This asks each provider
+	// ONCE per interval, however many entries are waiting, to catch capacity
+	// that frees from sources we never see: AllDebrid's own 30-minute no-peer
+	// prune, the operator deleting on the provider, another client sharing the
+	// account, and the daily add allowance resetting (which frees no slot at
+	// all, so no event can ever exist for it).
+	//
+	// One call PER PROVIDER, not one per held entry. That is O(1) against O(N):
+	// at a few thousand held entries a per-entry cadence is ~100 provider calls
+	// a second and grows with the backlog, where this stays constant.
+	if jd, err := utils.ConvertToJobDef(capacityAdmissionInterval); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to convert capacity admission interval to job definition")
+	} else {
+		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
+			m.admitHeldFromProviderCapacity()
+		}), gocron.WithContext(ctx), gocron.WithName("capacity-admission")); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to create capacity admission job")
+		} else {
+			m.logger.Debug().Msgf("Capacity admission controller scheduled for every %s", capacityAdmissionInterval)
+		}
+	}
+
 	// Missing-download recovery sweep. Completed entries whose download folder
 	// vanished (e.g. the category-directory data-loss incident) are reset to the
 	// claimed shape and resubmitted through the action gate, which rebuilds their

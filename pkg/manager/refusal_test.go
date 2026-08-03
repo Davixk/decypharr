@@ -115,7 +115,7 @@ func TestClassifyQuotaUnderCapIsHeld(t *testing.T) {
 func TestClassifyQuotaAtCapIsRefusedLoudly(t *testing.T) {
 	m := newRefusalFixture(t, "ad",
 		config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(5000)},
-		&fillClient{count: 4998})
+		&fillClient{count: 5000})
 
 	r := m.classifyAddRefusal(quotaErr("ad"))
 	if r.hold {
@@ -124,33 +124,43 @@ func TestClassifyQuotaAtCapIsRefusedLoudly(t *testing.T) {
 	if r.standingCondition == "" {
 		t.Fatal("a full stored-item cap must raise an operator-visible standing condition")
 	}
-	if !strings.Contains(r.standingCondition, "4998") || !strings.Contains(r.standingCondition, "5000") {
+	if !strings.Contains(r.standingCondition, "5000") {
 		t.Fatalf("standing condition must state the arithmetic; got %q", r.standingCondition)
 	}
 }
 
-// TestFillIsAtCapErrsEarly pins the asymmetry. The live account refuses at
-// 4,998/5,000, so `fill >= capacity` never fires and the entry would be held
-// against a cap nothing frees — the fork.34 pathology. Calling at-cap early is
-// the cheap mistake: a sync 400 sends the arr to its next candidate.
-func TestFillIsAtCapErrsEarly(t *testing.T) {
-	// The measured real condition.
-	if !fillIsAtCap(4998, 5000) {
-		t.Error("4998/5000 is the MEASURED full account; it must read as at-cap")
+// TestAtCapComparisonIsExact is the correction to a margin that used to live
+// here. A 99% fudge was added because the account refuses at 4,998 of 5,000, so
+// `fill >= cap` never fired — but padding an operator-set knob is a threshold
+// invented to compensate for a threshold already supplied, and worse it HIDES
+// which of two conditions is true.
+//
+// Under the configured cap and still refused is the DAILY allowance, which is
+// transient and must be held. A margin would have permanently refused a
+// condition that clears every day. If AllDebrid's real ceiling here is lower
+// than 5,000, the knob is the answer.
+func TestAtCapComparisonIsExact(t *testing.T) {
+	cfg := config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(5000)}
+
+	// The measured 4,998 case: UNDER the configured cap, so this is the daily
+	// allowance and it must be HELD, not refused.
+	underCap := newRefusalFixture(t, "ad", cfg, &fillClient{count: 4998})
+	if r := underCap.classifyAddRefusal(quotaErr("ad")); !r.hold {
+		t.Fatalf("4998/5000 is UNDER the configured cap; that is the daily allowance and must be held, got %+v", r)
 	}
-	if !fillIsAtCap(5000, 5000) || !fillIsAtCap(5001, 5000) {
-		t.Error("at or over the nominal cap must read as at-cap")
+
+	// Exactly at the cap refuses.
+	atCap := newRefusalFixture(t, "ad", cfg, &fillClient{count: 5000})
+	if r := atCap.classifyAddRefusal(quotaErr("ad")); r.hold {
+		t.Fatal("5000/5000 is at the cap and must be refused")
 	}
-	// A clearly-transient daily allowance must stay in the hold branch.
-	if fillIsAtCap(1200, 5000) {
-		t.Error("1200/5000 is the measured daily-allowance case; it must NOT read as at-cap")
-	}
-	if fillIsAtCap(4000, 5000) {
-		t.Error("4000/5000 has ample room; it must NOT read as at-cap")
-	}
-	// No cap means no threshold to be at.
-	if fillIsAtCap(999999, 0) {
-		t.Error("an uncapped provider must never read as at-cap")
+
+	// And an operator who knows the real ceiling is 4,998 sets the knob, which
+	// then works exactly.
+	tightened := config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(4998)}
+	tight := newRefusalFixture(t, "ad", tightened, &fillClient{count: 4998})
+	if r := tight.classifyAddRefusal(quotaErr("ad")); r.hold {
+		t.Fatal("with the cap set to the real ceiling, 4998/4998 must be refused")
 	}
 }
 

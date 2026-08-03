@@ -44,6 +44,13 @@ func (m *Manager) removeTorrentPlacementsLocked(t *storage.Entry) error {
 	}
 	seen := make(map[string]struct{}, len(t.Providers))
 	var errs []error
+	// Count the debrid placements actually released. Each one is a provider
+	// slot that demonstrably became free, which is exactly what an entry held
+	// for capacity is waiting on — the most definitive slot-free event there
+	// is, covering stall pruning, user deletes and cleanup alike. Admitting
+	// against it is why the hold needs no polling. Usenet is excluded on
+	// purpose: it has no debrid slot to free.
+	released := 0
 	for _, placement := range t.Providers {
 		if placement == nil {
 			continue
@@ -63,7 +70,16 @@ func (m *Manager) removeTorrentPlacementsLocked(t *storage.Entry) error {
 		}
 		if err := m.removeProviderPlacementIfUnreferenced(t.InfoHash, placement); err != nil {
 			errs = append(errs, err)
+			continue
 		}
+		released++
+	}
+	if released > 0 {
+		// The provider's stored count also just dropped, so a fill snapshot
+		// taken before this delete would still report the account full and
+		// wrongly refuse the next add as a standing condition.
+		m.fillCache.invalidate(t.ActiveProvider)
+		m.releaseHeldForCapacity(released)
 	}
 	return errors.Join(errs...)
 }

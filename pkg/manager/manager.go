@@ -40,10 +40,19 @@ type Manager struct {
 	// AllDebrid's transient daily allowance apart from its permanent
 	// stored-item cap. Both raise the same error code.
 	fillCache    *providerFillCache
+	// capacityHold holds grabs accepted at add time that no provider had room
+	// for yet. Drained on slot-free events and by the per-provider admission
+	// controller — never by a per-entry timer.
+	capacityHold *capacityHoldQueue
 	arr          *arr.Storage
 	logger       zerolog.Logger
 	ready        chan struct{}
 	readyOnce    sync.Once
+	// restoreDone is closed when the backgrounded boot restore finishes. See
+	// WaitForRestore for why callers that seed entries right after construction
+	// need it.
+	restoreDone     chan struct{}
+	restoreDoneOnce sync.Once
 	streamClient *http.Client
 
 	// Migration jobs tracking
@@ -195,6 +204,7 @@ func New() *Manager {
 		storage:                strg,
 		clients:                xsync.NewMap[string, debrid.Client](),
 		fillCache:              newProviderFillCache(),
+		capacityHold:           newCapacityHoldQueue(),
 		logger:                 _logger,
 		migrationJobs:          xsync.NewMap[string, *storage.SwitcherJob](),
 		config:                 cfg,
@@ -202,6 +212,7 @@ func New() *Manager {
 		queue:                  newQueue(strg, cfg.RemoveStalledAfter),
 		ctx:                    ctx,
 		ready:                  make(chan struct{}),
+		restoreDone:            make(chan struct{}),
 		streamClient:           streamClient,
 		usenetTimeout:          usenetTimeout,
 		debridSpeedTestResults: xsync.NewMap[string, debridTypes.SpeedTestResult](),
@@ -357,9 +368,36 @@ func (m *Manager) initJobQueue() {
 			if r := recover(); r != nil {
 				m.logger.Error().Interface("panic", r).Msg("Recovered from panic while restoring active downloads")
 			}
+			// Signals completion whether the restore finished or panicked, so a
+			// waiter can never be blocked forever by a crash inside it.
+			m.restoreDoneOnce.Do(func() { close(m.restoreDone) })
 		}()
 		m.restoreActiveDownloadJobs()
 	}()
+}
+
+// WaitForRestore blocks until the background boot restore has finished, or ctx
+// ends.
+//
+// It exists because that restore runs in a goroutine started during
+// construction, so ANYTHING that adds entries immediately after New() races it:
+// the restore lists the queue at its own moment, and an entry created a
+// microsecond earlier is swept into a boot pass that then revives or rebuilds
+// it. That is invisible in production, where nothing seeds an entry and asserts
+// its state in the same breath, and it made TestRetryRevivesFailedEntryAndClears-
+// FailedHistory fail intermittently on slower CI runners — a flaky gate that
+// invites re-running until green, which is exactly how a real failure gets
+// waved through as "probably the flaky one".
+func (m *Manager) WaitForRestore(ctx context.Context) error {
+	if m.restoreDone == nil {
+		return nil
+	}
+	select {
+	case <-m.restoreDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *Manager) cleanupOrphanedStagedNZBs() error {
@@ -473,9 +511,8 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 			m.logger.Info().
 				Str("job_id", job.ID).
 				Str("provider", refusal.provider).
-				Dur("retry_in", providerCapacityRetryDelay).
-				Msgf("Still holding: %s", refusal.detail)
-			m.jobQueue.Retry(job, providerCapacityRetryDelay)
+				Msgf("Still holding until a provider slot frees: %s", refusal.detail)
+			m.holdForCapacity(job)
 			return
 		} else if refusal.standingCondition != "" {
 			// LOUD and operator-addressed. This is the one capacity condition
@@ -557,6 +594,11 @@ func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.
 	if entry == nil {
 		return
 	}
+	// However this returns — completed, failed, or capped — this entry has
+	// stopped occupying a provider download slot, which is precisely the event
+	// a held entry is waiting for. Admitting one here is why the hold needs no
+	// polling: the slot's owner tells us it is done.
+	defer m.releaseHeldEntryOnSlotFree()
 	// Wait on a private snapshot. Detached post-download action goroutines and
 	// restore paths can retain the original pointer; refreshing a shared
 	// pointer from this loop would race with their own snapshot refreshes.

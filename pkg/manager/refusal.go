@@ -139,7 +139,7 @@ func (m *Manager) classifyQuotaRefusal(err error) addRefusal {
 		}
 	}
 
-	if fillIsAtCap(fill, capacity) {
+	if fill >= capacity {
 		return addRefusal{
 			provider: name,
 			detail:   fmt.Sprintf("stored-item cap reached (%d/%d)", fill, capacity),
@@ -192,56 +192,35 @@ func (m *Manager) holdTorrentForCapacity(importReq *ImportRequest, torrent *stor
 		Str("provider", refusal.provider).
 		Str("hash", torrent.InfoHash).
 		Str("name", torrent.Name).
-		Dur("retry_in", providerCapacityRetryDelay).
-		Msgf("Accepted and holding: %s", refusal.detail)
+		Msgf("Accepted and holding until a provider slot frees: %s", refusal.detail)
 
-	if m.jobQueue == nil {
-		return fmt.Errorf("failed to hold torrent for provider capacity: job queue unavailable: %w", cause)
-	}
-	m.jobQueue.Retry(job, providerCapacityRetryDelay)
+	// Parked, not polled. It is admitted the moment a slot frees — an event this
+	// process witnesses and usually causes — rather than on a cadence that would
+	// re-ask a question we already know the answer to, N/30 times a second.
+	m.holdForCapacity(job)
 	return nil
 }
 
-// fillIsAtCap reports whether an account should be treated as having hit its
-// STORED-item cap.
+// AT-CAP IS AN EXACT COMPARISON: fill >= capacity, nothing else.
 //
-// Deliberately NOT `fill >= capacity`. The live account was measured refusing
-// every add at 4,998 against a 5,000 cap, so the provider's own accounting
-// reaches its ceiling before our count does. That is expected rather than
-// surprising: our count comes from enumerating magnets, and there is no
-// guarantee the provider counts exactly the same set — items mid-delete, or
-// states its listing omits, plausibly still occupy the cap.
+// A margin was tried here and removed. It was justified by the account refusing
+// at 4,998 against a 5,000 cap, so that `fill >= capacity` never fired — but
+// that observation is evidence about the CAP, not an argument for a fudge
+// factor. max_magnets is a value the operator sets; padding it is a threshold
+// invented to compensate for a threshold already supplied, which is the same
+// mistake as the fabricated DefaultAvailableSlots of 100.
 //
-// THE MARGIN IS CHOSEN BY WHICH MISTAKE IS CHEAPER, which is strongly
-// asymmetric here:
+// Worse, a margin HIDES which of two conditions is true, and they need opposite
+// handling:
 //
-//	calling at-cap too EARLY  -> we refuse a grab that could have been held.
-//	                            A synchronous 400, so the arr immediately takes
-//	                            its next candidate from a list it still holds.
-//	                            No indexer traffic. Cheap and self-correcting.
-//	calling at-cap too LATE   -> we HOLD against a cap nothing will free, and
-//	                            the entry waits forever. This is exactly the
-//	                            fork.34 pathology: 15.2 hours of cycling on an
-//	                            account that had been full for 54.6 hours.
+//	the real stored ceiling here is lower than 5,000  -> the KNOB should say so,
+//	   and exact comparison then works perfectly;
+//	the refusal at 4,998 is the DAILY add cap, not the stored cap -> it is
+//	   TRANSIENT and must be HELD. A margin would permanently refuse a condition
+//	   that clears every day.
 //
-// So err early. One percent of the cap keeps a clearly-transient daily
-// allowance (measured at ~1,200/5,000) firmly in the hold branch while treating
-// the genuinely-full account as full.
-func fillIsAtCap(fill, capacity int) bool {
-	if capacity <= 0 {
-		return false
-	}
-	return fill*100 >= capacity*99
-}
-
-// providerCapacityRetryDelay is how often a held entry re-attempts.
-//
-// A CADENCE, not a deadline — there is deliberately no expiry, so this only
-// governs how often we ask, never how long we are willing to wait. Slots free
-// as our own downloads finish and as stall pruning reclaims them, both on the
-// order of minutes, so a short interval is appropriate and costs one admission
-// check per attempt (which for RealDebrid is answered before any add is spent).
-const providerCapacityRetryDelay = 30 * time.Second
+// Exact comparison surfaces that honestly: under the configured cap and still
+// refused means the daily allowance, and the hold branch already handles it.
 
 // providerConfig returns the configured Debrid block for a provider name.
 func (m *Manager) providerConfig(name string) (config.Debrid, bool) {

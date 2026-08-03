@@ -3,6 +3,7 @@ package sabnzbd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"mime/multipart"
 	"net"
@@ -180,6 +181,17 @@ func newSABTestHarness(t *testing.T, server *fakeNNTPServer) (*SABnzbd, *manager
 		}
 	})
 	t.Cleanup(server.Close)
+	// The boot restore runs in a goroutine started inside New(), so entries a
+	// test seeds immediately afterwards RACE it: the restore lists the queue at
+	// its own moment, sweeps in an entry created a microsecond earlier, and
+	// revives or rebuilds it out from under the assertion. That is what made
+	// TestRetryRevivesFailedEntryAndClearsFailedHistory fail intermittently on
+	// CI while passing every time locally. Wait for it before seeding anything.
+	waitCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := m.WaitForRestore(waitCtx); err != nil {
+		t.Fatalf("wait for boot restore: %v", err)
+	}
 	return New(m), m
 }
 
