@@ -302,7 +302,17 @@ class ConfigManager {
         setStall('no_progress_after', stall.no_progress_after);
         setStall('max_eta', stall.max_eta);
         setStall('min_age', stall.min_age);
+        setStall('seeder_grace', stall.seeder_grace);
         setStall('max_per_sweep', stall.max_per_sweep);
+        // TRI-STATE, so it cannot go through setStall: `value || ''` renders an
+        // explicit 0 as blank, and blank means "use the default" — which is 1,
+        // the opposite of what a 0 was set to say.
+        const minSeedersInput = document.querySelector('[name="stall_prune.min_seeders"]');
+        if (minSeedersInput) {
+            minSeedersInput.value = (stall.min_seeders === undefined || stall.min_seeders === null)
+                ? ''
+                : String(stall.min_seeders);
+        }
 
         fields.forEach(field => {
             const element = document.querySelector(`[name="${field}"]`);
@@ -1332,6 +1342,18 @@ class ConfigManager {
                 no_progress_after: document.querySelector('[name="stall_prune.no_progress_after"]')?.value?.trim() || "",
                 max_eta: document.querySelector('[name="stall_prune.max_eta"]')?.value?.trim() || "",
                 min_age: document.querySelector('[name="stall_prune.min_age"]')?.value?.trim() || "",
+                seeder_grace: document.querySelector('[name="stall_prune.seeder_grace"]')?.value?.trim() || "",
+                // TRI-STATE, so `|| 0` would be wrong in both directions here.
+                // Blank means "not mentioned" and must reach the backend as
+                // null so it takes the default; an explicit 0 means "switch
+                // this stage off" and must survive as 0. The other numeric
+                // fields above have no such distinction — for them 0 IS absent.
+                min_seeders: (() => {
+                    const raw = document.querySelector('[name="stall_prune.min_seeders"]')?.value?.trim();
+                    if (!raw) return null;
+                    const n = parseInt(raw, 10);
+                    return (Number.isNaN(n) || n < 0) ? null : n;
+                })(),
                 max_per_sweep: parseInt(document.querySelector('[name="stall_prune.max_per_sweep"]')?.value) || 0,
             },
             skip_pre_cache: document.querySelector('[name="skip_pre_cache"]').checked,

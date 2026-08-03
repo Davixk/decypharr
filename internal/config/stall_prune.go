@@ -49,10 +49,63 @@ type StallPruneConfig struct {
 	// Defaults to 30m when MaxETA is set but this is not.
 	MinAge string `json:"min_age,omitempty"`
 
+	// MinSeeders enables STAGE 3: delete a torrent that has moved zero bytes and
+	// has fewer than this many seeders, once SeederGrace has elapsed.
+	//
+	// TRI-STATE, and the distinction is load-bearing:
+	//
+	//	nil (absent) -> 1. The measured default; see below.
+	//	0            -> stage disabled. An explicit "do not judge on seeders".
+	//	N            -> require N.
+	//
+	// A plain int could not express "absent" separately from "explicitly off",
+	// and those must not collapse: the default is non-zero, so an operator
+	// turning the stage off would otherwise be indistinguishable from one who
+	// never mentioned it.
+	//
+	// WHY 1, MEASURED. Across 107 live RealDebrid transfers sampled against
+	// actual outcomes:
+	//
+	//	seeders  n    stalled (speed 0)
+	//	0        14   79%
+	//	1-2      49   24%
+	//	3+       44   27%
+	//
+	// The cliff is entirely between 0 and 1. A threshold of 3 buys nothing over
+	// 1-2 and would refuse 59% of transfers, so "more is safer" is exactly wrong
+	// here.
+	//
+	// This stage only ever acts inside an already-enabled sweep — it cannot turn
+	// stall pruning on by itself (see stallPruneSettings.enabled) — and it only
+	// ever acts on torrents that have moved ZERO bytes, which stage 1 would kill
+	// on its own window anyway. Its contribution is speed, not reach: it will not
+	// touch a torrent that has transferred anything, whatever its seeder count,
+	// because a momentary zero reading on a moving torrent must never be fatal.
+	//
+	// AllDebrid publishes no seeder field, so this is inert there. That costs
+	// nothing: AllDebrid runs download_uncached=false, where an uncached release
+	// is refused at add time and never reaches a stall.
+	MinSeeders *int `json:"min_seeders,omitempty"`
+
+	// SeederGrace is how long a torrent must have existed before STAGE 3 may
+	// judge it. RealDebrid reports 0 seeders at 0% progress on a transfer it has
+	// only just created, so sampling immediately would condemn every torrent on
+	// arrival. Defaults to 10m.
+	SeederGrace string `json:"seeder_grace,omitempty"`
+
 	// MaxPerSweep caps deletions per pass so a misconfigured threshold drains
 	// visibly instead of emptying an account in one tick. Defaults to 25.
 	MaxPerSweep int `json:"max_per_sweep,omitempty"`
 }
+
+// DefaultStallPruneMinSeeders is the stage-3 threshold when the sweep is
+// enabled and MinSeeders is absent. See the field comment for the measurement.
+const DefaultStallPruneMinSeeders = 1
+
+// DefaultStallPruneSeederGrace is the settle window before a seeder count means
+// anything. Long enough that a just-created transfer reporting 0 is not read as
+// a verdict.
+const DefaultStallPruneSeederGrace = "10m"
 
 // DefaultStallPruneMinAge is the stage-2 grace period when MaxETA is configured
 // without one. Matches AllDebrid's own 30-minute no-peer rule, which is the
@@ -63,5 +116,6 @@ const DefaultStallPruneMinAge = "30m"
 const DefaultStallPruneMaxPerSweep = 25
 
 func (s StallPruneConfig) IsZero() bool {
-	return s.NoProgressAfter == "" && s.MaxETA == "" && s.MinAge == "" && s.MaxPerSweep == 0
+	return s.NoProgressAfter == "" && s.MaxETA == "" && s.MinAge == "" && s.MaxPerSweep == 0 &&
+		s.MinSeeders == nil && s.SeederGrace == ""
 }

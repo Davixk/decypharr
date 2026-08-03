@@ -394,6 +394,22 @@
                                     <span class="text-sm opacity-70">Stage 2 only. An average over a few seconds projects to an absurd time-remaining, so without this every new torrent would be deleted on arrival. Stage 1 doesn't need it &mdash; its own window is the grace period.</span>
                                 </div>
                                 <div>
+                                    <label class="label" for="stall_prune.min_seeders">
+                                        <span class="font-medium">Minimum seeders</span>
+                                    </label>
+                                    <input type="number" min="0" class="input w-full" name="stall_prune.min_seeders"
+                                           id="stall_prune.min_seeders" placeholder="1 &mdash; 0 = off">
+                                    <span class="text-sm opacity-70"><strong>Stage 3, a faster stage 1.</strong> Deletes a torrent that has moved <em>zero bytes</em> <em>and</em> has fewer seeders than this. It never touches a torrent that has transferred anything, whatever its seeder count &mdash; so it can only ever act where stage 1 would have acted later, just sooner. Measured on 107 live transfers: 0 seeders stalls 79% of the time, 1&ndash;2 stalls 24%, 3+ stalls 27% &mdash; the cliff is entirely between 0 and 1, so raising this above 1 refuses far more without predicting better. Set <strong>0</strong> to switch the stage off. Only applies while stage 1 or 2 is enabled. AllDebrid publishes no seeder count, so this is inert there.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="stall_prune.seeder_grace">
+                                        <span class="font-medium">Grace period before checking seeders</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="stall_prune.seeder_grace"
+                                           id="stall_prune.seeder_grace" placeholder="10m">
+                                    <span class="text-sm opacity-70">Stage 3 only. A provider reports 0 seeders on a transfer it has only just created, so sampling immediately would condemn every torrent on arrival.</span>
+                                </div>
+                                <div>
                                     <label class="label" for="stall_prune.max_per_sweep">
                                         <span class="font-medium">Max deletions per sweep</span>
                                     </label>
