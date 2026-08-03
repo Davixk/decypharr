@@ -24,6 +24,7 @@ class TorrentDashboard {
             stateFilter: document.getElementById('stateFilter'),
             sortSelector: document.getElementById('sortSelector'),
             selectAll: document.getElementById('selectAll'),
+            batchPruneBtn: document.getElementById('batchPruneBtn'),
             batchDeleteBtn: document.getElementById('batchDeleteBtn'),
             batchDeleteDebridBtn: document.getElementById('batchDeleteDebridBtn'),
             refreshBtn: document.getElementById('refreshBtn'),
@@ -48,6 +49,7 @@ class TorrentDashboard {
         this.refs.refreshBtn.addEventListener('click', () => this.loadTorrents());
 
         // Batch delete
+        this.refs.batchPruneBtn.addEventListener('click', () => this.pruneSelectedTorrents());
         this.refs.batchDeleteBtn.addEventListener('click', () => this.deleteSelectedTorrents());
         this.refs.batchDeleteDebridBtn.addEventListener('click', () => this.deleteSelectedTorrents(true));
 
@@ -179,9 +181,16 @@ class TorrentDashboard {
                     window.decypharrUtils.createToast('Failed to copy torrent name', 'error');
                 }
             },
+            'prune': async () => {
+                await this.pruneTorrent(torrent.hash);
+            },
             'delete': async () => {
                 await this.deleteTorrent(torrent.hash, torrent.category, false);
             },
+            // The template emitted `debrid-delete` while this map keyed
+            // `delete-debrid`, so the context menu's "Remove from Provider" had
+            // no handler and silently did nothing when clicked. Both now use
+            // `delete-debrid`.
             'delete-debrid': async () => {
                 await this.deleteTorrent(torrent.hash, torrent.category, true);
             }
@@ -316,13 +325,18 @@ class TorrentDashboard {
                         ${this.renderStateBadge(torrent.state)}
                     </td>
                     <td>
+                        <button class="btn btn-ghost btn-xs text-warning"
+                                title="Prune: free the provider slot and report a FAILED download to the *arr, so it removes its queue row and searches for a replacement. Use this for a download that will not finish."
+                                onclick="window.dashboard.pruneTorrent('${torrent.info_hash}');">
+                            <i class="bi bi-scissors"></i>
+                        </button>
                         <button class="btn btn-ghost btn-xs text-error"
-                                title="Delete Torrent"
+                                title="Delete: remove it from decypharr only. The *arr is NOT told, so it keeps its queue row and will not search for a replacement."
                                 onclick="window.dashboard.deleteTorrent('${torrent.info_hash}', '${this.escapeAttr(torrent.category || '')}', false);">
                             <i class="bi bi-trash"></i>
                         </button>
                         <button class="btn btn-ghost btn-xs text-error"
-                                title="Delete from Provider"
+                                title="Delete from decypharr AND the debrid provider. The *arr is still NOT told."
                                 onclick="window.dashboard.deleteTorrent('${torrent.info_hash}', '${this.escapeAttr(torrent.category || '')}', true);">
                             <i class="bi bi-cloud-slash"></i>
                         </button>
@@ -459,12 +473,76 @@ class TorrentDashboard {
 
     updateSelectionUI() {
         const hasSelection = this.state.selectedEntries.size > 0;
+        this.refs.batchPruneBtn.classList.toggle('hidden', !hasSelection);
         this.refs.batchDeleteBtn.classList.toggle('hidden', !hasSelection);
         this.refs.batchDeleteDebridBtn.classList.toggle('hidden', !hasSelection);
 
         const allSelected = this.state.torrents.length > 0 &&
             this.state.torrents.every(t => this.state.selectedEntries.has(t.info_hash));
         this.refs.selectAll.checked = allSelected;
+    }
+
+    // PRUNE is not DELETE. Delete removes the item and tells the *arr nothing,
+    // so it keeps a queue row for a download that no longer exists. Prune frees
+    // the provider slot and then reports a FAILED download, which is what makes
+    // the arr drop its queue row and search for a replacement.
+    async pruneTorrent(hash) {
+        if (!confirm('Prune this download?\n\nThis frees the slot on the debrid provider and reports a FAILED download to the *arr, so it will remove its queue row and search for a replacement.')) return;
+
+        try {
+            const url = `${window.urlBase}api/torrents/${hash}/prune`;
+            const response = await window.decypharrUtils.fetcher(url, {method: 'POST'});
+            const result = await response.json().catch(() => null);
+
+            if (!response.ok) {
+                // A prune that could not release the provider slot deliberately
+                // leaves the entry alone rather than failing it while the slot
+                // is still held, so surface the provider's reason instead of a
+                // generic failure.
+                const reason = result && result.failed && result.failed[hash];
+                throw new Error(reason || 'Failed to prune download');
+            }
+
+            window.decypharrUtils.createToast('Pruned: provider slot freed and the *arr told to re-search');
+            this.state.selectedEntries.delete(hash);
+            this.loadTorrents();
+        } catch (error) {
+            console.error('Error pruning torrent:', error);
+            window.decypharrUtils.createToast(`Failed to prune: ${error.message}`, 'error');
+        }
+    }
+
+    async pruneSelectedTorrents() {
+        if (this.state.selectedEntries.size === 0) return;
+
+        const count = this.state.selectedEntries.size;
+        if (!confirm(`Prune ${count} selected downloads?\n\nThis frees their slots on the debrid provider and reports FAILED downloads to the *arr, so it will search for replacements.`)) return;
+
+        try {
+            const hashes = Array.from(this.state.selectedEntries).join(',');
+            const url = `${window.urlBase}api/torrents/prune?hashes=${hashes}`;
+            const response = await window.decypharrUtils.fetcher(url, {method: 'POST'});
+            const result = await response.json().catch(() => null);
+
+            if (!response.ok && !(result && result.pruned && result.pruned.length)) {
+                throw new Error('Failed to prune downloads');
+            }
+
+            // A partial batch is reported honestly: one stuck placement must not
+            // read as "all pruned".
+            const pruned = (result && result.pruned && result.pruned.length) || 0;
+            const failed = (result && result.failed && Object.keys(result.failed).length) || 0;
+            if (failed > 0) {
+                window.decypharrUtils.createToast(`Pruned ${pruned}; ${failed} could not be pruned (provider slot still held)`, 'warning');
+            } else {
+                window.decypharrUtils.createToast(`Pruned ${pruned} downloads; the *arr will re-search`);
+            }
+            this.state.selectedEntries.clear();
+            this.loadTorrents();
+        } catch (error) {
+            console.error('Error pruning items:', error);
+            window.decypharrUtils.createToast('Failed to prune downloads', 'error');
+        }
     }
 
     async deleteTorrent(hash, category, removeFromDebrid = false) {

@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -197,28 +198,53 @@ func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPrune
 			Str("reason", reason).
 			Msg("Stall prune: failing a torrent that will not finish, and releasing its provider slot")
 
-		// Release the provider placement first — that is the resource being
-		// reclaimed, and the entry must NOT be failed while its slot is still
-		// held (1558258): telling the arr to re-grab while we still occupy the
-		// slot spends a second one on the replacement.
-		if err := m.releasePlacementWithRetry(ctx, current); err != nil {
-			stuck = append(stuck, current.InfoHash)
-			continue
-		}
-
-		// Then fail it, so the *arr actually learns. Without this the *arr keeps
-		// a queue row for a download that no longer exists and never re-grabs.
-		current.MarkAsError(fmt.Errorf("stall prune: %s", reason))
-		if err := m.queue.Update(current); err != nil {
-			m.logger.Error().Err(err).
-				Str("infohash", current.InfoHash).
-				Msg("Stall prune: released the provider slot but could not record the failure; the arr may " +
-					"not see this as a failed download")
+		if err := m.PruneEntry(ctx, current, "stall prune: "+reason); err != nil {
+			if errors.Is(err, errPruneSlotStillHeld) {
+				stuck = append(stuck, current.InfoHash)
+			}
 			continue
 		}
 		pruned++
 	}
 	return pruned
+}
+
+// errPruneSlotStillHeld reports that the provider placement could not be
+// released, so the entry was deliberately left alone rather than failed.
+var errPruneSlotStillHeld = errors.New("provider placement could not be released")
+
+// PruneEntry is THE prune. Both the automatic stall sweep and the manual
+// control go through here, so there is exactly one definition of what pruning
+// means and the two cannot drift into behaving differently.
+//
+// The ordering is the whole point and it is load-bearing (1558258):
+//
+//  1. RELEASE the provider placement first. That is the resource being
+//     reclaimed, and it must happen even if the local update later fails.
+//  2. THEN fail the entry, so the *arr actually learns. Without this the arr
+//     keeps a queue row for a download that no longer exists and never
+//     re-searches — which is precisely what the plain delete does, and why it
+//     is not a prune.
+//
+// Never step 2 before step 1: telling the arr to re-grab while we still occupy
+// the slot spends a second slot on the replacement.
+func (m *Manager) PruneEntry(ctx context.Context, entry *storage.Entry, reason string) error {
+	if entry == nil {
+		return fmt.Errorf("prune: no entry")
+	}
+	if err := m.releasePlacementWithRetry(ctx, entry); err != nil {
+		return fmt.Errorf("%w: %s: %w", errPruneSlotStillHeld, entry.InfoHash, err)
+	}
+
+	entry.MarkAsError(fmt.Errorf("%s", reason))
+	if err := m.queue.Update(entry); err != nil {
+		m.logger.Error().Err(err).
+			Str("infohash", entry.InfoHash).
+			Msg("Prune: released the provider slot but could not record the failure; the arr may not see " +
+				"this as a failed download")
+		return fmt.Errorf("prune %s: released the slot but could not record the failure: %w", entry.InfoHash, err)
+	}
+	return nil
 }
 
 // Placement-release retry policy.

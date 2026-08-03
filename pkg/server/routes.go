@@ -84,6 +84,16 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)
 			r.Delete("/torrents", s.handleDeleteTorrents) // Fixed trailing slash
 
+			// PRUNE IS NOT DELETE, and they are separate routes so that stays
+			// obvious. DELETE removes the entry (optionally from the provider
+			// too) and tells the *arr nothing, leaving it holding a queue row
+			// for a download that no longer exists. PRUNE releases the provider
+			// slot and then FAILS the entry, so the arr sees a failed download
+			// and re-searches — the same pipeline the automatic stall prune
+			// uses, not a parallel implementation of it.
+			r.Post("/torrents/{hash}/prune", s.handlePruneTorrent)
+			r.Post("/torrents/prune", s.handlePruneTorrents)
+
 			// Browse - WebDAV-style hierarchical file browser
 			r.Route("/browse", func(r chi.Router) {
 				// Hierarchical browse endpoints

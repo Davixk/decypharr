@@ -17,7 +17,13 @@
         <div class="card-body">
             <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
                 <div class="flex items-center gap-2">
-                    <button class="btn btn-secondary btn-sm hidden" id="batchDeleteBtn">
+                    <button class="btn btn-warning btn-sm hidden" id="batchPruneBtn"
+                            title="Free the provider slots and report FAILED downloads to the *arr, so it removes its queue rows and searches for replacements.">
+                        <i class="bi bi-scissors"></i>
+                        <span class="hidden sm:inline">Prune Selected</span>
+                    </button>
+                    <button class="btn btn-secondary btn-sm hidden" id="batchDeleteBtn"
+                            title="Remove from decypharr only. The *arr is NOT told, so it keeps its queue row and will not re-search.">
                         <i class="bi bi-trash"></i>
                         <span class="hidden sm:inline">Delete Selected</span>
                     </button>
@@ -149,11 +155,14 @@
         <i class="bi bi-clipboard text-info"></i>Copy Name
     </a></li>
     <hr/>
-    <li><a class="menu-item text-sm text-error" data-action="delete">
-        <i class="bi bi-trash"></i>Delete Entry
+    <li><a class="menu-item text-sm text-warning" data-action="prune">
+        <i class="bi bi-scissors"></i>Prune (free slot, tell the *arr to re-search)
     </a></li>
-    <li><a class="menu-item text-sm text-error" data-action="debrid-delete">
-        <i class="bi bi-cloud-slash"></i> Remove from Provider
+    <li><a class="menu-item text-sm text-error" data-action="delete">
+        <i class="bi bi-trash"></i>Delete Entry (*arr not told)
+    </a></li>
+    <li><a class="menu-item text-sm text-error" data-action="delete-debrid">
+        <i class="bi bi-cloud-slash"></i> Remove from Provider (*arr not told)
     </a></li>
 </ul>
 

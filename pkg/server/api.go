@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -471,6 +472,103 @@ func (s *Server) handleDeleteTorrents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// PRUNE endpoints.
+//
+// Deliberately NOT folded into the delete handlers above, because they do
+// materially different things and conflating them is the defect this fixes:
+//
+//	DELETE  removes the entry, and with removeFromDebrid also removes it from
+//	        the provider. It makes NO arr call in either mode — verified:
+//	        DeleteEntry contains no arr interaction at all. The arr therefore
+//	        keeps a queue row for a download that no longer exists, and never
+//	        re-searches. That is fine when the operator means "forget this",
+//	        and wrong when they mean "this one is hopeless, get another".
+//	PRUNE   releases the provider slot and then FAILS the entry, so the arr
+//	        sees a failed download, removes its queue row and re-searches.
+//
+// Both are kept. The existing delete is unchanged.
+
+// pruneResult reports per-hash outcomes so a partial batch is legible rather
+// than collapsing into one status code.
+type pruneResult struct {
+	Pruned []string          `json:"pruned"`
+	Failed map[string]string `json:"failed,omitempty"`
+}
+
+func (s *Server) handlePruneTorrent(w http.ResponseWriter, r *http.Request) {
+	hash := chi.URLParam(r, "hash")
+	if hash == "" {
+		http.Error(w, "No hash provided", http.StatusBadRequest)
+		return
+	}
+	result := s.pruneHashes(r.Context(), []string{hash})
+	if len(result.Failed) > 0 {
+		// A prune that could not release the slot has deliberately left the
+		// entry alone, so report failure rather than a misleading 200.
+		utils.JSONResponse(w, result, http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, result, http.StatusOK)
+}
+
+func (s *Server) handlePruneTorrents(w http.ResponseWriter, r *http.Request) {
+	hashesStr := r.URL.Query().Get("hashes")
+	if hashesStr == "" {
+		http.Error(w, "No hashes provided", http.StatusBadRequest)
+		return
+	}
+	hashes := make([]string, 0)
+	for _, h := range strings.Split(hashesStr, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			hashes = append(hashes, h)
+		}
+	}
+	if len(hashes) == 0 {
+		http.Error(w, "No hashes provided", http.StatusBadRequest)
+		return
+	}
+	result := s.pruneHashes(r.Context(), hashes)
+	// A partial batch is still a success overall; the body says which failed.
+	// Only a batch where nothing at all could be pruned is an error.
+	if len(result.Pruned) == 0 && len(result.Failed) > 0 {
+		utils.JSONResponse(w, result, http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, result, http.StatusOK)
+}
+
+// pruneHashes runs the real prune pipeline for each hash, continuing past
+// individual failures so one stuck placement cannot block the rest of a
+// multi-select.
+func (s *Server) pruneHashes(ctx context.Context, hashes []string) pruneResult {
+	result := pruneResult{Pruned: make([]string, 0, len(hashes))}
+	for _, hash := range hashes {
+		entry, err := s.manager.GetEntry(hash)
+		if err != nil || entry == nil {
+			if result.Failed == nil {
+				result.Failed = map[string]string{}
+			}
+			result.Failed[hash] = "entry not found"
+			continue
+		}
+		if err := s.manager.PruneEntry(ctx, entry, "pruned manually by the operator"); err != nil {
+			s.logger.Error().Err(err).Str("hash", hash).Msg("Manual prune failed")
+			if result.Failed == nil {
+				result.Failed = map[string]string{}
+			}
+			result.Failed[hash] = err.Error()
+			continue
+		}
+		s.logger.Info().
+			Str("hash", hash).
+			Str("name", entry.Name).
+			Str("provider", entry.ActiveProvider).
+			Msg("Manual prune: released the provider slot and failed the entry so the arr re-searches")
+		result.Pruned = append(result.Pruned, hash)
+	}
+	return result
 }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
