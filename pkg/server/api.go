@@ -545,12 +545,20 @@ func (s *Server) handlePruneTorrents(w http.ResponseWriter, r *http.Request) {
 func (s *Server) pruneHashes(ctx context.Context, hashes []string) pruneResult {
 	result := pruneResult{Pruned: make([]string, 0, len(hashes))}
 	for _, hash := range hashes {
-		entry, err := s.manager.GetEntry(hash)
+		// The QUEUE row, not the main-store row. A still-downloading entry — the
+		// only kind a prune is for — exists solely in the queue, so resolving
+		// this through the main store made the control fail on exactly its
+		// intended targets. See Manager.PrunableEntry.
+		entry, err := s.manager.PrunableEntry(hash)
 		if err != nil || entry == nil {
 			if result.Failed == nil {
 				result.Failed = map[string]string{}
 			}
-			result.Failed[hash] = "entry not found"
+			if err != nil {
+				result.Failed[hash] = err.Error()
+			} else {
+				result.Failed[hash] = "entry not found"
+			}
 			continue
 		}
 		if err := s.manager.PruneEntry(ctx, entry, "pruned manually by the operator"); err != nil {

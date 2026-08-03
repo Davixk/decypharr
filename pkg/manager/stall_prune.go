@@ -150,12 +150,27 @@ func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPrune
 
 	now := time.Now()
 	pruned := 0
+	// Candidates that qualified for pruning but whose authoritative row could
+	// not be re-read. This counter exists because its absence hid a total
+	// failure of the feature: the re-read used to consult the MAIN store while
+	// the listing above comes from the QUEUE, so it missed on EVERY candidate
+	// and every one was dropped by a bare `continue`. A sweep that considers
+	// hundreds of entries and prunes none must say so.
+	skipped := 0
 	// Entries whose provider slot could not be released. Collected so the sweep
 	// REPORTS them: a per-entry error line among thousands is how a permanently
 	// unreleasable entry became invisible, skipped silently on every pass with
 	// nothing ever summarising that it kept happening.
 	var stuck []string
 	defer func() {
+		if skipped > 0 {
+			m.logger.Error().
+				Int("skipped", skipped).
+				Int("pruned", pruned).
+				Msg("Stall prune: these torrents qualified for pruning but their queue row could not be " +
+					"re-read, so they were left alone. A non-zero count here means the sweep is not acting " +
+					"on entries it has already judged prunable.")
+		}
 		if len(stuck) == 0 {
 			return
 		}
@@ -182,8 +197,9 @@ func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPrune
 		// Re-read before deleting: the listing is a snapshot, and an entry that
 		// started moving between the scan and now must not die on stale
 		// evidence.
-		current, err := m.GetEntry(entry.InfoHash)
+		current, err := m.PrunableEntry(entry.InfoHash)
 		if err != nil {
+			skipped++
 			continue
 		}
 		reason := prunableReason(current, settings, time.Now())
@@ -212,6 +228,48 @@ func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPrune
 // errPruneSlotStillHeld reports that the provider placement could not be
 // released, so the entry was deliberately left alone rather than failed.
 var errPruneSlotStillHeld = errors.New("provider placement could not be released")
+
+// errNotAnActiveEntry reports that a hash has no queue row, so there is no
+// in-flight download to prune.
+var errNotAnActiveEntry = errors.New("no active queue entry")
+
+// PrunableEntry re-reads the authoritative row for a prune candidate.
+//
+// IT MUST READ THE QUEUE, AND THAT IS THE ENTIRE POINT OF THIS FUNCTION.
+//
+// decypharr keeps two stores. The QUEUE holds in-flight workflow rows; the MAIN
+// store holds the library, and an entry is only written there by
+// persistCompletedEntry — that is, ON COMPLETION. A torrent that is still
+// downloading therefore exists in the queue and NOWHERE ELSE.
+//
+// Both prune callers used to re-read through Manager.GetEntry, which resolves
+// the MAIN store. That lookup missed on every candidate the sweep could ever
+// act on, because "still downloading" and "present in the main store" are
+// mutually exclusive by construction. Each miss hit a bare `continue`, so the
+// automatic stall prune ran on schedule, evaluated its thresholds correctly,
+// selected the right entries — and then silently dropped all of them. It had
+// never pruned anything. The manual control added later inherited the same
+// lookup and would have reported "entry not found" for precisely the stalled
+// torrents it exists to kill.
+//
+// The main store is deliberately NOT consulted as a fallback. A completed
+// library entry has no arr queue row to fail, so pruning it cannot do the one
+// thing a prune is for; "remove it from the provider" is a different action and
+// already has its own control. Answering with a typed refusal keeps the two
+// distinct instead of half-performing one as the other.
+func (m *Manager) PrunableEntry(infohash string) (*storage.Entry, error) {
+	entry, err := m.queue.GetTorrent(infohash)
+	if err != nil {
+		if errors.Is(err, storage.ErrEntryNotFound) {
+			return nil, fmt.Errorf("%w for %s", errNotAnActiveEntry, infohash)
+		}
+		return nil, err
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("%w for %s", errNotAnActiveEntry, infohash)
+	}
+	return entry, nil
+}
 
 // PruneEntry is THE prune. Both the automatic stall sweep and the manual
 // control go through here, so there is exactly one definition of what pruning
