@@ -88,6 +88,17 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		})
 	}
 
+	// Capture the providers' own view ONCE, before pass 2 rebuilds anything.
+	// Pass 2 decides per entry whether to re-submit a torrent, and it used to
+	// decide that from our record alone — so a torrent the provider already
+	// holds, whose placement write we never completed, was silently added
+	// again. Built only when at least one torrent would actually reach that
+	// branch, so a queue of NZBs or of already-placed entries costs nothing.
+	var reconciliation *restoreReconciliation
+	if m.queuedTorrentNeedsReconciliation(entries) {
+		reconciliation = m.buildRestoreReconciliation(ctx)
+	}
+
 	// Pass 2 re-parses queued NZBs over the network. When the NNTP substrate
 	// has collapsed, ploughing ahead serially converts one outage into
 	// thousands of failed rebuilds — the breaker pauses the loop after
@@ -113,7 +124,7 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		if entry.Status != debridTypes.TorrentStatusQueued && !m.nzbNeedsReprocessing(entry) {
 			continue
 		}
-		job, err := m.rebuildQueuedJob(entry)
+		job, err := m.rebuildQueuedJob(entry, reconciliation)
 		if err != nil {
 			if errors.Is(err, parser.ErrProbeInfrastructure) {
 				// The rebuild failed on the NNTP substrate, not on the content:
@@ -230,14 +241,14 @@ func (m *Manager) nzbNeedsReprocessing(entry *storage.Entry) bool {
 	return meta.Status == usenet.NZBStatusParsing || meta.Status == usenet.NZBStatusDownloading || meta.Status == usenet.NZBStatusPending
 }
 
-func (m *Manager) rebuildQueuedJob(entry *storage.Entry) (*Job, error) {
+func (m *Manager) rebuildQueuedJob(entry *storage.Entry, rec *restoreReconciliation) (*Job, error) {
 	if entry.IsNZB() {
 		return m.rebuildQueuedNZBJob(entry)
 	}
-	return m.rebuildQueuedTorrentJob(entry)
+	return m.rebuildQueuedTorrentJob(entry, rec)
 }
 
-func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
+func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry, rec *restoreReconciliation) (*Job, error) {
 	if entry.ActiveProvider != "" && entry.GetActiveProvider() != nil {
 		return &Job{
 			ID:             entry.InfoHash,
@@ -245,6 +256,15 @@ func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
 			Entry:          entry,
 			ResumeExisting: true,
 		}, nil
+	}
+
+	// We hold no placement — which is a statement about OUR record, not about
+	// the provider's. Ask the providers before concluding this was never
+	// submitted: adopting a copy they already hold is what stops a crash in the
+	// add/persist window from becoming a duplicate add. A negative or
+	// unavailable answer falls through to the re-submit below, unchanged.
+	if job, adopted := m.adoptProviderPlacement(entry, rec); adopted {
+		return job, nil
 	}
 
 	magnet, err := utils.GetMagnetInfo(entry.Magnet, m.config.AlwaysRmTrackerUrls)
