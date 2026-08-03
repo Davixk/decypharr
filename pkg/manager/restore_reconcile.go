@@ -58,6 +58,11 @@ type restoreReconciliation struct {
 	// sightings, which is already the safe direction.
 	answered []string
 	failed   []string
+	// adopted counts placements taken over instead of re-submitted. Reported by
+	// the boot-restore summary so the narrow crash-window case is legible next
+	// to the ordinary resume/rebuild counts, rather than being the only thing
+	// restore ever says.
+	adopted int
 }
 
 // queuedTorrentNeedsReconciliation reports whether any entry about to be
@@ -238,6 +243,8 @@ func (m *Manager) adoptProviderPlacement(entry *storage.Entry, rec *restoreRecon
 			Msg("Restore reconciliation: adopted placement could not be persisted; re-submitting instead")
 		return nil, false
 	}
+
+	rec.adopted++
 
 	m.logger.Info().
 		Str("infohash", entry.InfoHash).

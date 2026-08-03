@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
@@ -44,6 +45,34 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		return entries[i].AddedOn.Before(entries[j].AddedOn)
 	})
 
+	// Restore is a BOOT-TIME pass and runs exactly once, so the only evidence
+	// that it walked the whole set is what it says on the way out. Without this
+	// summary the sole line it emitted was the per-entry adoption notice — which
+	// fires only for the narrow crash-window case — so a healthy run that
+	// resumed thousands of entries and adopted seventeen looked identical to a
+	// run that processed seventeen entries and then died.
+	startedAt := time.Now()
+	var resumed, rebuilt, restoreFailed int
+	// Declared here rather than at its first use so the summary can read its
+	// adoption count on EVERY exit path, including the early returns for
+	// shutdown. A summary that only prints on the happy path would be missing
+	// exactly when it is most worth having.
+	var reconciliation *restoreReconciliation
+	defer func() {
+		adopted := 0
+		if reconciliation != nil {
+			adopted = reconciliation.adopted
+		}
+		m.logger.Info().
+			Int("candidates", len(entries)).
+			Int("resumed", resumed).
+			Int("rebuilt", rebuilt).
+			Int("adopted", adopted).
+			Int("failed", restoreFailed).
+			Dur("took", time.Since(startedAt)).
+			Msg("Boot restore completed")
+	}()
+
 	// Existing active downloads reserve slots before queued imports are resumed.
 	for _, entry := range entries {
 		if ctx.Err() != nil {
@@ -71,8 +100,11 @@ func (m *Manager) restoreActiveDownloadJobs() {
 			}
 			if job != nil {
 				if err := m.SubmitJob(job); err != nil {
+					restoreFailed++
 					entry.MarkAsError(err)
 					_ = m.queue.Update(entry)
+				} else {
+					resumed++
 				}
 			}
 			continue
@@ -80,12 +112,16 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		if entry.Status == debridTypes.TorrentStatusQueued || m.nzbNeedsReprocessing(entry) {
 			continue
 		}
-		_ = m.SubmitJob(&Job{
+		if err := m.SubmitJob(&Job{
 			ID:           entry.InfoHash,
 			Type:         jobTypeForEntry(entry),
 			Entry:        entry,
 			ResumeAction: entry.IsDownloading && entry.Status == debridTypes.TorrentStatusDownloaded,
-		})
+		}); err != nil {
+			restoreFailed++
+		} else {
+			resumed++
+		}
 	}
 
 	// Capture the providers' own view ONCE, before pass 2 rebuilds anything.
@@ -94,7 +130,6 @@ func (m *Manager) restoreActiveDownloadJobs() {
 	// holds, whose placement write we never completed, was silently added
 	// again. Built only when at least one torrent would actually reach that
 	// branch, so a queue of NZBs or of already-placed entries costs nothing.
-	var reconciliation *restoreReconciliation
 	if m.queuedTorrentNeedsReconciliation(entries) {
 		reconciliation = m.buildRestoreReconciliation(ctx)
 	}
@@ -148,6 +183,7 @@ func (m *Manager) restoreActiveDownloadJobs() {
 			// Terminal, non-infrastructure outcome: the substrate answered, so
 			// the consecutive-infrastructure chain is broken.
 			breaker.recordSuccess()
+			restoreFailed++
 			entry.MarkAsError(err)
 			if updateErr := m.queue.Update(entry); updateErr != nil {
 				m.logger.Debug().Err(updateErr).Str("infohash", entry.InfoHash).Msg("Skipped stale restore error update")
@@ -164,10 +200,13 @@ func (m *Manager) restoreActiveDownloadJobs() {
 		}
 		job.Entry = entry
 		if err := m.SubmitJob(job); err != nil {
+			restoreFailed++
 			entry.MarkAsError(err)
 			if updateErr := m.queue.Update(entry); updateErr != nil {
 				m.logger.Debug().Err(updateErr).Str("infohash", entry.InfoHash).Msg("Skipped stale restore submission error")
 			}
+		} else {
+			rebuilt++
 		}
 	}
 }
