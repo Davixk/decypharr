@@ -61,16 +61,10 @@ func TestStage1PrunesZeroBytesOverTheWindow(t *testing.T) {
 	}
 }
 
-// Seeders may never OVERRULE progress, in either direction. A stalled torrent
+// Seeders must not enter the predicate in either direction. A stalled torrent
 // reporting seeders is still stalled — if those seeders were useful, bytes
 // would have moved — and a moving torrent reporting none is still moving.
-//
-// Stage 3 later gave the seeder count a job, but only a strictly narrower one:
-// it may act sooner where progress has ALREADY shown zero, never against a
-// torrent progress says is working. Both assertions here bound that stage too,
-// which is why they are stated in terms of what seeders cannot do rather than
-// in terms of the count being unread.
-func TestSeedersDoNotOverruleProgress(t *testing.T) {
+func TestSeedersAreNotPartOfThePredicate(t *testing.T) {
 	withSeeders := stallEntry(func(e *storage.Entry) { e.Seeders = 12 })
 	if prunableReason(withSeeders, stallSettings(nil), time.Now()) == "" {
 		t.Fatal("seeders must not rescue an entry that moved zero bytes for the window")

@@ -25,15 +25,9 @@ type stallPruneSettings struct {
 	noProgressAfter time.Duration // stage 1; 0 = disabled
 	maxETA          time.Duration // stage 2; 0 = disabled
 	minAge          time.Duration // stage 2 grace period
-	minSeeders      int           // stage 3; 0 = disabled
-	seederGrace     time.Duration // stage 3 settle window
 	maxPerSweep     int
 }
 
-// enabled deliberately ignores minSeeders. Stage 3 defaults to a NON-ZERO
-// threshold, so letting it count here would switch the whole destructive
-// feature on for every operator who never asked for it. Stage 3 refines a sweep
-// that is already running; it never starts one.
 func (s stallPruneSettings) enabled() bool {
 	return s.noProgressAfter > 0 || s.maxETA > 0
 }
@@ -54,22 +48,10 @@ func resolveStallPruneSettings(cfg config.StallPruneConfig) stallPruneSettings {
 		noProgressAfter: parse(cfg.NoProgressAfter),
 		maxETA:          parse(cfg.MaxETA),
 		minAge:          parse(cfg.MinAge),
-		seederGrace:     parse(cfg.SeederGrace),
 		maxPerSweep:     cfg.MaxPerSweep,
-	}
-	// TRI-STATE. nil means "not mentioned", which takes the measured default;
-	// an explicit 0 means "do not judge on seeders" and must survive as a zero
-	// rather than being refilled by it.
-	if cfg.MinSeeders == nil {
-		s.minSeeders = config.DefaultStallPruneMinSeeders
-	} else if *cfg.MinSeeders > 0 {
-		s.minSeeders = *cfg.MinSeeders
 	}
 	if s.minAge <= 0 {
 		s.minAge = parse(config.DefaultStallPruneMinAge)
-	}
-	if s.seederGrace <= 0 {
-		s.seederGrace = parse(config.DefaultStallPruneSeederGrace)
 	}
 	if s.maxPerSweep <= 0 {
 		s.maxPerSweep = config.DefaultStallPruneMaxPerSweep
@@ -79,18 +61,13 @@ func resolveStallPruneSettings(cfg config.StallPruneConfig) stallPruneSettings {
 
 // prunableReason reports why an entry should be deleted, or "" to keep it.
 //
-// THREE STAGES, AND THE FIRST IS THE ONE TO TRUST.
+// TWO STAGES, AND THE FIRST IS THE ONE TO TRUST.
 //
 // Stage 1 — zero bytes for a window. Progress is MONOTONIC, so "0 now, added
 // an hour ago" already proves zero bytes across that entire hour: no sampling,
-// no buffer, no window state. Progress measures the outcome; a seeder count is
-// only a proxy for it, which is why stage 3 may never overrule it.
-//
-// Stage 3 — zero bytes AND no swarm, on a shorter window. It is stage 1 acting
-// sooner on the one population where waiting cannot help: a torrent with no
-// seeders is not slow to start, it has nowhere to start from. It requires zero
-// progress for the same reason stage 1 trusts progress, so it can only ever act
-// where stage 1 would have acted later.
+// no buffer, no window state. Seeders are deliberately not consulted, because
+// if seeders had been present and useful, bytes would have moved. Progress
+// measures the outcome; the seeder count is only a proxy for it.
 //
 // Stage 2 — projected completion beyond MaxETA, computed from the LIFETIME
 // AVERAGE. Weaker on purpose: some genuinely slow torrents do finish, and this
@@ -123,25 +100,6 @@ func prunableReason(e *storage.Entry, s stallPruneSettings, now time.Time) strin
 	// Stage 1: zero bytes for the whole window.
 	if s.noProgressAfter > 0 && e.Progress <= 0 && age >= s.noProgressAfter {
 		return fmt.Sprintf("no bytes transferred in %s", age.Round(time.Minute))
-	}
-
-	// Stage 3: no bytes AND no swarm. Strictly a faster stage 1, never a wider
-	// one — the zero-progress requirement is what keeps it safe.
-	//
-	// A seeder count is a proxy for an outcome, and progress is that outcome
-	// measured directly, so seeders may only ever break a tie that progress has
-	// already lost. A torrent that has moved bytes is not judged here at all,
-	// whatever its seeder count reads at this instant: the count fluctuates and
-	// a momentary zero on a working torrent must not be fatal.
-	//
-	// What it buys is time. Stage 1 has to wait out a window long enough to be
-	// safe for torrents that are merely slow to start; a zero-seeder torrent is
-	// not slow to start, it has nowhere to start from, and 79% of them never
-	// move a byte. Releasing that slot in 10 minutes instead of 38 is the whole
-	// feature.
-	if s.minSeeders > 0 && age >= s.seederGrace && e.Progress <= 0 && e.Seeders < s.minSeeders {
-		return fmt.Sprintf("no bytes transferred and %d seeders after %s, below the minimum of %d",
-			e.Seeders, age.Round(time.Minute), s.minSeeders)
 	}
 
 	// Stage 2: projected completion beyond the ceiling, at the average rate.
