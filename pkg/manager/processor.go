@@ -769,6 +769,33 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			logDebridAttemptFailure(_logger, providerName, "status check", debridTorrent.InfoHash, uncachedErr)
 			continue
 		}
+		// SEEDER GATE. The provider took an UNCACHED torrent and started it, so
+		// this is the last moment at which refusing is still cheap: we are
+		// inside the arr's blocking add, it still holds its ranked candidate
+		// list, and an error here makes it try the next release immediately
+		// with no indexer traffic. After we return, the same verdict costs a
+		// full re-search across every indexer.
+		//
+		// A cached hit never reaches this branch, and neither does a provider
+		// with download_uncached=false — that case is refused above.
+		if downloadUncached && torrent.Status != debridTypes.TorrentStatusDownloaded {
+			if reason := m.seederGateRefusal(ctx, debridTorrent.InfoHash, torrent.Seeders); reason != "" {
+				cleanupID := torrent.Id
+				if cleanupID == "" {
+					cleanupID = dbt.Id
+				}
+				gateErr := errors.New(reason)
+				// Prune the transfer we just created: refusing the grab while
+				// still holding the slot would spend it on a release we have
+				// declined.
+				errs = append(errs, errors.Join(
+					providerStageError(providerName, "seeder gate", gateErr),
+					cleanupDebridAttempt(db, providerName, cleanupID),
+				))
+				logDebridAttemptFailure(_logger, providerName, "seeder gate", debridTorrent.InfoHash, gateErr)
+				continue
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			// The provider accepted the torrent and the status check
 			// succeeded; deleting it now would remove content the user asked

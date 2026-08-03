@@ -401,6 +401,35 @@
                                            id="stall_prune.max_per_sweep" placeholder="25">
                                     <span class="text-sm opacity-70">Blast-radius cap. If a threshold is set too aggressively, this makes it drain visibly over several sweeps instead of emptying the account in one tick.</span>
                                 </div>
+
+                                <div class="md:col-span-2 border-t border-base-300 pt-4 mt-2">
+                                    <h4 class="font-semibold mb-1">Minimum seeders &mdash; refuse at grab time</h4>
+                                    <span class="text-sm opacity-70">A <strong>separate feature</strong> from the sweep above, shown here only because it also uses a threshold. The sweep prunes on a timer, <em>after</em> the *arr has been told the grab succeeded. This one answers <strong>while the *arr is still waiting on the add</strong>, so refusing is free &mdash; it simply takes the next release on its list, with no new indexer search. Once we have answered OK, any later failure forces a full new search across every indexer instead.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.min_seeders">
+                                        <span class="font-medium">Minimum seeders</span>
+                                    </label>
+                                    <input type="number" min="0" class="input w-full" name="seeder_gate.min_seeders"
+                                           id="seeder_gate.min_seeders" placeholder="empty = off">
+                                    <span class="text-sm opacity-70">Applies only to an <strong>uncached</strong> release the provider has just started downloading &mdash; a cached hit never reaches it. Below this, the transfer is deleted and the grab is failed so the *arr moves on immediately. Measured on 107 live transfers: 0 seeders stalls 79% of the time, 1&ndash;2 stalls 24%, 3+ stalls 27%. The cliff is entirely between 0 and 1, so <strong>1</strong> is the useful value; higher refuses far more without predicting any better. <strong>Empty or 0 = off.</strong></span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.bitmagnet_url">
+                                        <span class="font-medium">Bitmagnet GraphQL URL</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="seeder_gate.bitmagnet_url"
+                                           id="seeder_gate.bitmagnet_url" placeholder="http://host:3333/graphql &mdash; empty = off">
+                                    <span class="text-sm opacity-70">Where the seeder count comes from. It must be <strong>local and fast</strong>, because the lookup runs inside a request your *arr is blocked on. <strong>If it has no record, no count, or does not answer, the grab is ALLOWED</strong> &mdash; roughly half of all releases have no data, and refusing on ignorance would reject half of everything. Empty disables the whole feature.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.timeout">
+                                        <span class="font-medium">Lookup timeout</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="seeder_gate.timeout"
+                                           id="seeder_gate.timeout" placeholder="2s">
+                                    <span class="text-sm opacity-70">How long to wait for that lookup before giving up and allowing the grab. A typical answer takes 1&ndash;3ms.</span>
+                                </div>
                             </div>
                         </div>
                     </div>

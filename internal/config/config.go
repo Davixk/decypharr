@@ -456,6 +456,11 @@ type Config struct {
 	MaxConcurrentJobs int `json:"max_concurrent_jobs,omitempty"`
 
 	StallPrune StallPruneConfig `json:"stall_prune,omitempty"`
+	// SeederGate is a GRAB-TIME refusal, deliberately NOT part of StallPrune.
+	// That one prunes asynchronously on a timer; this one answers while the arr
+	// is still blocked on its add. Sharing a threshold does not make them the
+	// same feature, and wiring this into the sweep inverts it.
+	SeederGate            SeederGateConfig         `json:"seeder_gate,omitempty"`
 	SkipPreCache          bool                     `json:"skip_pre_cache,omitempty"`
 	SkipMultiSeason       bool                     `json:"skip_multi_season,omitempty"`
 	AlwaysRmTrackerUrls   bool                     `json:"always_rm_tracker_urls,omitempty"`
@@ -966,6 +971,10 @@ func clearHotFields(c *Config) {
 	// data, and an operator who has set a threshold too aggressively must be
 	// able to turn it off immediately rather than wait for a restart window.
 	c.StallPrune = StallPruneConfig{}
+	// Read live on each grab, so a gate refusing too much can be turned off
+	// without a restart. That matters here for the same reason it matters for
+	// stall pruning: this one deletes the transfer it refuses.
+	c.SeederGate = SeederGateConfig{}
 	c.SkipPreCache = false
 	c.SkipMultiSeason = false
 	c.AlwaysRmTrackerUrls = false

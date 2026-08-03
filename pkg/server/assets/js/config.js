@@ -304,6 +304,25 @@ class ConfigManager {
         setStall('min_age', stall.min_age);
         setStall('max_per_sweep', stall.max_per_sweep);
 
+        // The grab-time seeder gate is its own config block, not part of
+        // stall_prune — the two act at opposite ends of a download's life.
+        const gate = config.seeder_gate || {};
+        const setGate = (key, value) => {
+            const el = document.querySelector(`[name="seeder_gate.${key}"]`);
+            if (el) el.value = value || '';
+        };
+        setGate('bitmagnet_url', gate.bitmagnet_url);
+        setGate('timeout', gate.timeout);
+        // TRI-STATE. Absent and an explicit 0 both mean OFF, but they must
+        // still render differently: blank is "never configured", 0 is "turned
+        // off deliberately", and collapsing one into the other loses intent.
+        const gateMinSeeders = document.querySelector('[name="seeder_gate.min_seeders"]');
+        if (gateMinSeeders) {
+            gateMinSeeders.value = (gate.min_seeders === undefined || gate.min_seeders === null)
+                ? ''
+                : String(gate.min_seeders);
+        }
+
         fields.forEach(field => {
             const element = document.querySelector(`[name="${field}"]`);
             if (element && config[field] !== undefined) {
@@ -1333,6 +1352,20 @@ class ConfigManager {
                 max_eta: document.querySelector('[name="stall_prune.max_eta"]')?.value?.trim() || "",
                 min_age: document.querySelector('[name="stall_prune.min_age"]')?.value?.trim() || "",
                 max_per_sweep: parseInt(document.querySelector('[name="stall_prune.max_per_sweep"]')?.value) || 0,
+            },
+            seeder_gate: {
+                bitmagnet_url: document.querySelector('[name="seeder_gate.bitmagnet_url"]')?.value?.trim() || "",
+                timeout: document.querySelector('[name="seeder_gate.timeout"]')?.value?.trim() || "",
+                // TRI-STATE, so `|| 0` would be wrong: blank must reach the
+                // backend as null ("never configured") and an explicit 0 must
+                // survive as 0 ("turned off deliberately"). Both disable the
+                // gate, but only one of them is a decision.
+                min_seeders: (() => {
+                    const raw = document.querySelector('[name="seeder_gate.min_seeders"]')?.value?.trim();
+                    if (!raw) return null;
+                    const n = parseInt(raw, 10);
+                    return (Number.isNaN(n) || n < 0) ? null : n;
+                })(),
             },
             skip_pre_cache: document.querySelector('[name="skip_pre_cache"]').checked,
             always_rm_tracker_urls: document.querySelector('[name="always_rm_tracker_urls"]').checked,
