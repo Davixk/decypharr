@@ -128,6 +128,11 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 	// the same quantity the cache would otherwise enumerate for itself.
 	m.fillCache.observe(provider, len(remote), time.Now())
 
+	// The other direction of the same listing: items the provider holds that no
+	// local record claims. Reported only — see provider_orphans.go for why this
+	// must never delete on its own inference.
+	m.reportProviderOrphans(provider, remote)
+
 	if len(remote) == 0 {
 		m.logger.Debug().Str("debrid", provider).Msg("No remote found")
 	}

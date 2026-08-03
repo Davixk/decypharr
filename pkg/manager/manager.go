@@ -44,7 +44,11 @@ type Manager struct {
 	// for yet. Drained on slot-free events and by the per-provider admission
 	// controller — never by a per-entry timer.
 	capacityHold *capacityHoldQueue
-	arr          *arr.Storage
+	// providerOrphans records items a provider holds that no local record
+	// claims — the divergence the local consistency checker cannot see, because
+	// it only compares our index against our own scan.
+	providerOrphans *providerOrphanTracker
+	arr             *arr.Storage
 	logger       zerolog.Logger
 	ready        chan struct{}
 	readyOnce    sync.Once
@@ -204,6 +208,7 @@ func New() *Manager {
 		storage:                strg,
 		clients:                xsync.NewMap[string, debrid.Client](),
 		fillCache:              newProviderFillCache(),
+		providerOrphans:        newProviderOrphanTracker(),
 		capacityHold:           newCapacityHoldQueue(),
 		logger:                 _logger,
 		migrationJobs:          xsync.NewMap[string, *storage.SwitcherJob](),

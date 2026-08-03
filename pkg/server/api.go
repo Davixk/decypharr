@@ -1118,7 +1118,21 @@ func (s *Server) handleQueueConsistency(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	utils.JSONResponse(w, report, http.StatusOK)
+	// The local report answers "does our index agree with our scan", and it can
+	// answer yes while the provider holds 97 transfers we have no record of —
+	// observed, with consistent:true, on an account pinned at 100/100. A checker
+	// that only compares us against ourselves will always certify a
+	// self-consistent blindness, so the provider-side diff is reported beside
+	// it. It is captured by the torrent refresh rather than measured here: this
+	// endpoint stays local and immediate, and carries checked_at so a stale or
+	// never-run answer is visible as one.
+	utils.JSONResponse(w, struct {
+		*storage.QueueConsistencyReport
+		ProviderDivergence manager.ProviderDivergence `json:"provider_divergence"`
+	}{
+		QueueConsistencyReport: report,
+		ProviderDivergence:     s.manager.ProviderDivergence(),
+	}, http.StatusOK)
 }
 
 // handleQueueKeyState answers index membership and scan visibility for one
