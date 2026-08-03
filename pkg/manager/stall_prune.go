@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
@@ -148,6 +149,22 @@ func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPrune
 
 	now := time.Now()
 	pruned := 0
+	// Entries whose provider slot could not be released. Collected so the sweep
+	// REPORTS them: a per-entry error line among thousands is how a permanently
+	// unreleasable entry became invisible, skipped silently on every pass with
+	// nothing ever summarising that it kept happening.
+	var stuck []string
+	defer func() {
+		if len(stuck) == 0 {
+			return
+		}
+		m.logger.Error().
+			Int("stuck", len(stuck)).
+			Strs("infohashes", stuck).
+			Msg("Stall prune: these torrents could NOT have their provider slot released, so they were left " +
+				"untouched rather than failed while still holding it. Their slots stay occupied and they will " +
+				"be retried next sweep. If this repeats, the placement needs deleting on the provider directly.")
+	}()
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return pruned
@@ -181,12 +198,11 @@ func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPrune
 			Msg("Stall prune: failing a torrent that will not finish, and releasing its provider slot")
 
 		// Release the provider placement first — that is the resource being
-		// reclaimed, and it must happen even if the local update later fails.
-		if err := m.RemoveTorrentPlacements(current); err != nil {
-			m.logger.Error().Err(err).
-				Str("infohash", current.InfoHash).
-				Msg("Stall prune: could not release the provider placement; leaving the entry alone rather " +
-					"than failing it while the slot is still held")
+		// reclaimed, and the entry must NOT be failed while its slot is still
+		// held (1558258): telling the arr to re-grab while we still occupy the
+		// slot spends a second one on the replacement.
+		if err := m.releasePlacementWithRetry(ctx, current); err != nil {
+			stuck = append(stuck, current.InfoHash)
 			continue
 		}
 
@@ -203,4 +219,98 @@ func (m *Manager) pruneStalledDownloads(ctx context.Context, settings stallPrune
 		pruned++
 	}
 	return pruned
+}
+
+// Placement-release retry policy.
+//
+// A release failure was previously one undifferentiated `continue`: the entry
+// was skipped, and if the condition was permanent it was skipped again on every
+// subsequent sweep, forever, with nothing distinguishing "the provider blipped"
+// from "this will never succeed".
+//
+// The two need opposite handling. A transient failure deserves another attempt
+// promptly, because the slot it is holding is the resource under contention. A
+// terminal one must never be retried silently — retrying cannot change it, and
+// the operator has to know a slot is stranded.
+const (
+	placementReleaseAttempts   = 3
+	placementReleaseBackoff    = 2 * time.Second
+	placementReleaseBackoffMax = 8 * time.Second
+)
+
+// releasePlacementWithRetry releases an entry's provider placements, retrying
+// only what is worth retrying.
+//
+// Returns nil once the slot is genuinely free. A provider reporting the item as
+// already absent counts as released — the slot is not occupied by something the
+// provider does not have, and treating that as failure would strand the entry
+// permanently: its slot free, but the caller refusing to fail it on the grounds
+// that the slot is held.
+func (m *Manager) releasePlacementWithRetry(ctx context.Context, entry *storage.Entry) error {
+	delay := placementReleaseBackoff
+	var err error
+	for attempt := 1; attempt <= placementReleaseAttempts; attempt++ {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		err = m.RemoveTorrentPlacements(entry)
+		if err == nil {
+			return nil
+		}
+
+		if !customerror.IsRetriableError(err) {
+			// TERMINAL. Loud, identifiable, and named as an operator action —
+			// not a line in a sweep summary. Retrying is pointless, so this
+			// returns immediately rather than burning the remaining attempts.
+			m.logger.Error().Err(err).
+				Str("infohash", entry.InfoHash).
+				Str("name", entry.Name).
+				Str("provider", entry.ActiveProvider).
+				Str("placement_id", placementIDOf(entry)).
+				Int("attempt", attempt).
+				Msg("Stall prune: PERMANENTLY cannot release this provider placement. The slot stays occupied " +
+					"and the entry is left untouched (failing it while the slot is held would make the arr " +
+					"re-grab into a slot we still hold). This will not fix itself — delete the item on the " +
+					"provider, or check the account's credentials.")
+			return err
+		}
+
+		m.logger.Warn().Err(err).
+			Str("infohash", entry.InfoHash).
+			Str("provider", entry.ActiveProvider).
+			Int("attempt", attempt).
+			Int("of", placementReleaseAttempts).
+			Dur("retry_in", delay).
+			Msg("Stall prune: transient failure releasing the provider placement; retrying")
+
+		if attempt == placementReleaseAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay = delay * 2; delay > placementReleaseBackoffMax {
+			delay = placementReleaseBackoffMax
+		}
+	}
+
+	// Transient, but it outlasted the attempt budget. Still not silent: the
+	// next sweep retries, and the sweep summary reports that it is stuck.
+	m.logger.Error().Err(err).
+		Str("infohash", entry.InfoHash).
+		Str("name", entry.Name).
+		Str("provider", entry.ActiveProvider).
+		Int("attempts", placementReleaseAttempts).
+		Msg("Stall prune: could not release the provider placement after retries; leaving the entry alone " +
+			"rather than failing it while the slot is still held")
+	return err
+}
+
+func placementIDOf(entry *storage.Entry) string {
+	if placement := entry.GetActiveProvider(); placement != nil {
+		return placement.ID
+	}
+	return ""
 }

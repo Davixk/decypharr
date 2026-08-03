@@ -716,13 +716,34 @@ func (r *RealDebrid) DeleteTorrent(torrentId string) error {
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return err
+		// Transport failure: the request never got a verdict, so it is safe and
+		// correct to retry.
+		return customerror.NewError(fmt.Errorf("realdebrid delete %s: %w", torrentId, err), http.StatusServiceUnavailable, "", false, false).Retryable()
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("realdebrid API error: Status: %d", resp.StatusCode)
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		r.logger.Info().Msgf("Torrent: %s deleted from RD", torrentId)
+		return nil
+	case resp.StatusCode == http.StatusNotFound:
+		// ALREADY GONE IS A SATISFIED DELETE, not a failure. The caller's whole
+		// reason for deleting is to release the provider slot, and a torrent
+		// RealDebrid does not have is not holding one. Reporting an error here
+		// would strand the entry: its slot is free, but the caller would refuse
+		// to fail it on the grounds that the slot is still held.
+		r.logger.Debug().Msgf("Torrent: %s already absent from RD; delete satisfied", torrentId)
+		return nil
+	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		// Rate limiting and server-side faults are transient by definition.
+		// These used to be indistinguishable from a 403, because every non-2xx
+		// collapsed into one untyped "API error: Status: %d" string — so a
+		// caller could not tell "try again shortly" from "this will never work".
+		return customerror.NewError(fmt.Errorf("realdebrid delete %s: status %d", torrentId, resp.StatusCode), resp.StatusCode, "", false, false).Retryable()
+	default:
+		// 401/403/4xx: retrying cannot change the outcome.
+		return customerror.NewPermanentError(fmt.Errorf("realdebrid delete %s: status %d", torrentId, resp.StatusCode))
 	}
-	r.logger.Info().Msgf("Torrent: %s deleted from RD", torrentId)
-	return nil
 }
 
 func (r *RealDebrid) GetFileDownloadLinks(t *types.Torrent) (map[string]types.DownloadLink, error) {
