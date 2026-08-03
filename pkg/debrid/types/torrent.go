@@ -21,7 +21,39 @@ type Torrent struct {
 	Magnet           *utils.Magnet   `json:"magnet"`
 	Files            map[string]File `json:"files"`
 	Status           TorrentStatus   `json:"status"`
-	Added            time.Time       `json:"added"`
+	// ProviderStatus is the provider's OWN word for this torrent's state,
+	// unnormalized — "magnet_error", "dead", "Expired - Files removed", "No
+	// peer after 30 minutes".
+	//
+	// It exists because Status above is a four-value enum whose error case is
+	// produced by a catch-all `default` branch in every provider mapper
+	// (realdebrid.getStatus, alldebrid.getAlldebridStatus). That is fine for
+	// deciding "is this usable yet", and NOT fine for deciding "is this
+	// permanently dead", because an unrecognised or newly-introduced provider
+	// status silently becomes TorrentStatusError. Anything that acts
+	// destructively on a dead verdict must classify from this raw string (or a
+	// provider's own documented code range), never from the normalized enum.
+	//
+	// May be empty: only the bulk-enumeration paths populate it.
+	ProviderStatus string `json:"provider_status,omitempty"`
+
+	// ProviderDead is the provider's own verdict that this torrent has failed
+	// TERMINALLY — it will never become servable without being re-added.
+	//
+	// Each provider computes this from its OWN status scheme, because only it
+	// knows that scheme: AllDebrid uses its documented statusCode ladder,
+	// RealDebrid an explicit set of status strings. Deliberately NOT derived
+	// from Status == TorrentStatusError, which both mappers reach through a
+	// catch-all default and which therefore also swallows statuses neither
+	// mapper has ever seen.
+	//
+	// It is a POSITIVE finding only. false means "not reported dead", which
+	// includes "in progress", "healthy", and "this provider does not enumerate
+	// failures at all" — never read it as proof a torrent is fine, and never
+	// read the ABSENCE of a hash from an enumeration as anything at all.
+	ProviderDead bool `json:"provider_dead,omitempty"`
+
+	Added time.Time `json:"added"`
 	Progress         float64         `json:"progress"`
 	Speed            int64           `json:"speed"`
 	Seeders          int             `json:"seeders"`
@@ -63,6 +95,8 @@ func (t *Torrent) Copy() *Torrent {
 		Magnet:           t.Magnet,
 		Files:            newFiles,
 		Status:           t.Status,
+		ProviderStatus:   t.ProviderStatus,
+		ProviderDead:     t.ProviderDead,
 		Added:            t.Added,
 		Progress:         t.Progress,
 		Speed:            t.Speed,

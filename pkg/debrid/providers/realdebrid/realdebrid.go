@@ -560,6 +560,29 @@ func (r *RealDebrid) GetDownloadingStatus() []string {
 	return []string{"downloading", "magnet_conversion", "queued", "compressing", "uploading"}
 }
 
+// isDeadRealDebridStatus reports whether a RealDebrid status string is a
+// TERMINAL failure — the torrent will never become servable where it stands.
+//
+// An explicit ALLOWLIST, deliberately, and not `getStatus(s) ==
+// TorrentStatusError`. getStatus reaches its error case through a catch-all
+// `default`, so every status RealDebrid has not documented — and every one it
+// adds in future — reads as an error there. That is harmless for "is this
+// usable yet" and unacceptable here, because this verdict feeds destructive
+// components. An unrecognised status must fall through as NOT dead and be
+// resolved by the ordinary payload probe, which moves real bytes.
+//
+// Documented RealDebrid statuses NOT listed here, for the record:
+// magnet_conversion, waiting_files_selection, queued, downloading, downloaded,
+// compressing, uploading.
+func isDeadRealDebridStatus(status string) bool {
+	switch status {
+	case "magnet_error", "error", "virus", "dead":
+		return true
+	default:
+		return false
+	}
+}
+
 func getStatus(status string) types.TorrentStatus {
 	switch status {
 	case "downloading", "magnet_conversion", "queued", "compressing", "uploading", "waiting_files_selection":
@@ -829,7 +852,11 @@ func (r *RealDebrid) GetDownloadLink(id string, file *types.File) (types.Downloa
 	return r.accountsManager.GetDownloadLink(id, file, r.fetchDownloadLink)
 }
 
-func (r *RealDebrid) getTorrents(offset int, limit int) (int, []*types.Torrent, error) {
+// getTorrents fetches one page. downloadedOnly applies the `usable` filter that
+// GetTorrents' contract promises; GetAllTorrents passes false so failed and
+// in-flight torrents survive. The first return value is the number of rows the
+// API returned BEFORE filtering — see the comment at the return.
+func (r *RealDebrid) getTorrents(offset int, limit int, downloadedOnly bool) (int, []*types.Torrent, error) {
 	torrents := make([]*types.Torrent, 0)
 
 	queryParams := make(map[string]string)
@@ -875,42 +902,60 @@ func (r *RealDebrid) getTorrents(offset int, limit int) (int, []*types.Torrent, 
 		return 0, torrents, err
 	}
 
-	totalItems, _ := strconv.Atoi(resp.Header.Get("X-Total-Count"))
-	for _, t := range data {
-		if t.Status != "downloaded" {
+	for _, row := range data {
+		if downloadedOnly && row.Status != "downloaded" {
 			continue
 		}
-		t := &types.Torrent{
-			Id:               t.Id,
-			Name:             t.Filename,
-			Bytes:            t.Bytes,
-			Progress:         t.Progress,
-			Status:           types.TorrentStatusDownloaded,
-			Filename:         t.Filename,
-			OriginalFilename: t.Filename,
-			Links:            t.Links,
+		// The /torrents LIST endpoint carries no per-file data at all
+		// (TorrentsResponse has no Files field) — only /torrents/info/{id}
+		// does. Files stays empty here on purpose. This used to end with a
+		// `for _, f := range t.Files` loop that read the freshly-made empty map
+		// on the NEW torrent rather than any API data, so it looked like file
+		// population and was a no-op.
+		torrents = append(torrents, &types.Torrent{
+			Id:               row.Id,
+			Name:             row.Filename,
+			Bytes:            row.Bytes,
+			Progress:         row.Progress,
+			Status:           getStatus(row.Status),
+			ProviderStatus:   row.Status,
+			ProviderDead:     isDeadRealDebridStatus(row.Status),
+			Filename:         row.Filename,
+			OriginalFilename: row.Filename,
+			Links:            row.Links,
 			Files:            make(map[string]types.File),
-			InfoHash:         t.Hash,
+			InfoHash:         row.Hash,
 			Debrid:           r.config.Name,
-			Added:            t.Added,
-		}
-		for _, f := range t.Files {
-			t.Files[f.Name] = f
-		}
-		torrents = append(torrents, t)
+			Added:            row.Added,
+		})
 	}
-	return totalItems, torrents, nil
+	// The FETCHED row count, not the kept count: it is what the caller must
+	// advance its offset by. Returning the filtered count made the pager
+	// re-request rows it had already skipped and, worse, treat a page that
+	// happened to contain no `downloaded` rows as the end of the list.
+	return len(data), torrents, nil
 }
 
-// GetAllTorrents is identical to GetTorrents here: RealDebrid's /torrents
-// paginates every status, so the list already includes error and magnet_error
-// entries. Kept as a distinct method so callers state which contract they rely
-// on rather than depending on this happening to be true.
+// GetAllTorrents lists every torrent RealDebrid holds, across all statuses.
+//
+// It used to delegate straight to GetTorrents, and the doc comment claimed that
+// was equivalent because "/torrents paginates every status". The pagination
+// does — but GetTorrents then dropped every row whose status was not
+// `downloaded` before returning, so GetAllTorrents could not observe a single
+// error, magnet_error, dead or virus entry. It answered "nothing is broken" for
+// any RealDebrid account, with total confidence. That is the precise failure the
+// GetAllTorrents contract warns about, so the filter is now a parameter rather
+// than an assumption.
 func (r *RealDebrid) GetAllTorrents() ([]*types.Torrent, error) {
-	return r.GetTorrents()
+	return r.listTorrents(false)
 }
 
+// GetTorrents lists torrents RealDebrid considers usable, i.e. `downloaded`.
 func (r *RealDebrid) GetTorrents() ([]*types.Torrent, error) {
+	return r.listTorrents(true)
+}
+
+func (r *RealDebrid) listTorrents(downloadedOnly bool) ([]*types.Torrent, error) {
 	limit := 1000
 	if r.config.Limit != 0 {
 		limit = r.config.Limit
@@ -918,27 +963,24 @@ func (r *RealDebrid) GetTorrents() ([]*types.Torrent, error) {
 	hardLimit := r.config.Limit
 
 	allTorrents := make([]*types.Torrent, 0)
-	var fetchError error
 	offset := 0
 	for {
-		_, torrents, err := r.getTorrents(offset, limit)
+		fetched, torrents, err := r.getTorrents(offset, limit, downloadedOnly)
 		if err != nil {
-			fetchError = err
-			break
+			// Return the error, never the partial list. A truncated
+			// enumeration that reads as complete is exactly what lets a caller
+			// infer "absent, therefore fine".
+			return nil, err
 		}
-		totalTorrents := len(torrents)
-		if totalTorrents == 0 {
+		if fetched == 0 {
 			break
 		}
 		allTorrents = append(allTorrents, torrents...)
-		offset += totalTorrents
+		// Advance by rows FETCHED, not rows kept — see getTorrents.
+		offset += fetched
 		if hardLimit != 0 && len(allTorrents) >= hardLimit {
 			break
 		}
-	}
-
-	if fetchError != nil {
-		return nil, fetchError
 	}
 
 	return allTorrents, nil

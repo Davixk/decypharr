@@ -379,6 +379,33 @@ func getAlldebridStatus(statusCode int) types.TorrentStatus {
 	}
 }
 
+// alldebridFirstErrorStatusCode is the bottom of AllDebrid's terminal-failure
+// band. Its documented ladder is 0-3 in progress, 4 Ready, and 5+ failures:
+//
+//	5 Upload fail · 6 Internal error on unpacking · 7 Not downloaded in 20 min
+//	8 File too big · 9 Internal error · 10 Download took more than 72h
+//	11 Deleted on the hoster website
+const alldebridFirstErrorStatusCode = 5
+
+// isDeadAlldebridStatus reports whether an AllDebrid statusCode is a TERMINAL
+// failure.
+//
+// Bounded from BELOW on purpose, which is the whole difference from
+// getAlldebridStatus above: that one's `default` arm also captures NEGATIVE and
+// otherwise-nonsensical codes, so a malformed or absent statusCode would read as
+// a failure. Here an out-of-band code must fall through as NOT dead — this
+// verdict feeds destructive components, and the payload probe is the correct
+// resolver for anything unrecognised.
+//
+// The band is used rather than an exact code list because the live API returns
+// human labels outside the documented set ("Expired - Files removed", "No peer
+// after 30 minutes" were both observed on this account); those carry codes in
+// the failure band even though their wording is undocumented. The label travels
+// separately as ProviderStatus so the verdict names AllDebrid's own words.
+func isDeadAlldebridStatus(statusCode int) bool {
+	return statusCode >= alldebridFirstErrorStatusCode
+}
+
 func (ad *AllDebrid) flattenFiles(torrentId string, files []MagnetFile, parentPath string, index *int) map[string]types.File {
 	result := make(map[string]types.File)
 
@@ -608,6 +635,8 @@ func (ad *AllDebrid) listMagnets(params map[string]string) ([]*types.Torrent, er
 			Name:             magnet.Filename,
 			Bytes:            magnet.Size,
 			Status:           getAlldebridStatus(magnet.StatusCode),
+			ProviderStatus:   magnet.Status,
+			ProviderDead:     isDeadAlldebridStatus(magnet.StatusCode),
 			Filename:         magnet.Filename,
 			OriginalFilename: magnet.Filename,
 			Files:            make(map[string]types.File),
