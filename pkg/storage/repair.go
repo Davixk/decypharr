@@ -35,7 +35,12 @@ const (
 
 const (
 	RepairStageSelecting RepairRunStage = "selecting"
-	RepairStageProbing   RepairRunStage = "probing"
+	// RepairStageEnumerating is the ENUMERATE operation: ask each provider for
+	// its own view of every torrent it holds and record a verdict for the ones
+	// it reports terminally dead. Runs before probing because it is seconds of
+	// bulk calls against hours of per-file payload verification.
+	RepairStageEnumerating RepairRunStage = "enumerating"
+	RepairStageProbing     RepairRunStage = "probing"
 	RepairStageRepairing RepairRunStage = "repairing"
 	RepairStageDone      RepairRunStage = "done"
 )
@@ -119,6 +124,22 @@ type RepairRunStats struct {
 
 	Deletions          int `json:"deletions"`
 	DeletionCapSkipped int `json:"deletion_cap_skipped"`
+
+	// ENUMERATE counters. Reported separately from CHECK's Probed/Broken
+	// because the two reach a verdict by completely different means and must
+	// not be blended: CHECK moves real bytes, ENUMERATE relays what the
+	// provider says about its own state.
+	//
+	// EnumProvidersFailed is the one that makes the rest readable. Every other
+	// counter here can legitimately be zero, so without it a run in which every
+	// provider enumeration ERRORED is indistinguishable from one that
+	// successfully found nothing wrong — which, given "absence is not
+	// evidence", are opposite conclusions.
+	EnumScanned         int `json:"enum_scanned"`
+	EnumReportedDead    int `json:"enum_reported_dead"`
+	EnumMatched         int `json:"enum_matched"`
+	EnumMarkedBroken    int `json:"enum_marked_broken"`
+	EnumProvidersFailed int `json:"enum_providers_failed"`
 }
 
 // RepairRun is the append-only history record produced by a single sweep.

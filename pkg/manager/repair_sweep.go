@@ -127,6 +127,7 @@ const (
 	componentRepair = "repair"
 	componentPrune  = "prune"
 	componentArrDelete = "arr_delete"
+	componentEnumerate = "enumerate"
 )
 
 // Machine-readable reasons recorded when a component DECLINES to act, or when a
@@ -209,6 +210,27 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	// StopSchedule post-stop pass.
 	budget := r.newDeletionBudget(run.ID)
 
+	// ENUMERATE runs FIRST and is a separate operation, not a pre-filter: it
+	// neither narrows nor reorders the candidate set CHECK builds below, which
+	// still covers the whole managed library. It goes first only because it is
+	// seconds of bulk provider calls against ~13 hours of payload probing, so
+	// anything the provider already knows is dead gets acted on immediately
+	// instead of waiting for a probe pass to rediscover it by download.
+	//
+	// Skipped entirely when no component could act on what it finds — with
+	// REPAIR, PRUNE and ARR-DELETE all off the sweep is CHECK-only, and
+	// enumerating providers to write verdicts nothing will use is just load.
+	if actions.any() {
+		var enumMu sync.Mutex
+		run.Stage = storage.RepairStageEnumerating
+		r.saveRun(run)
+		r.runProviderEnumeration(ctx, run, &enumMu, cfg, actions, budget)
+		if ctx.Err() != nil {
+			r.finishCancelledRepairSweep(ctx, run, stopState, actions, "context cancelled during enumeration", nil, budget)
+			return
+		}
+	}
+
 	log.Info().
 		Bool("repair", actions.repair).
 		Bool("prune", actions.prune).
@@ -280,6 +302,10 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 	recordBudgetStats(run, budget)
 	r.finalizeRun(run, storage.RepairRunCompleted, "", "")
 	log.Info().
+		Int("enum_scanned", run.Stats.EnumScanned).
+		Int("enum_reported_dead", run.Stats.EnumReportedDead).
+		Int("enum_marked_broken", run.Stats.EnumMarkedBroken).
+		Int("enum_providers_failed", run.Stats.EnumProvidersFailed).
 		Int("probed", run.Stats.Probed).
 		Int("broken", run.Stats.Broken).
 		Int("healthy", run.Stats.Healthy).
