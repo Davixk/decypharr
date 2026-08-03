@@ -176,22 +176,123 @@ func TestScrapeHasNothingToAsk(t *testing.T) {
 	}
 }
 
-// TestScrapeUsesFallbackOnlyWhenTheMagnetHasNone: a DHT-only magnet may fall
-// back to a configured set, but a magnet with its own list must not be
-// second-guessed.
-func TestScrapeUsesFallbackOnlyWhenTheMagnetHasNone(t *testing.T) {
-	fallback := newFakeTracker(t, 55, 0, 0, "")
+// TestScrapePoolIsUsedWithAndWithoutMagnetTrackers.
+//
+// The pool started life as a DHT-only fallback. Measured on a live deployment
+// that was wrong in the strongest way available: 3,276 of 3,276 stored magnets
+// carried ZERO tr= entries, so the pool is the only tracker list that
+// deployment will ever have. It is therefore used ALONGSIDE the magnet's own
+// trackers, not instead of them.
+func TestScrapePoolIsUsedWithAndWithoutMagnetTrackers(t *testing.T) {
+	pool := newFakeTracker(t, 55, 0, 0, "")
 	own := newFakeTracker(t, 3, 0, 0, "")
-	u := &UDPScrape{PerTracker: 2 * time.Second, Fallback: []string{udpTracker(fallback.addr())}}
+	u := &UDPScrape{PerTracker: 2 * time.Second, Trackers: []string{udpTracker(pool.addr())}}
 
+	// No trackers in the magnet — the pool carries the whole lookup.
 	md, ok := u.Lookup(context.Background(), scrapeTestHash, nil)
 	if !ok || md.Seeders != 55 {
-		t.Fatalf("md=%+v ok=%v; a DHT-only magnet should reach the fallback set", md, ok)
+		t.Fatalf("md=%+v ok=%v; a magnet with no tr= list must still reach the pool", md, ok)
 	}
 
+	// With its own tracker, BOTH are asked and the highest wins — so the pool
+	// cannot drag a reading down and the magnet's tracker cannot hide a better
+	// one.
 	md, ok = u.Lookup(context.Background(), scrapeTestHash, []string{udpTracker(own.addr())})
-	if !ok || md.Seeders != 3 {
-		t.Fatalf("md=%+v ok=%v; the magnet's own tracker must be used, not the fallback", md, ok)
+	if !ok || md.Seeders != 55 {
+		t.Fatalf("md=%+v ok=%v; the pool augments the magnet's list rather than replacing it", md, ok)
+	}
+}
+
+// TestTrackerBackoffStopsAskingAFailingTracker.
+//
+// Measured against a real public tracker: 8 back-to-back scrapes answered 2,
+// and 5 spaced four seconds apart answered ZERO — spacing made it worse, so the
+// penalty is cumulative. Continuing to ask both deepens it and burns the lookup
+// budget on a host that will not reply.
+func TestTrackerBackoffStopsAskingAFailingTracker(t *testing.T) {
+	silent := newFakeTracker(t, 0, 0, 0, "silent")
+	u := &UDPScrape{PerTracker: 100 * time.Millisecond, Trackers: []string{udpTracker(silent.addr())}}
+
+	if _, ok := u.Lookup(context.Background(), scrapeTestHash, nil); ok {
+		t.Fatal("a silent tracker cannot answer")
+	}
+
+	// Now in backoff: the next lookup must not even try, so it returns fast.
+	start := time.Now()
+	if _, ok := u.Lookup(context.Background(), scrapeTestHash, nil); ok {
+		t.Fatal("expected unknown")
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("second lookup took %s; a tracker in backoff must be skipped, not re-dialled", elapsed)
+	}
+
+	// And a failure must never read as a swarm verdict.
+	u.mu.Lock()
+	blocked := len(u.blockedUntil)
+	u.mu.Unlock()
+	if blocked != 1 {
+		t.Fatalf("blocked trackers = %d, want 1", blocked)
+	}
+}
+
+// TestBackoffClearsOnSuccess: a tracker that recovers must come back.
+func TestBackoffClearsOnSuccess(t *testing.T) {
+	tr := newFakeTracker(t, 12, 0, 0, "")
+	u := &UDPScrape{PerTracker: time.Second, Trackers: []string{udpTracker(tr.addr())}}
+	endpoint := udpEndpoints([]string{udpTracker(tr.addr())})[0]
+
+	u.recordOutcome(endpoint, false, time.Now())
+	u.mu.Lock()
+	_, blocked := u.blockedUntil[endpoint]
+	u.mu.Unlock()
+	if !blocked {
+		t.Fatal("a failure must register a penalty")
+	}
+
+	u.recordOutcome(endpoint, true, time.Now())
+	u.mu.Lock()
+	_, stillBlocked := u.blockedUntil[endpoint]
+	failures := u.failures[endpoint]
+	u.mu.Unlock()
+	if stillBlocked || failures != 0 {
+		t.Fatalf("a success must clear the penalty and the failure count (blocked=%v failures=%d)",
+			stillBlocked, failures)
+	}
+}
+
+// TestPoolRotatesSoNoTrackerSeesEveryLookup. Without rotation a pool is just a
+// list whose first N members absorb the entire rate — the single-tracker limit
+// again, with more configuration.
+func TestPoolRotatesSoNoTrackerSeesEveryLookup(t *testing.T) {
+	pool := make([]string, 0, 6)
+	for i := 0; i < 6; i++ {
+		pool = append(pool, udpTracker(newFakeTracker(t, int32(i+1), 0, 0, "").addr()))
+	}
+	u := &UDPScrape{PerTracker: time.Second, Trackers: pool, PerLookup: 2}
+
+	seen := map[string]bool{}
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		for _, endpoint := range u.selectEndpoints(udpEndpoints(pool), now) {
+			seen[endpoint] = true
+		}
+	}
+	if len(seen) < 4 {
+		t.Fatalf("3 lookups of 2 trackers touched only %d distinct hosts; the pool must rotate", len(seen))
+	}
+}
+
+// TestPerLookupCapsTheFanOut: asking the whole pool every time multiplies our
+// rate against every member, which is the opposite of what a pool is for.
+func TestPerLookupCapsTheFanOut(t *testing.T) {
+	pool := make([]string, 0, 8)
+	for i := 0; i < 8; i++ {
+		pool = append(pool, udpTracker(newFakeTracker(t, 1, 0, 0, "").addr()))
+	}
+	u := &UDPScrape{PerTracker: time.Second, Trackers: pool, PerLookup: 3}
+
+	if got := len(u.selectEndpoints(udpEndpoints(pool), time.Now())); got != 3 {
+		t.Fatalf("selected %d trackers, want 3", got)
 	}
 }
 
@@ -248,8 +349,8 @@ func TestChainTakesTheFirstAnswer(t *testing.T) {
 	loud := newFakeTracker(t, 21, 0, 0, "")
 
 	chain := Chain{
-		&UDPScrape{PerTracker: 200 * time.Millisecond, Fallback: []string{udpTracker(quiet.addr())}},
-		&UDPScrape{PerTracker: time.Second, Fallback: []string{udpTracker(loud.addr())}},
+		&UDPScrape{PerTracker: 200 * time.Millisecond, Trackers: []string{udpTracker(quiet.addr())}},
+		&UDPScrape{PerTracker: time.Second, Trackers: []string{udpTracker(loud.addr())}},
 	}
 	md, ok := chain.Lookup(context.Background(), scrapeTestHash, nil)
 	if !ok || md.Seeders != 21 {

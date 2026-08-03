@@ -77,14 +77,45 @@ type SeederGateConfig struct {
 	// to 1s.
 	ScrapeTimeout string `json:"scrape_timeout,omitempty"`
 
-	// FallbackTrackers are scraped ONLY when a magnet carries no announce list
-	// of its own (a DHT-only magnet). Absence of trackers is otherwise an
-	// absence, not a licence to invent an announce list.
+	// Trackers is the UDP tracker POOL, used in addition to whatever announce
+	// URLs a magnet carries.
 	//
-	// Note this interacts with always_rm_tracker_urls: with that on, magnets
-	// reach the gate stripped of their `tr=` list, so EVERY grab falls back to
-	// this set — and with it empty, the scrape can never answer.
-	FallbackTrackers []string `json:"fallback_trackers,omitempty"`
+	// ⚠️ IN PRACTICE THIS IS USUALLY THE ONLY TRACKER LIST THERE IS. Measured
+	// on a live deployment: 3,276 of 3,276 stored magnets carried ZERO tr=
+	// entries. The uniform tracker visible in the qBittorrent API is a
+	// decypharr-synthesised placeholder, not magnet data. So a gate configured
+	// without a pool has nobody to ask on every single grab, fails open every
+	// time, and is indistinguishable from a working one — which is why an
+	// enabled gate with no reachable tracker WARNS rather than staying quiet.
+	//
+	// A POOL, NOT A TRACKER. One public tracker answered 2 of 8 back-to-back
+	// scrapes and 0 of 5 spaced four seconds apart — spacing made it worse, so
+	// the penalty is cumulative rather than rate-based. Under the grab floods
+	// this deployment runs deliberately, a single tracker degrades exactly when
+	// load is highest. Spread the requests.
+	//
+	// Also note always_rm_tracker_urls strips a magnet's own list before the
+	// gate sees it, which makes this pool the sole source outright.
+	Trackers []string `json:"trackers,omitempty"`
+
+	// TrackersPerLookup caps how many pool members one lookup asks. Asking all
+	// of them would multiply our rate against every member — the single-tracker
+	// limit again, with more configuration. Defaults to 3, rotating.
+	TrackersPerLookup int `json:"trackers_per_lookup,omitempty"`
+
+	// CacheTTL is how long a swarm reading is reused for the same infohash.
+	//
+	// THE HIGHEST-VALUE SETTING HERE. The same release is re-grabbed and
+	// re-probed constantly, so one scrape can serve all of it; against a
+	// tracker with a cumulative penalty window the fix is to make far fewer
+	// requests, not to pace them. Defaults to 15m.
+	CacheTTL string `json:"cache_ttl,omitempty"`
+
+	// CacheNegativeTTL is how long an UNANSWERABLE lookup is remembered, so a
+	// burst does not re-ask a tracker that has just refused us. Deliberately
+	// short — it exists to stop a stampede, not to give up on a hash. A cached
+	// unknown still allows. Defaults to 1m.
+	CacheNegativeTTL string `json:"cache_negative_ttl,omitempty"`
 }
 
 const (
@@ -92,6 +123,14 @@ const (
 	DefaultSeederGateTimeout = "3s"
 	// DefaultSeederGateScrapeTimeout bounds one tracker exchange.
 	DefaultSeederGateScrapeTimeout = "1s"
+	// DefaultSeederGateCacheTTL reuses a positive reading. A swarm does not
+	// change much in minutes, and re-scraping is what gets us rate-limited.
+	DefaultSeederGateCacheTTL = "15m"
+	// DefaultSeederGateCacheNegativeTTL remembers an unanswerable lookup just
+	// long enough to stop a burst re-asking a tracker that refused us.
+	DefaultSeederGateCacheNegativeTTL = "1m"
+	// DefaultSeederGateTrackersPerLookup rotates a small subset of the pool.
+	DefaultSeederGateTrackersPerLookup = 3
 
 	SwarmSourceUDPScrape = "udp_scrape"
 	SwarmSourceBitmagnet = "bitmagnet"
@@ -107,5 +146,6 @@ const (
 func (s SeederGateConfig) IsZero() bool {
 	return s.MinSeeders == nil && len(s.Sources) == 0 && s.Timeout == "" &&
 		s.BitmagnetURL == "" && s.ScrapeBindAddr == "" && s.ScrapeTimeout == "" &&
-		len(s.FallbackTrackers) == 0
+		len(s.Trackers) == 0 && s.TrackersPerLookup == 0 &&
+		s.CacheTTL == "" && s.CacheNegativeTTL == ""
 }

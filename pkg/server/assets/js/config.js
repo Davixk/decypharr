@@ -324,7 +324,10 @@ class ConfigManager {
         setGate('scrape_bind_addr', gate.scrape_bind_addr);
         setGate('scrape_timeout', gate.scrape_timeout);
         setGate('sources', Array.isArray(gate.sources) ? gate.sources.join(', ') : '');
-        setGate('fallback_trackers', Array.isArray(gate.fallback_trackers) ? gate.fallback_trackers.join(', ') : '');
+        setGate('trackers', Array.isArray(gate.trackers) ? gate.trackers.join(', ') : '');
+        setGate('trackers_per_lookup', gate.trackers_per_lookup);
+        setGate('cache_ttl', gate.cache_ttl);
+        setGate('cache_negative_ttl', gate.cache_negative_ttl);
         // TRI-STATE. Absent and an explicit 0 both mean OFF, but they must
         // still render differently: blank is "never configured", 0 is "turned
         // off deliberately", and collapsing one into the other loses intent.
@@ -1374,7 +1377,10 @@ class ConfigManager {
                 scrape_bind_addr: document.querySelector('[name="seeder_gate.scrape_bind_addr"]')?.value?.trim() || "",
                 scrape_timeout: document.querySelector('[name="seeder_gate.scrape_timeout"]')?.value?.trim() || "",
                 sources: splitList(document.querySelector('[name="seeder_gate.sources"]')?.value),
-                fallback_trackers: splitList(document.querySelector('[name="seeder_gate.fallback_trackers"]')?.value),
+                trackers: splitList(document.querySelector('[name="seeder_gate.trackers"]')?.value),
+                trackers_per_lookup: parseInt(document.querySelector('[name="seeder_gate.trackers_per_lookup"]')?.value) || 0,
+                cache_ttl: document.querySelector('[name="seeder_gate.cache_ttl"]')?.value?.trim() || "",
+                cache_negative_ttl: document.querySelector('[name="seeder_gate.cache_negative_ttl"]')?.value?.trim() || "",
                 // TRI-STATE, so `|| 0` would be wrong: blank must reach the
                 // backend as null ("never configured") and an explicit 0 must
                 // survive as 0 ("turned off deliberately"). Both disable the

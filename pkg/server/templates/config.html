@@ -439,12 +439,36 @@
                                     <span class="text-sm opacity-70">Only used if <code>bitmagnet</code> is listed as a source above.</span>
                                 </div>
                                 <div>
-                                    <label class="label" for="seeder_gate.fallback_trackers">
-                                        <span class="font-medium">Fallback trackers</span>
+                                    <label class="label" for="seeder_gate.trackers">
+                                        <span class="font-medium">Tracker pool</span>
                                     </label>
-                                    <input type="text" class="input w-full" name="seeder_gate.fallback_trackers"
-                                           id="seeder_gate.fallback_trackers" placeholder="udp://tracker.example:1337/announce, ...">
-                                    <span class="text-sm opacity-70">Comma-separated. Used <strong>only</strong> when a magnet carries no trackers of its own (a DHT-only magnet). Note that <strong>"Always remove tracker URLs"</strong> strips every magnet's tracker list, so with that on the scrape has nobody to ask unless you fill this in &mdash; and with nobody to ask it always allows.</span>
+                                    <input type="text" class="input w-full" name="seeder_gate.trackers"
+                                           id="seeder_gate.trackers" placeholder="udp://tracker.example:1337/announce, udp://other.example:6969/announce, ...">
+                                    <span class="text-sm opacity-70">Comma-separated, used <strong>in addition</strong> to any trackers the magnet carries. <strong>In practice this is usually the only list there is</strong> &mdash; measured on a live library, 3,276 of 3,276 stored magnets had no tracker entries at all (the uniform tracker shown in the qBittorrent view is a placeholder decypharr synthesises, not magnet data), and <strong>"Always remove tracker URLs"</strong> strips whatever is there before this point. With an empty pool the gate has nobody to ask, allows every grab, and looks exactly like a gate that is working &mdash; so it logs a warning instead. <strong>Give it several trackers, not one:</strong> a single public tracker answered 2 of 8 back-to-back requests, and spacing them out made it worse.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.trackers_per_lookup">
+                                        <span class="font-medium">Trackers asked per grab</span>
+                                    </label>
+                                    <input type="number" min="1" class="input w-full" name="seeder_gate.trackers_per_lookup"
+                                           id="seeder_gate.trackers_per_lookup" placeholder="3">
+                                    <span class="text-sm opacity-70">How many of the pool to ask each time, rotating through it. Asking all of them every time would multiply your request rate against every tracker &mdash; which is the single-tracker rate limit again, just with more configuration. A tracker that stops answering is dropped for a while and retried later.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.cache_ttl">
+                                        <span class="font-medium">Cache lifetime</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="seeder_gate.cache_ttl"
+                                           id="seeder_gate.cache_ttl" placeholder="15m">
+                                    <span class="text-sm opacity-70">How long a seeder count is reused for the same torrent. <strong>This is the setting that makes the feature survive a grab flood</strong> &mdash; the same release gets re-grabbed and re-probed constantly, and one lookup can serve all of it. Trackers penalise repeat requests cumulatively, so making fewer requests works where spacing them out does not.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="seeder_gate.cache_negative_ttl">
+                                        <span class="font-medium">Cache lifetime for "no answer"</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="seeder_gate.cache_negative_ttl"
+                                           id="seeder_gate.cache_negative_ttl" placeholder="1m">
+                                    <span class="text-sm opacity-70">How long to remember that a lookup couldn't be answered, so a burst doesn't re-ask a tracker that just refused. Kept short on purpose &mdash; it's there to stop a stampede, not to give up on a torrent. A remembered "no answer" still allows the grab.</span>
                                 </div>
                                 <div>
                                     <label class="label" for="seeder_gate.timeout">
