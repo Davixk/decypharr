@@ -49,11 +49,14 @@ const (
 
 // UDPScrape reads swarm counts from a pool of UDP trackers.
 type UDPScrape struct {
-	// BindAddr is the local address to egress from. Empty uses the default
-	// route — see the IP-exposure note above. It must belong to THIS process's
-	// network namespace: a VPN sidecar's tunnel address is not bindable from a
-	// container that does not share its namespace.
-	BindAddr string
+	// LocalAddr supplies the local address to egress from, resolved fresh per
+	// dial. Nil, or a nil address with no error, uses the OS default route.
+	//
+	// A FUNCTION rather than a fixed address on purpose: an interface name has
+	// to be resolved at connect time so a reconnected tunnel is picked up, and
+	// so a tunnel that has GONE returns an error instead of a stale address
+	// that no longer routes. An error here fails the scrape — never a fallback.
+	LocalAddr func() (net.Addr, error)
 	// PerTracker bounds one tracker's full connect+scrape exchange.
 	PerTracker time.Duration
 
@@ -234,15 +237,17 @@ func (u *UDPScrape) scrapeOne(ctx context.Context, endpoint string, hash []byte,
 	}
 
 	dialer := &net.Dialer{Deadline: deadline}
-	if u.BindAddr != "" {
-		local, err := net.ResolveUDPAddr("udp", u.BindAddr)
+	if u.LocalAddr != nil {
+		local, err := u.LocalAddr()
 		if err != nil {
-			// A bind address that does not resolve must FAIL, not silently fall
-			// back to the default route — falling back is the leak this exists
-			// to prevent.
+			// A binding that cannot be honoured must FAIL, not silently fall
+			// back to the default route. Falling back sends this packet
+			// exactly where it was configured not to go, and says nothing.
 			return Metadata{}, false
 		}
-		dialer.LocalAddr = local
+		if local != nil {
+			dialer.LocalAddr = local
+		}
 	}
 
 	conn, err := dialer.DialContext(ctx, "udp", endpoint)

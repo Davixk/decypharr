@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-co-op/gocron/v2"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/netbind"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 )
@@ -15,6 +16,42 @@ func (m *Manager) runInitialCalls(ctx context.Context) {
 	go m.refreshDownloadLinks(ctx)
 	go m.processQueuedEntries()
 	go m.syncAccounts()
+}
+
+// logNetworkBindings states, once at startup, where each class of outbound
+// traffic will actually leave from.
+//
+// An operator must be able to READ which class goes where rather than infer it
+// from the absence of a complaint — the whole point of the feature is that
+// certain traffic takes a specific route, and "it did not error" is not
+// evidence of that. A binding that is configured but broken is reported here,
+// at startup, instead of surfacing hours later as a failed grab nobody connects
+// back to the config.
+func (m *Manager) logNetworkBindings() {
+	binder := netbind.New(classSpecs(config.Get().NetworkBinding.Bindings()))
+	for _, resolved := range binder.Snapshot() {
+		event := m.logger.Info()
+		if resolved.Err != nil {
+			// LOUD. A configured-but-unresolvable binding means every operation
+			// in that class will FAIL rather than quietly take the ordinary
+			// route. That is the intended behaviour, and the operator needs to
+			// know it is happening.
+			m.logger.Error().Err(resolved.Err).
+				Str("class", string(resolved.Class)).
+				Str("configured", resolved.Spec).
+				Msg("Network binding cannot be resolved. Traffic in this class will FAIL rather than " +
+					"fall back to the default route. If this interface lives on the host, note that a " +
+					"bridge-network container cannot see it — that is a deployment change, not a config one.")
+			continue
+		}
+		if resolved.Configured {
+			event = event.Str("configured", resolved.Spec)
+		}
+		event.
+			Str("class", string(resolved.Class)).
+			Str("egress", resolved.Address).
+			Msg("Network binding")
+	}
 }
 
 func (m *Manager) syncAccounts() {
@@ -195,6 +232,8 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 func (m *Manager) StartWorker(ctx context.Context) error {
 	// Stop any existing jobs before starting new ones
 	m.scheduler.RemoveByTags("decypharr")
+
+	m.logNetworkBindings()
 
 	// Call the initial calls
 	m.runInitialCalls(ctx)

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -332,15 +334,65 @@ func TestScrapeStopsOnACancelledContext(t *testing.T) {
 	}
 }
 
-// TestBadBindAddressFailsRatherThanLeaks. The bind address is the operator's
-// control over which interface a scrape egresses from; falling back to the
-// default route on a typo is precisely the IP leak it exists to prevent.
-func TestBadBindAddressFailsRatherThanLeaks(t *testing.T) {
+// TestUnresolvableBindingFailsRatherThanLeaks.
+//
+// The binding is the operator's control over WHICH interface a scrape leaves
+// from. Falling back to the default route when it cannot be honoured sends the
+// packet exactly where he configured it not to go, and says nothing — so a
+// failed binding must fail the operation.
+func TestUnresolvableBindingFailsRatherThanLeaks(t *testing.T) {
 	tr := newFakeTracker(t, 77, 0, 0, "")
-	u := &UDPScrape{PerTracker: time.Second, BindAddr: "not-an-address:::"}
+	u := &UDPScrape{
+		PerTracker: time.Second,
+		LocalAddr: func() (net.Addr, error) {
+			return nil, errors.New("no interface named \"wgProtonCH\"")
+		},
+	}
 
 	if _, ok := u.Lookup(context.Background(), scrapeTestHash, []string{udpTracker(tr.addr())}); ok {
-		t.Fatal("an unresolvable bind address must fail the scrape, never silently use the default route")
+		t.Fatal("an unresolvable binding must fail the scrape, never silently use the default route")
+	}
+}
+
+// TestNilBindingUsesTheDefaultRoute: unconfigured is not an error.
+func TestNilBindingUsesTheDefaultRoute(t *testing.T) {
+	tr := newFakeTracker(t, 8, 0, 0, "")
+
+	for _, name := range []string{"nil func", "nil addr"} {
+		u := &UDPScrape{PerTracker: 2 * time.Second}
+		if name == "nil addr" {
+			u.LocalAddr = func() (net.Addr, error) { return nil, nil }
+		}
+		t.Run(name, func(t *testing.T) {
+			md, ok := u.Lookup(context.Background(), scrapeTestHash, []string{udpTracker(tr.addr())})
+			if !ok || md.Seeders != 8 {
+				t.Fatalf("md=%+v ok=%v; an unconfigured binding must simply use the OS default", md, ok)
+			}
+		})
+	}
+}
+
+// TestBindingIsResolvedPerDial. An interface name has to be re-resolved so a
+// reconnected tunnel is picked up — and so a tunnel that has GONE starts
+// failing instead of resolving to a stale address that no longer routes.
+func TestBindingIsResolvedPerDial(t *testing.T) {
+	tr := newFakeTracker(t, 4, 0, 0, "")
+	var calls atomic.Int32
+	u := &UDPScrape{
+		PerTracker: 2 * time.Second,
+		LocalAddr: func() (net.Addr, error) {
+			calls.Add(1)
+			return nil, nil
+		},
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, ok := u.Lookup(context.Background(), scrapeTestHash, []string{udpTracker(tr.addr())}); !ok {
+			t.Fatalf("lookup %d failed", i)
+		}
+	}
+	if calls.Load() < 3 {
+		t.Fatalf("binding resolved %d times across 3 lookups; it must be resolved per dial", calls.Load())
 	}
 }
 

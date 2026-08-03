@@ -422,13 +422,8 @@
                                            id="seeder_gate.sources" placeholder="udp_scrape, bitmagnet &mdash; empty = off">
                                     <span class="text-sm opacity-70">Comma-separated, <strong>in priority order</strong> &mdash; the first one that can answer wins, and one that can't falls through to the next. <code>udp_scrape</code> asks the torrent's own trackers for the <strong>live</strong> swarm. <code>bitmagnet</code> reads a local index, which is fast but was measured at a median of <strong>58 hours stale</strong> &mdash; good enough to rescue a release the scrape couldn't reach, never good enough to condemn one, so put it second if you use it. <strong>If nothing can answer, the grab is ALLOWED.</strong> Empty disables the feature.</span>
                                 </div>
-                                <div>
-                                    <label class="label" for="seeder_gate.scrape_bind_addr">
-                                        <span class="font-medium">Scrape bind address</span>
-                                    </label>
-                                    <input type="text" class="input w-full" name="seeder_gate.scrape_bind_addr"
-                                           id="seeder_gate.scrape_bind_addr" placeholder="local address to send from &mdash; empty = default route">
-                                    <span class="text-sm opacity-70"><strong>⚠️ A tracker scrape reveals this host's IP to every tracker it contacts.</strong> Nothing else in decypharr talks to a tracker at all &mdash; the point of a debrid service is that the <em>provider</em> faces the swarm and you never do. Turning on <code>udp_scrape</code> gives that up for one packet per uncached grab. Set this to a VPN interface's local address to send those packets the same way your other indexing tools go. Left empty it uses the container's default route. An address that doesn't resolve makes the scrape <em>fail</em> rather than quietly fall back.</span>
+                                <div class="md:col-span-2">
+                                    <span class="text-sm opacity-70">To send tracker requests over a VPN instead of your normal connection, see <strong>Network binding</strong> below.</span>
                                 </div>
                                 <div>
                                     <label class="label" for="seeder_gate.bitmagnet_url">
@@ -485,6 +480,27 @@
                                     <input type="text" class="input w-full" name="seeder_gate.scrape_timeout"
                                            id="seeder_gate.scrape_timeout" placeholder="1s">
                                     <span class="text-sm opacity-70">Bounds one tracker's connect+scrape exchange. Trackers are queried in parallel, so this isn't multiplied by how many there are.</span>
+                                </div>
+
+                                <div class="md:col-span-2 border-t border-base-300 pt-4 mt-2">
+                                    <h4 class="font-semibold mb-1">Network binding &mdash; which adapter outbound traffic uses</h4>
+                                    <span class="text-sm opacity-70">Choose which network interface decypharr sends from, per kind of traffic. The usual reason: send everything over your normal connection, but send <strong>tracker</strong> requests through a VPN &mdash; your debrid and usenet providers are companies you hold an account with, while a public tracker is run by someone you don't know. Give an <strong>interface name</strong> (like <code>wgProtonCH</code>) rather than an address where you can: a name survives a VPN reconnect, an address may not. Leave both empty for normal behaviour. <strong>If a binding can't be used, that traffic FAILS rather than quietly going out your normal connection</strong> &mdash; a silent fallback would send it exactly where you said not to, and tell you nothing. The resolved choice for each kind is written to the log at startup.<br><br><strong>⚠️ The interface must be visible to the decypharr container itself.</strong> A container on a bridge network only sees its own adapter, so a VPN interface on the host cannot be used from inside it however correct the name is &mdash; that needs a container networking change, not a setting here. If you configure one and it can't be reached, startup logs an error and that traffic stops.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="network_binding.default">
+                                        <span class="font-medium">Default adapter</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="network_binding.default"
+                                           id="network_binding.default" placeholder="empty = normal connection">
+                                    <span class="text-sm opacity-70">Applies to everything without a more specific setting below &mdash; debrid APIs, usenet, *arr calls. Empty means your normal route, which is what happens today.</span>
+                                </div>
+                                <div>
+                                    <label class="label" for="network_binding.tracker">
+                                        <span class="font-medium">Tracker adapter</span>
+                                    </label>
+                                    <input type="text" class="input w-full" name="network_binding.tracker"
+                                           id="network_binding.tracker" placeholder="e.g. wgProtonCH or 10.2.0.2">
+                                    <span class="text-sm opacity-70">Used for BitTorrent tracker requests &mdash; currently the seeder-count lookup above. Worth knowing what one of these actually exposes: a <em>scrape</em> asks "how big is this swarm" and carries no port and no peer id, so a tracker cannot add you to the swarm from it and no other peer ever sees you. Its operator sees your address in their own logs, like any API call. Tunnelling it is a reasonable preference about who you'd rather not hand that to.</span>
                                 </div>
                             </div>
                         </div>

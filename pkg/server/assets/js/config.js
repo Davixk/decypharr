@@ -321,7 +321,13 @@ class ConfigManager {
         };
         setGate('bitmagnet_url', gate.bitmagnet_url);
         setGate('timeout', gate.timeout);
-        setGate('scrape_bind_addr', gate.scrape_bind_addr);
+        const binding = config.network_binding || {};
+        const setBinding = (key, value) => {
+            const el = document.querySelector(`[name="network_binding.${key}"]`);
+            if (el) el.value = value || '';
+        };
+        setBinding('default', binding.default);
+        setBinding('tracker', binding.tracker);
         setGate('scrape_timeout', gate.scrape_timeout);
         setGate('sources', Array.isArray(gate.sources) ? gate.sources.join(', ') : '');
         setGate('trackers', Array.isArray(gate.trackers) ? gate.trackers.join(', ') : '');
@@ -1371,10 +1377,15 @@ class ConfigManager {
             // Comma-separated text fields that reach the backend as arrays. An
             // all-blank field must become [] and not [""], because an empty
             // string would register as a source name the backend cannot match.
+            // Which adapter each class of outbound traffic leaves from. Empty
+            // means the OS default route, i.e. unchanged behaviour.
+            network_binding: {
+                default: document.querySelector('[name="network_binding.default"]')?.value?.trim() || "",
+                tracker: document.querySelector('[name="network_binding.tracker"]')?.value?.trim() || "",
+            },
             seeder_gate: {
                 bitmagnet_url: document.querySelector('[name="seeder_gate.bitmagnet_url"]')?.value?.trim() || "",
                 timeout: document.querySelector('[name="seeder_gate.timeout"]')?.value?.trim() || "",
-                scrape_bind_addr: document.querySelector('[name="seeder_gate.scrape_bind_addr"]')?.value?.trim() || "",
                 scrape_timeout: document.querySelector('[name="seeder_gate.scrape_timeout"]')?.value?.trim() || "",
                 sources: splitList(document.querySelector('[name="seeder_gate.sources"]')?.value),
                 trackers: splitList(document.querySelector('[name="seeder_gate.trackers"]')?.value),

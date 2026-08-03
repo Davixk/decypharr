@@ -461,6 +461,12 @@ type Config struct {
 	// is still blocked on its add. Sharing a threshold does not make them the
 	// same feature, and wiring this into the sweep inverts it.
 	SeederGate            SeederGateConfig         `json:"seeder_gate,omitempty"`
+	// NetworkBinding is COLD (restart-required): the shared HTTP transport is
+	// built once at construction, so a changed binding would apply to new
+	// sockets only and leave existing pooled connections on the old route —
+	// which is precisely the silent-fallback failure this feature exists to
+	// prevent. Deliberately absent from clearHotFields.
+	NetworkBinding        NetworkBindingConfig     `json:"network_binding,omitempty"`
 	SkipPreCache          bool                     `json:"skip_pre_cache,omitempty"`
 	SkipMultiSeason       bool                     `json:"skip_multi_season,omitempty"`
 	AlwaysRmTrackerUrls   bool                     `json:"always_rm_tracker_urls,omitempty"`

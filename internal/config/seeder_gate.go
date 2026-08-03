@@ -57,26 +57,11 @@ type SeederGateConfig struct {
 	// BitmagnetURL is the GraphQL endpoint for the "bitmagnet" source.
 	BitmagnetURL string `json:"bitmagnet_url,omitempty"`
 
-	// ScrapeBindAddr is the LOCAL address the UDP scrape egresses from.
+	// Which interface a scrape egresses from is NetworkBindingConfig's job, on
+	// the "tracker" class — it is one instance of a general per-class binding
+	// rather than a scrape-specific knob, and lives there so the same mechanism
+	// can route other traffic later.
 	//
-	// It must be an address in THIS process's own network namespace. A VPN
-	// sidecar's tunnel address is not one unless the container shares that
-	// namespace — measured on a live deployment, decypharr and its gluetun
-	// sidecar sat in different namespaces, so the tunnel address was simply not
-	// bindable and decypharr egressed on the host's real IP.
-	//
-	// ⚠️ A UDP SCRAPE REVEALS THIS HOST'S IP TO EVERY TRACKER IT CONTACTS.
-	// Nothing else in decypharr talks to a tracker at all — the point of a
-	// debrid service is that the provider faces the swarm and we never do.
-	// Enabling "udp_scrape" gives that up for one packet per uncached grab.
-	//
-	// Set this to a VPN interface's local address to egress the same way other
-	// indexing tools do. It is deliberately not defaulted: no address this code
-	// could pick is right for someone else's network, and quietly using the
-	// container's default route is exactly the leak. An address that does not
-	// resolve makes the scrape fail rather than fall back.
-	ScrapeBindAddr string `json:"scrape_bind_addr,omitempty"`
-
 	// ScrapeTimeout bounds ONE tracker's connect+scrape exchange. Trackers are
 	// queried in parallel, so this is not multiplied by their number. Defaults
 	// to 1s.
@@ -150,7 +135,7 @@ const (
 // dead torrent later — just at the async price this gate exists to avoid.
 func (s SeederGateConfig) IsZero() bool {
 	return s.MinSeeders == nil && len(s.Sources) == 0 && s.Timeout == "" &&
-		s.BitmagnetURL == "" && s.ScrapeBindAddr == "" && s.ScrapeTimeout == "" &&
+		s.BitmagnetURL == "" && s.ScrapeTimeout == "" &&
 		len(s.Trackers) == 0 && s.TrackersPerLookup == 0 &&
 		s.CacheTTL == "" && s.CacheNegativeTTL == ""
 }

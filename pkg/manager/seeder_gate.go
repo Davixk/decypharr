@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/netbind"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/swarm"
 )
@@ -137,14 +139,28 @@ func scrapeFor(cfg config.SeederGateConfig, perLookup int) *swarm.UDPScrape {
 	// Identity of the settings that shape the scraper. When they change (a live
 	// config apply), the instance is rebuilt — and losing backoff state at that
 	// point is correct, because the pool itself may have changed.
-	key := strings.Join(cfg.Trackers, ",") + "|" + cfg.ScrapeBindAddr + "|" + cfg.ScrapeTimeout + "|" +
-		strconv.Itoa(perLookup)
+	binding := config.Get().NetworkBinding
+	key := strings.Join(cfg.Trackers, ",") + "|" + binding.Tracker + "|" + binding.Default + "|" +
+		cfg.ScrapeTimeout + "|" + strconv.Itoa(perLookup)
 
 	scrapeMu.Lock()
 	defer scrapeMu.Unlock()
 	if sharedScrape == nil || scrapeSettings != key {
+		binder := netbind.New(classSpecs(binding.Bindings()))
 		sharedScrape = &swarm.UDPScrape{
-			BindAddr:   cfg.ScrapeBindAddr,
+			// Resolved per dial through the tracker class, so a reconnected
+			// tunnel is picked up and a vanished one fails the scrape rather
+			// than quietly leaving on the ordinary route.
+			LocalAddr: func() (net.Addr, error) {
+				addr, err := binder.UDPAddr(netbind.ClassTracker)
+				if err != nil {
+					return nil, err
+				}
+				if addr == nil {
+					return nil, nil
+				}
+				return addr, nil
+			},
 			PerTracker: parseDurationOr(cfg.ScrapeTimeout, config.DefaultSeederGateScrapeTimeout),
 			Trackers:   cfg.Trackers,
 			PerLookup:  perLookup,
@@ -152,6 +168,15 @@ func scrapeFor(cfg config.SeederGateConfig, perLookup int) *swarm.UDPScrape {
 		scrapeSettings = key
 	}
 	return sharedScrape
+}
+
+// classSpecs adapts config's string-keyed bindings to netbind's Class keys.
+func classSpecs(raw map[string]string) map[netbind.Class]string {
+	out := make(map[netbind.Class]string, len(raw))
+	for name, spec := range raw {
+		out[netbind.Class(name)] = spec
+	}
+	return out
 }
 
 func parseDurationOr(raw, fallback string) time.Duration {

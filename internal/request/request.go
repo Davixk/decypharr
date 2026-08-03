@@ -15,7 +15,9 @@ import (
 
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/rs/zerolog"
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/logger"
+	"github.com/sirrobot01/decypharr/internal/netbind"
 	"go.uber.org/ratelimit"
 	"golang.org/x/net/proxy"
 )
@@ -204,6 +206,17 @@ func retryAfterBackoff(min, max time.Duration, attemptNum int, resp *http.Respon
 	return retryablehttp.DefaultBackoff(min, max, attemptNum, resp)
 }
 
+// classSpecs adapts the config's string-keyed bindings to netbind's Class keys.
+// The indirection keeps netbind free of a config dependency, so it stays
+// testable without a loaded configuration.
+func classSpecs(raw map[string]string) map[netbind.Class]string {
+	out := make(map[netbind.Class]string, len(raw))
+	for name, spec := range raw {
+		out[netbind.Class(name)] = spec
+	}
+	return out
+}
+
 // New creates a new HTTP client with the specified options
 func New(options ...ClientOption) *Client {
 	client := &Client{
@@ -236,14 +249,17 @@ func New(options ...ClientOption) *Client {
 
 	// Check if transport was set by WithTransport option
 	if client.httpClient.Transport == nil {
+		// Every HTTP client in decypharr is built here, so binding the dialer
+		// at this one point covers all of them. The class is `default`; a
+		// dial resolves the binding fresh each time, so a reconnected tunnel is
+		// picked up and a vanished one FAILS the dial rather than silently
+		// leaving on the ordinary route.
+		binder := netbind.New(classSpecs(config.Get().NetworkBinding.Bindings()))
 		transport := &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: client.skipTLSVerify,
 			},
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 15 * time.Second,
-			}).DialContext,
+			DialContext: binder.DialContext(netbind.ClassDefault, 30*time.Second, 15*time.Second),
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       30 * time.Second,
