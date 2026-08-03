@@ -57,8 +57,13 @@ type SeederGateConfig struct {
 	// BitmagnetURL is the GraphQL endpoint for the "bitmagnet" source.
 	BitmagnetURL string `json:"bitmagnet_url,omitempty"`
 
-	// ScrapeBindAddr is the LOCAL address the UDP scrape egresses from, e.g.
-	// "10.2.0.2:0".
+	// ScrapeBindAddr is the LOCAL address the UDP scrape egresses from.
+	//
+	// It must be an address in THIS process's own network namespace. A VPN
+	// sidecar's tunnel address is not one unless the container shares that
+	// namespace — measured on a live deployment, decypharr and its gluetun
+	// sidecar sat in different namespaces, so the tunnel address was simply not
+	// bindable and decypharr egressed on the host's real IP.
 	//
 	// ⚠️ A UDP SCRAPE REVEALS THIS HOST'S IP TO EVERY TRACKER IT CONTACTS.
 	// Nothing else in decypharr talks to a tracker at all — the point of a

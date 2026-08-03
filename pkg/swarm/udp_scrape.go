@@ -49,8 +49,10 @@ const (
 
 // UDPScrape reads swarm counts from a pool of UDP trackers.
 type UDPScrape struct {
-	// BindAddr is the local address to egress from, e.g. "10.2.0.2:0". Empty
-	// uses the default route — see the IP-exposure note above.
+	// BindAddr is the local address to egress from. Empty uses the default
+	// route — see the IP-exposure note above. It must belong to THIS process's
+	// network namespace: a VPN sidecar's tunnel address is not bindable from a
+	// container that does not share its namespace.
 	BindAddr string
 	// PerTracker bounds one tracker's full connect+scrape exchange.
 	PerTracker time.Duration

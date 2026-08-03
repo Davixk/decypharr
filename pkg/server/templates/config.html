@@ -427,7 +427,7 @@
                                         <span class="font-medium">Scrape bind address</span>
                                     </label>
                                     <input type="text" class="input w-full" name="seeder_gate.scrape_bind_addr"
-                                           id="seeder_gate.scrape_bind_addr" placeholder="e.g. 10.2.0.2:0 &mdash; empty = default route">
+                                           id="seeder_gate.scrape_bind_addr" placeholder="local address to send from &mdash; empty = default route">
                                     <span class="text-sm opacity-70"><strong>⚠️ A tracker scrape reveals this host's IP to every tracker it contacts.</strong> Nothing else in decypharr talks to a tracker at all &mdash; the point of a debrid service is that the <em>provider</em> faces the swarm and you never do. Turning on <code>udp_scrape</code> gives that up for one packet per uncached grab. Set this to a VPN interface's local address to send those packets the same way your other indexing tools go. Left empty it uses the container's default route. An address that doesn't resolve makes the scrape <em>fail</em> rather than quietly fall back.</span>
                                 </div>
                                 <div>
