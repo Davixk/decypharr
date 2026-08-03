@@ -101,6 +101,22 @@ func (c *providerFillCache) fill(name string, client debrid.Client, now time.Tim
 	return count, known
 }
 
+// observe records a count someone else already paid for.
+//
+// The torrent refresh enumerates the same account this cache would, so its
+// result is published here rather than re-fetched. Only a genuine enumeration
+// may call this: a partial or filtered listing would install a count that is
+// too low, and "the account has room" is the one wrong answer that costs a
+// permanent refusal to add.
+func (c *providerFillCache) observe(name string, count int, now time.Time) {
+	if c == nil || name == "" || count < 0 {
+		return
+	}
+	c.mu.Lock()
+	c.byProvider[name] = providerFillSnapshot{count: count, known: true, takenAt: now}
+	c.mu.Unlock()
+}
+
 // invalidate drops a provider's snapshot so the next read re-enumerates. Used
 // after we delete items on that provider, where waiting out the TTL would keep
 // reporting a cap that is no longer full.

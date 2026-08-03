@@ -426,7 +426,9 @@ func TestProviderRemovalSkipsDeleteReaddReplacement(t *testing.T) {
 	m := newProviderLifecycleManager(t)
 	hash := strings.Repeat("2", 40)
 	persistLifecycleEntry(t, m, lifecycleEntry(hash, "provider", "same-id"))
-	_, removals, err := m.detectTorrentChanges("provider", map[string]*debridTypes.Torrent{}, map[string]*debridTypes.Torrent{})
+	// Zero-value presence: the provider holds nothing at all, which is the only
+	// condition under which a placement may be removed.
+	_, removals, err := m.detectTorrentChanges("provider", map[string]*debridTypes.Torrent{}, map[string]*debridTypes.Torrent{}, providerPresence{})
 	if err != nil || len(removals) != 1 {
 		t.Fatalf("detect removals=(%d, %v)", len(removals), err)
 	}
@@ -607,6 +609,7 @@ func TestProviderRefreshMatchesSyntheticAliasByPlacementID(t *testing.T) {
 		"provider",
 		map[string]*debridTypes.Torrent{remoteHash: remote},
 		map[string]*debridTypes.Torrent{"new-remote-id": remote},
+		presenceOf(remote),
 	)
 	if err != nil || len(removals) != 0 || len(refreshes) != 1 || refreshes[0].snapshot == nil || refreshes[0].snapshot.InfoHash != aliasHash {
 		t.Fatalf("alias detection refreshes=%+v removals=%+v err=%v", refreshes, removals, err)

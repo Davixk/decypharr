@@ -75,13 +75,58 @@ func (m *Manager) refreshTorrents(ctx context.Context, provider string, debridCl
 	return err
 }
 
-// doRefreshTorrents performs the actual refresh logic
+// providerPresence records every hash and ID a provider holds in ANY state.
+//
+// It exists to answer one question honestly: "is this item still on the
+// provider at all?" That is a different question from "is this item usable",
+// and conflating the two is what made the removal path wrong. See
+// detectTorrentChanges.
+type providerPresence struct {
+	hashes map[string]struct{}
+	ids    map[string]struct{}
+}
+
+func (p providerPresence) holds(hash, id string) bool {
+	if id != "" {
+		if _, ok := p.ids[id]; ok {
+			return true
+		}
+	}
+	if hash == "" {
+		return false
+	}
+	_, ok := p.hashes[strings.ToLower(hash)]
+	return ok
+}
+
+// doRefreshTorrents performs the actual refresh logic.
+//
+// ONE ENUMERATION, TWO VIEWS. This used to call GetTorrents (downloaded only)
+// while the fill cache, ENUMERATE and restore reconciliation each called
+// GetAllTorrents — the same account, listed twice on unrelated schedules, one a
+// strict superset of the other. It now lists once and derives both views:
+//
+//	LIBRARY view   downloaded rows only. Feeds refreshes/creates, so what
+//	               becomes a library entry is unchanged: an in-progress torrent
+//	               has no files yet and must not be projected into the mount.
+//	PRESENCE view  every row in any state. Feeds the removal guard ONLY.
+//
+// The split matters beyond saving a request. Removal candidates were selected
+// from the downloaded-only listing, so an entry whose provider copy was merely
+// mid-download read as "gone from the provider" and had its placement removed —
+// and, when that was its only placement, the entry deleted outright. A status
+// filter must never be able to mean deletion; absence now means absent.
 func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridClient debrid.Client) error {
-	remote, err := debridClient.GetTorrents()
+	startedAt := time.Now()
+	remote, err := debridClient.GetAllTorrents()
 	if err != nil {
 		m.logger.Error().Err(err).Str("debrid", provider).Msg("Failed to get remote")
 		return err
 	}
+
+	// The account was just counted, so the fill snapshot is free here. It is
+	// the same quantity the cache would otherwise enumerate for itself.
+	m.fillCache.observe(provider, len(remote), time.Now())
 
 	if len(remote) == 0 {
 		m.logger.Debug().Str("debrid", provider).Msg("No remote found")
@@ -90,6 +135,11 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 	// Build map of current remote by infohash
 	remoteTorrentsByHash := make(map[string]*types.Torrent, len(remote))
 	remoteTorrentsByID := make(map[string]*types.Torrent, len(remote))
+	presence := providerPresence{
+		hashes: make(map[string]struct{}, len(remote)),
+		ids:    make(map[string]struct{}, len(remote)),
+	}
+	downloaded := 0
 	for _, t := range remote {
 		if t == nil || t.InfoHash == "" {
 			continue
@@ -97,10 +147,25 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 		if t.Debrid == "" {
 			t.Debrid = provider
 		}
+		remoteHash := strings.ToLower(t.InfoHash)
+
+		// PRESENCE first, and unconditionally: a row in any state, including a
+		// terminally dead one, is still an item the provider holds. Dropping our
+		// record of it would not remove it from the account; culling a dead copy
+		// is ENUMERATE's job, which deletes on the provider rather than only
+		// forgetting locally.
+		presence.hashes[remoteHash] = struct{}{}
+		if t.Id != "" {
+			presence.ids[t.Id] = struct{}{}
+		}
+
+		if t.Status != types.TorrentStatusDownloaded {
+			continue
+		}
+		downloaded++
 		if t.Id != "" {
 			remoteTorrentsByID[t.Id] = t
 		}
-		remoteHash := strings.ToLower(t.InfoHash)
 		old, exists := remoteTorrentsByHash[remoteHash]
 		if !exists {
 			remoteTorrentsByHash[remoteHash] = t
@@ -111,7 +176,7 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 	}
 
 	// Detect changes by streaming through cached entries
-	refreshes, removals, err := m.detectTorrentChanges(provider, remoteTorrentsByHash, remoteTorrentsByID)
+	refreshes, removals, err := m.detectTorrentChanges(provider, remoteTorrentsByHash, remoteTorrentsByID, presence)
 	if err != nil {
 		return err
 	}
@@ -126,6 +191,20 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 		}
 	}
 
+	// A successful refresh used to log NOTHING, which made "the job never ran"
+	// and "the job ran and had nothing to do" indistinguishable from the
+	// outside. An operator reading 19,587 log lines over 2h47m of uptime found
+	// zero matches for it and reasonably concluded it was not scheduled. State
+	// what happened, at a level that is actually on.
+	m.logger.Info().
+		Str("debrid", provider).
+		Int("remote", len(remote)).
+		Int("downloaded", downloaded).
+		Int("refreshed", len(refreshes)).
+		Int("removed", len(removals)).
+		Dur("took", time.Since(startedAt)).
+		Msg("Torrent refresh completed")
+
 	return errors.Join(removalErr, refreshErr)
 }
 
@@ -134,6 +213,7 @@ func (m *Manager) detectTorrentChanges(
 	provider string,
 	remoteTorrentsByHash map[string]*types.Torrent,
 	remoteTorrentsByID map[string]*types.Torrent,
+	presence providerPresence,
 ) (
 	refreshes []providerRefreshCandidate,
 	removals []providerRemovalCandidate,
@@ -172,6 +252,17 @@ func (m *Manager) detectTorrentChanges(
 
 			if placementOnDebrid && oldPlacement != nil {
 				if !onRemote {
+					// Not in the LIBRARY view. Before concluding the provider
+					// dropped it, ask whether the provider holds it at all: an
+					// item that is merely mid-download, queued, or dead is
+					// absent from the downloaded-only view while very much
+					// still on the account. Removing its placement here would
+					// delete our only record of something we are still paying a
+					// slot for — and, when this is the last placement, delete
+					// the entry itself.
+					if presence.holds(entryHash, oldPlacement.ID) {
+						continue
+					}
 					removals = append(removals, providerRemovalCandidate{
 						snapshot:    entry,
 						provider:    provider,
