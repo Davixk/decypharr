@@ -169,13 +169,36 @@ func TestWorkerSlotFreesOnceActionClaimed(t *testing.T) {
 	}
 }
 
-// TestDownloadCompletionParkCap pins the defensive worker-park bound: the
-// longest legitimate pipeline (mount wait + usenet processing) plus slack.
+// TestDownloadCompletionParkCap pins the defensive worker-park bound, which is
+// SIZED PER PROTOCOL.
+//
+// A torrent never touches the usenet processing path, so including
+// m.usenetTimeout in its budget padded the cap with an unrelated subsystem's
+// worst case. On a live deployment that made it 45 minutes, and each torrent
+// that reached it was abandoned mid-download while the provider carried on.
 func TestDownloadCompletionParkCap(t *testing.T) {
 	m := &Manager{usenetTimeout: 10 * time.Minute}
-	want := symlinkMountWaitTimeout + 10*time.Minute + downloadCompletionSlack
-	if got := m.downloadCompletionParkCap(); got != want {
-		t.Fatalf("downloadCompletionParkCap = %s, want %s", got, want)
+
+	nzb := &storage.Entry{Protocol: config.ProtocolNZB}
+	wantNZB := symlinkMountWaitTimeout + 10*time.Minute + downloadCompletionSlack
+	if got := m.downloadCompletionParkCap(nzb); got != wantNZB {
+		t.Fatalf("NZB park cap = %s, want %s", got, wantNZB)
+	}
+
+	torrent := &storage.Entry{Protocol: config.ProtocolTorrent}
+	wantTorrent := symlinkMountWaitTimeout + downloadCompletionSlack
+	if got := m.downloadCompletionParkCap(torrent); got != wantTorrent {
+		t.Fatalf("torrent park cap = %s, want %s — the usenet timeout must not pad a torrent's budget",
+			got, wantTorrent)
+	}
+	if wantTorrent >= wantNZB {
+		t.Fatal("a torrent's cap must be strictly shorter, or the split buys nothing")
+	}
+
+	// A nil entry must not panic, and takes the conservative shorter budget
+	// rather than a usenet allowance it cannot justify.
+	if got := m.downloadCompletionParkCap(nil); got != wantTorrent {
+		t.Fatalf("nil-entry park cap = %s, want %s", got, wantTorrent)
 	}
 }
 

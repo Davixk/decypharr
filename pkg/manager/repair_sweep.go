@@ -1634,7 +1634,14 @@ func (r *Repair) pruneDeadEntry(name string, h *storage.EntryHealth) bool {
 			continue
 		}
 		deleted = true
-		r.logger.Info().Str("component", "PRUNE").Str("entry", name).Str("infohash", hash).Msg("PRUNE: deleted dead entry decypharr-side (no arr call; any arr symlink is left dangling and the arr will NOT self-heal it)")
+		// The wording used to assert the arr "will NOT self-heal" the dangling
+		// symlink. That is not a property of decypharr and is no longer true
+		// everywhere: an arr configured to reap dangling symlinks detects the
+		// break, removes it, and nulls the file record on its next scan. Stating
+		// it as a certainty had operators planning around a hazard they had
+		// already fixed, so this now describes only what PRUNE itself does and
+		// leaves the consequence to the arr's own configuration.
+		r.logger.Info().Str("component", "PRUNE").Str("entry", name).Str("infohash", hash).Msg("PRUNE: deleted dead entry decypharr-side (no arr call is made, so any arr symlink is left dangling; whether it is reaped depends on the arr's own dangling-symlink handling)")
 	}
 	if !deleted {
 		return false

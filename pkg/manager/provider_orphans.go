@@ -7,7 +7,7 @@ import (
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/debrid/types"
+	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
@@ -49,6 +49,9 @@ type providerOrphan struct {
 	Name     string    `json:"name,omitempty"`
 	Status   string    `json:"status,omitempty"`
 	Added    time.Time `json:"added,omitempty"`
+	// Active reports whether the provider still has this in flight, i.e.
+	// whether it is holding a download slot rather than just storage.
+	Active bool `json:"active"`
 }
 
 // providerOrphanGrace exempts recently-created provider items. An add that
@@ -76,8 +79,19 @@ type ProviderOrphaned struct {
 	// Held is how many items the provider reports in total.
 	Held int `json:"held"`
 	// Unclaimed is how many of those no local record accounts for.
-	Unclaimed int              `json:"unclaimed"`
-	Sample    []providerOrphan `json:"sample,omitempty"`
+	Unclaimed int `json:"unclaimed"`
+	// UnclaimedActive is the subset still IN FLIGHT at the provider, and it is
+	// the number that actually costs something.
+	//
+	// The distinction is not cosmetic. An unclaimed COMPLETED item consumes
+	// storage and, on AllDebrid, a slot against the stored-item cap — annoying,
+	// bounded, reclaimable at leisure. An unclaimed ACTIVE item holds a
+	// concurrent DOWNLOAD slot, which is the scarce resource that stops new
+	// grabs from starting. Reporting only the total invites reasoning about a
+	// capacity problem using a number mostly made of things that are not
+	// occupying capacity.
+	UnclaimedActive int              `json:"unclaimed_active"`
+	Sample          []providerOrphan `json:"sample,omitempty"`
 }
 
 type providerOrphanTracker struct {
@@ -94,16 +108,37 @@ func (t *providerOrphanTracker) record(provider string, held int, orphans []prov
 	if t == nil {
 		return
 	}
-	sample := orphans
+	active := 0
+	for _, orphan := range orphans {
+		if orphan.Active {
+			active++
+		}
+	}
+	// ACTIVE ONES FIRST in the sample. The cap means a sample can be entirely
+	// completed items while the handful holding download slots — the ones worth
+	// looking at — never appear.
+	sorted := make([]providerOrphan, 0, len(orphans))
+	for _, orphan := range orphans {
+		if orphan.Active {
+			sorted = append(sorted, orphan)
+		}
+	}
+	for _, orphan := range orphans {
+		if !orphan.Active {
+			sorted = append(sorted, orphan)
+		}
+	}
+	sample := sorted
 	if len(sample) > providerOrphanSample {
 		sample = sample[:providerOrphanSample]
 	}
 	t.mu.Lock()
 	t.checkedAt = now
 	t.byProvider[provider] = ProviderOrphaned{
-		Held:      held,
-		Unclaimed: len(orphans),
-		Sample:    sample,
+		Held:            held,
+		Unclaimed:       len(orphans),
+		UnclaimedActive: active,
+		Sample:          sample,
 	}
 	t.mu.Unlock()
 }
@@ -201,7 +236,7 @@ func (m *Manager) collectLocalClaims() (localClaims, error) {
 // Returns orphans ONLY. A failure to build the local view returns an error and
 // no orphans, because a partial claim set would manufacture them wholesale —
 // exactly the direction that must never be guessed.
-func (m *Manager) findProviderOrphans(provider string, remote []*types.Torrent, now time.Time) ([]providerOrphan, error) {
+func (m *Manager) findProviderOrphans(provider string, remote []*debridTypes.Torrent, now time.Time) ([]providerOrphan, error) {
 	claims, err := m.collectLocalClaims()
 	if err != nil {
 		return nil, err
@@ -228,13 +263,16 @@ func (m *Manager) findProviderOrphans(provider string, remote []*types.Torrent, 
 			Name:     t.Name,
 			Status:   t.ProviderStatus,
 			Added:    t.Added,
+			// In flight ⇒ holding a download slot. Anything the provider calls
+			// downloaded is occupying storage only.
+			Active: t.Status != debridTypes.TorrentStatusDownloaded,
 		})
 	}
 	return orphans, nil
 }
 
 // reportProviderOrphans records the diff and says so if there is anything to say.
-func (m *Manager) reportProviderOrphans(provider string, remote []*types.Torrent) {
+func (m *Manager) reportProviderOrphans(provider string, remote []*debridTypes.Torrent) {
 	now := time.Now()
 	orphans, err := m.findProviderOrphans(provider, remote, now)
 	if err != nil {
@@ -254,12 +292,20 @@ func (m *Manager) reportProviderOrphans(provider string, remote []*types.Torrent
 	for _, o := range orphans[:min(10, len(orphans))] {
 		ids = append(ids, o.ID)
 	}
+	active := 0
+	for _, o := range orphans {
+		if o.Active {
+			active++
+		}
+	}
 	m.logger.Warn().
 		Str("debrid", provider).
 		Int("unclaimed", len(orphans)).
+		Int("unclaimed_active", active).
 		Int("held", len(remote)).
 		Strs("sample_ids", ids).
-		Msg("Provider holds items no local record accounts for. Each one occupies a slot that nothing here " +
-			"can release, because every release path starts from a local entry. Nothing has been deleted: " +
+		Msg("Provider holds items no local record accounts for. unclaimed_active is the number that costs " +
+			"capacity — those hold DOWNLOAD slots nothing here can release, because every release path " +
+			"starts from a local entry. The remainder occupy storage only. Nothing has been deleted: " +
 			"review them on the provider, or via /api/queue/consistency.")
 }

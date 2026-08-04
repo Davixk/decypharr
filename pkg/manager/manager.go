@@ -581,11 +581,26 @@ func (m *Manager) resumeClaimedAction(entry *storage.Entry) {
 const downloadCompletionSlack = 5 * time.Minute
 
 // downloadCompletionParkCap bounds how long a single worker may stay parked on
-// one entry. It covers the longest legitimate pipeline (the mount wait plus
-// the usenet processing timeout) with slack; anything beyond that means the
-// entry's lifecycle has wedged and the slot is worth more than the wait.
-func (m *Manager) downloadCompletionParkCap() time.Duration {
-	return symlinkMountWaitTimeout + m.usenetTimeout + downloadCompletionSlack
+// one entry. It covers the longest legitimate pipeline with slack; beyond that
+// the entry's lifecycle has wedged and the worker slot is worth more than the
+// wait.
+//
+// SIZED PER PROTOCOL, because the pipelines are not the same shape.
+//
+// A TORRENT never touches the usenet processing path, so including
+// m.usenetTimeout in its budget padded the cap with an unrelated subsystem's
+// worst case — on a live deployment that made it 45 minutes, and every torrent
+// that hit it was abandoned mid-download while the provider carried on. The
+// mount wait plus slack is the whole of a torrent's post-download pipeline.
+//
+// The cap firing is ALWAYS a defect being papered over. It exists so one wedged
+// entry cannot pin a worker forever, not as a normal timeout, which is why it
+// logs at ERROR — see waitForDownloadCompletion.
+func (m *Manager) downloadCompletionParkCap(entry *storage.Entry) time.Duration {
+	if entry != nil && entry.IsNZB() {
+		return symlinkMountWaitTimeout + m.usenetTimeout + downloadCompletionSlack
+	}
+	return symlinkMountWaitTimeout + downloadCompletionSlack
 }
 
 // waitForDownloadCompletion parks a worker slot only while the entry still
@@ -608,7 +623,7 @@ func (m *Manager) waitForDownloadCompletion(ctx context.Context, entry *storage.
 	// restore paths can retain the original pointer; refreshing a shared
 	// pointer from this loop would race with their own snapshot refreshes.
 	snapshot := *entry
-	maxPark := m.downloadCompletionParkCap()
+	maxPark := m.downloadCompletionParkCap(entry)
 	capTimer := time.NewTimer(maxPark)
 	defer capTimer.Stop()
 	ticker := time.NewTicker(time.Second)
