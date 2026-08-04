@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 
@@ -1081,6 +1082,68 @@ func (s *Storage) TakeQueued(infohash string) (*Entry, bool, error) {
 	return s.takeQueuedIfPresent(infohash, nil, nil)
 }
 
+// logQueueRemoval names the caller that removed a queue row.
+//
+// WHY THIS EXISTS. Queue rows are removed through roughly a dozen call sites
+// and not one of them logged on success. An investigation traced 130 in-flight
+// downloads and found 95 that vanished — the store answering `key not found`
+// for their infohash — while the provider went on downloading them for days.
+// Four separate root-cause theories were proposed and eliminated, three of them
+// by measurement, and the reason it took that many is that a deletion left no
+// evidence of itself. The row was gone and nothing said who took it.
+//
+// Both queue-store delete chokepoints funnel through here, so the caller is
+// recovered from the stack rather than threaded through every signature. That
+// keeps it honest — a new deletion path cannot forget to identify itself.
+//
+// The cost is bounded: this fires only on an actual removal, and it carries the
+// entry's state at the moment it died, which is the thing that turns "it
+// vanished" into "it vanished FROM downloading, via this function".
+func (s *Storage) logQueueRemoval(entry *Entry, op string) {
+	if entry == nil {
+		return
+	}
+	event := s.logger.Info().
+		Str("infohash", strings.ToLower(entry.InfoHash)).
+		Str("op", op).
+		Str("state", string(entry.State)).
+		Str("status", string(entry.Status)).
+		Str("caller", queueRemovalCaller())
+	if entry.ActiveProvider != "" {
+		event = event.Str("provider", entry.ActiveProvider)
+		if placement := entry.GetActiveProvider(); placement != nil && placement.ID != "" {
+			// The provider ID is what makes an orphan identifiable from the
+			// provider's side afterwards. Without it, a removed row and a
+			// stranded transfer cannot be tied together at all.
+			event = event.Str("placement_id", placement.ID)
+		}
+	}
+	event.Msg("Queue row removed")
+}
+
+// queueRemovalCaller walks past this package's own frames to name the code that
+// actually asked for the removal.
+func queueRemovalCaller() string {
+	pcs := make([]uintptr, 12)
+	n := runtime.Callers(3, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		frame, more := frames.Next()
+		if frame.Function == "" {
+			break
+		}
+		// Skip the storage layer itself — every removal passes through it, so
+		// naming it would identify nothing.
+		if !strings.Contains(frame.Function, "/pkg/storage.") {
+			return fmt.Sprintf("%s:%d", frame.Function, frame.Line)
+		}
+		if !more {
+			break
+		}
+	}
+	return "unknown"
+}
+
 // TakeQueuedSnapshotWhere atomically takes only the matching generation and
 // predicate result. This is the scan-to-delete commit point.
 func (s *Storage) TakeQueuedSnapshotWhere(snapshot *Entry, predicate func(*Entry) bool) (*Entry, bool, error) {
@@ -1114,6 +1177,7 @@ func (s *Storage) takeQueuedIfPresent(infohash string, expectedGeneration *strin
 	if err := s.queue.Delete(key); err != nil {
 		return nil, false, err
 	}
+	s.logQueueRemoval(entry, "take")
 	return entry, true, nil
 }
 
@@ -1142,6 +1206,7 @@ func (s *Storage) deleteQueuedIfPresent(
 	if err := s.queue.Delete(key); err != nil {
 		return false, err
 	}
+	s.logQueueRemoval(entry, "delete")
 	// Keep the per-key lifecycle lock through cleanup. A same-hash AddQueue
 	// cannot start a new generation while old-generation files/providers are
 	// still being removed.

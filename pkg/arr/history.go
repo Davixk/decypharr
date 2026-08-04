@@ -374,17 +374,36 @@ func (a *Arr) CleanupQueue() error {
 		}
 	}
 
+	// LOGGED ON SUCCESS, not only on failure.
+	//
+	// removeFromClient=true makes the *arr turn around and call decypharr's own
+	// qBittorrent delete endpoint. So this is decypharr instructing the removal
+	// of its own entries, on a 10-second cadence, and until now it said nothing
+	// whenever it worked. An investigation into 62 in-flight downloads that
+	// vanished leaving no log line could neither confirm nor eliminate this path
+	// for exactly that reason: both halves of the round trip were silent on
+	// success.
+	//
+	// A component that tells another system to delete our data has to say so.
 	for removeFromClient, items := range blacklistResearch {
 		if err := a.removeQueueItems(items, removeFromClient, true, false); err != nil {
 			a.retryCleanupDecisions(items)
 			l.Error().Err(err).Str("arr", a.Name).Msg("queue cleanup: blacklist + research failed")
+			continue
 		}
+		l.Info().Str("arr", a.Name).Int("items", len(items)).Bool("remove_from_client", removeFromClient).
+			Msg("queue cleanup: blocklisted and re-searched. remove_from_client=true makes the arr call our " +
+				"own delete endpoint back, which removes the queue entry here")
 	}
 	for removeFromClient, items := range blacklists {
 		if err := a.removeQueueItems(items, removeFromClient, true, true); err != nil {
 			a.retryCleanupDecisions(items)
 			l.Error().Err(err).Str("arr", a.Name).Msg("queue cleanup: blacklist failed")
+			continue
 		}
+		l.Info().Str("arr", a.Name).Int("items", len(items)).Bool("remove_from_client", removeFromClient).
+			Msg("queue cleanup: blocklisted. remove_from_client=true makes the arr call our own delete " +
+				"endpoint back, which removes the queue entry here")
 	}
 	if len(manualImports) > 0 {
 		go func() {

@@ -235,13 +235,36 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, hash := range hashes {
-		// An entry that is already absent is a satisfied delete, not a failure.
-		// This previously matched on the message text containing "not found",
-		// which happened to work only because both the storage and store-level
-		// sentinels are worded that way — rewording either would silently turn
-		// a tolerated absence back into a 500. Match the sentinel instead.
+		// LOGGED ON SUCCESS, not just on failure.
+		//
+		// This endpoint used to be completely silent when it worked, and so is
+		// the arr-side queue cleanup that drives most of its traffic. That made
+		// an entire class of disappearance unattributable: an investigation
+		// traced 130 in-flight downloads and found 62 that simply stopped
+		// having log lines, while the provider went on downloading them. They
+		// may well have been deleted right here — there was no way to tell.
+		//
+		// A removal that leaves no trace cannot be reasoned about afterwards,
+		// and three separate root-cause theories died for want of exactly this
+		// line. It records who was removed and whether the provider copy went
+		// with them.
 		err := q.manager.Queue().Delete(hash, cleanup)
-		if err != nil && !errors.Is(err, storage.ErrEntryNotFound) {
+		switch {
+		case err == nil:
+			q.logger.Info().
+				Str("infohash", hash).
+				Bool("delete_files", deleteFiles).
+				Msg("Queue entry deleted via the qBittorrent API. delete_files=false keeps the provider copy, " +
+					"which continues to occupy a slot")
+		case errors.Is(err, storage.ErrEntryNotFound):
+			// An entry that is already absent is a satisfied delete, not a
+			// failure. This previously matched on the message text containing
+			// "not found", which happened to work only because both the storage
+			// and store-level sentinels are worded that way — rewording either
+			// would silently turn a tolerated absence back into a 500. Match the
+			// sentinel instead.
+			q.logger.Debug().Str("infohash", hash).Msg("Delete requested for an entry that is already absent")
+		default:
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
