@@ -180,13 +180,67 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No hashes provided", http.StatusBadRequest)
 		return
 	}
+	// deleteFiles is qBittorrent's "also remove the downloaded data", and the
+	// *arrs already send it when they abandon a download.
+	//
+	// IGNORING IT WAS THE PROVIDER-SLOT LEAK. This endpoint passed a nil cleanup
+	// unconditionally, so the queue row went and the provider transfer kept
+	// running — forever, holding a slot nothing could reclaim, because every
+	// release path in decypharr starts from a local entry that no longer
+	// existed. Measured on a live account: 94 of 96 active RealDebrid transfers
+	// had no local record, 93 still downloading, 67 between 50% and 99%
+	// complete. The *arrs' own stalled-download handling is the likely trigger,
+	// which means the cleanup was causing the congestion.
+	//
+	// For a debrid client the provider copy IS the downloaded data, so honouring
+	// the flag means releasing the placement. That is not a guess about what the
+	// operator wants — it is doing what the caller explicitly asked for.
+	_ = r.ParseForm()
+	deleteFiles := strings.EqualFold(strings.TrimSpace(r.FormValue("deleteFiles")), "true")
+
+	var cleanup func(*storage.Entry) error
+	if deleteFiles {
+		cleanup = func(entry *storage.Entry) error {
+			// The PLACEMENT only. The main-store row, if one exists, is the
+			// library record and is not this endpoint's to remove: the caller
+			// asked to drop a queue item, and conflating the two would delete
+			// library content during a routine *arr queue removal.
+			if err := q.manager.RemoveTorrentPlacements(entry); err != nil {
+				// REPORTED, BUT NOT FATAL TO THE DELETE — and this is a
+				// judgement, so here is the reasoning.
+				//
+				// Failing the request leaves the queue row AND the placement,
+				// and the *arr retries the same call forever against the same
+				// broken condition. Nothing improves and the row becomes
+				// undeletable. Completing the delete leaks the placement, which
+				// is what this whole fix exists to stop.
+				//
+				// What breaks the tie is that a leaked placement is now
+				// RECOVERABLE: the provider-sourced stall prune finds abandoned
+				// transfers from the provider's own active list and needs no
+				// local record to act. So the worst case degrades to "an orphan
+				// the other sweep reaps", not "an orphan nothing can ever see"
+				// — which was the old behaviour, silently, on every delete.
+				q.logger.Error().Err(err).
+					Str("infohash", entry.InfoHash).
+					Str("provider", entry.ActiveProvider).
+					Msg("Could not release the provider placement for a deleted queue entry. The queue row is " +
+						"removed as requested; the provider copy may still be holding a slot. The " +
+						"provider-sourced stall prune reaps transfers like this from the provider's own " +
+						"list, so it is recoverable — but repeated occurrences point at a provider or " +
+						"credential problem worth fixing.")
+			}
+			return nil
+		}
+	}
+
 	for _, hash := range hashes {
 		// An entry that is already absent is a satisfied delete, not a failure.
 		// This previously matched on the message text containing "not found",
 		// which happened to work only because both the storage and store-level
 		// sentinels are worded that way — rewording either would silently turn
 		// a tolerated absence back into a 500. Match the sentinel instead.
-		err := q.manager.Queue().Delete(hash, nil)
+		err := q.manager.Queue().Delete(hash, cleanup)
 		if err != nil && !errors.Is(err, storage.ErrEntryNotFound) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

@@ -210,6 +210,32 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		}
 	}
 
+	// Provider-sourced stall prune. The local sweep above asks "which of MY
+	// entries look stalled" and is therefore blind to anything that fell out of
+	// local state — which is exactly the population that needs pruning.
+	// Measured: decypharr could see 4 downloading entries while RealDebrid ran
+	// 108 transfers, 68 dead or crawling. This one asks the PROVIDER what it is
+	// working on, because the slots are the provider's.
+	//
+	// Both run. They share thresholds and cannot double-act: the local pass
+	// fails an entry, which removes its placement, so the provider pass no
+	// longer sees it — and the provider pass routes anything it CAN match to a
+	// local row through the same PruneEntry.
+	if jd, err := utils.ConvertToJobDef(providerPruneSweepInterval); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to convert provider stall prune interval to job definition")
+	} else {
+		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
+			if released := m.pruneProviderStalled(ctx, resolveProviderPruneSettings()); released > 0 {
+				m.logger.Info().Int("released", released).
+					Msg("Provider stall prune released slots the local sweep could not see")
+			}
+		}), gocron.WithContext(ctx), gocron.WithName("provider-stall-prune")); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to create provider stall prune job")
+		} else {
+			m.logger.Debug().Msgf("Provider stall prune job scheduled for every %s", providerPruneSweepInterval)
+		}
+	}
+
 	// NZB refresh job for pending archives (every 5 minutes)
 	if m.usenet != nil {
 		if jd, err := utils.ConvertToJobDef("10m"); err != nil {
