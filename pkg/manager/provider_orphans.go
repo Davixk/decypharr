@@ -263,9 +263,19 @@ func (m *Manager) findProviderOrphans(provider string, remote []*debridTypes.Tor
 			Name:     t.Name,
 			Status:   t.ProviderStatus,
 			Added:    t.Added,
-			// In flight ⇒ holding a download slot. Anything the provider calls
-			// downloaded is occupying storage only.
-			Active: t.Status != debridTypes.TorrentStatusDownloaded,
+			// ACTIVE MEANS HOLDING A DOWNLOAD SLOT — membership in the
+			// provider's active set, not a negation of "downloaded".
+			//
+			// It was `!= Downloaded`, which swept in every ERRORED torrent.
+			// Measured on a live account that was 640 of them, and the metric
+			// built specifically to decide whether a capacity deadlock exists
+			// reported 722 where the truth was 92. At 722 it says "everything
+			// is a deadlock"; a number that can only say yes answers nothing.
+			//
+			// An errored or dead copy occupies STORAGE (and on AllDebrid a
+			// stored-cap slot). It does not occupy a concurrent download slot,
+			// which is the scarce resource this number exists to measure.
+			Active: t.Status == debridTypes.TorrentStatusDownloading,
 		})
 	}
 	return orphans, nil

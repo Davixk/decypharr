@@ -409,10 +409,38 @@ func (q *Queue) DeleteStalled() error {
 		return err
 	}
 	var errs []error
+	held := 0
 	for _, entry := range entries {
+		// AIRTIGHT GUARD: never remove a row that still holds a provider
+		// placement.
+		//
+		// This pass deletes with a NIL cleanup — it removes the local row and
+		// touches nothing remote, by design, because its job is clearing junk
+		// rows rather than managing provider state. But its second branch
+		// (State == Error && Progress == 0) can match an entry that errored
+		// LOCALLY while the provider carries on downloading; one transient
+		// CheckStatus failure is enough to put a row in that shape. Deleting it
+		// strands the transfer with nothing able to release it, because every
+		// release path in decypharr starts from a local entry.
+		//
+		// So a row with a live placement is left alone and reported. The
+		// provider-sourced stall prune is the right tool for it — that one
+		// works from the provider's own active list and can free the slot —
+		// and leaving the row costs only a queue entry the operator can see.
+		if placementIDOf(entry) != "" {
+			held++
+			continue
+		}
 		if _, err := q.deleteCurrentWhere(entry, predicate, nil); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if held > 0 {
+		q.logger.Warn().
+			Int("kept", held).
+			Msg("Stalled-entry cleanup left rows alone because they still hold a provider placement; " +
+				"removing them would strand the transfer with nothing able to release it. The " +
+				"provider-sourced stall prune handles these.")
 	}
 	return errors.Join(errs...)
 }

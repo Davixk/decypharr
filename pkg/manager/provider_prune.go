@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -78,13 +79,78 @@ func (c providerCandidate) averageSpeed(now time.Time) int64 {
 	return int64(float64(c.size) * c.progress / elapsed)
 }
 
+// progressTracker remembers where each provider transfer had got to, so a
+// stall can be measured as an absence of movement rather than inferred.
+//
+// Deliberately in-memory and unbounded-by-account-size only: it holds one small
+// record per IN-FLIGHT transfer, which is bounded by the provider's own
+// concurrency limit (100 on RealDebrid), and entries for anything no longer
+// seen are dropped on each sweep. A restart forgets everything, which is the
+// safe direction — the first sweep after boot re-baselines and concludes
+// nothing.
+type progressTracker struct {
+	mu   sync.Mutex
+	seen map[string]progressObservation
+}
+
+type progressObservation struct {
+	progress float64
+	// since is when this progress value was FIRST observed, not when it was
+	// last confirmed. That is what makes the elapsed time a stall duration
+	// rather than a sweep interval.
+	since time.Time
+}
+
+func newProgressTracker() *progressTracker {
+	return &progressTracker{seen: map[string]progressObservation{}}
+}
+
+// observe records the current progress and reports how long it has been stuck.
+//
+// Returns 0 for anything it has not seen before. A FIRST sighting can never be
+// a stall verdict: we have no idea whether it just started or has been frozen
+// for a day, and guessing would delete live transfers on the first sweep after
+// every restart.
+func (p *progressTracker) observe(key string, progress float64, now time.Time) time.Duration {
+	if p == nil || key == "" {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	prior, known := p.seen[key]
+	if !known || progress > prior.progress {
+		// New, or it moved. Either way the clock restarts from now.
+		p.seen[key] = progressObservation{progress: progress, since: now}
+		return 0
+	}
+	// Unchanged (or, defensively, went backwards — treat that as unchanged
+	// rather than as movement, since a provider reporting less than before is
+	// not evidence of progress).
+	return now.Sub(prior.since)
+}
+
+// retain drops observations for transfers the provider no longer lists, so the
+// map tracks the live set rather than growing for the process lifetime.
+func (p *progressTracker) retain(keys map[string]struct{}) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key := range p.seen {
+		if _, ok := keys[key]; !ok {
+			delete(p.seen, key)
+		}
+	}
+}
+
 // providerPrunableReason reports why a provider-side transfer should be killed,
 // or "" to keep it.
 //
-// Mirrors prunableReason's stages against provider-reported values. Only items
-// the provider itself calls in-flight are considered: a completed transfer is
-// occupying storage, not a download slot, and is not this pass's business.
-func providerPrunableReason(c providerCandidate, s stallPruneSettings, now time.Time) string {
+// stalledFor is how long the provider's own reported progress has been frozen,
+// or 0 when unknown (first sighting, or it is still moving).
+func providerPrunableReason(c providerCandidate, s stallPruneSettings, now time.Time, stalledFor time.Duration) string {
 	if !s.enabled() {
 		return ""
 	}
@@ -107,6 +173,27 @@ func providerPrunableReason(c providerCandidate, s stallPruneSettings, now time.
 	// "0 now, added an hour ago" already proves zero across that hour.
 	if s.noProgressAfter > 0 && c.progress <= 0 && age >= s.noProgressAfter {
 		return fmt.Sprintf("provider reports no bytes transferred in %s", age.Round(time.Minute))
+	}
+
+	// Stage 1b: NO PROGRESS SINCE WE LAST LOOKED.
+	//
+	// Stage 1 only catches a transfer that never started. It cannot see the
+	// commonest real stall: one that downloaded 76% and then died. Measured on
+	// a live account, 28 transfers sat at speed 0 with progress well above
+	// zero, and neither stage touched them — stage 1 because progress > 0, and
+	// stage 2 because a lifetime average computed over the fast early hours
+	// still projects a comfortable finish.
+	//
+	// That is also what the knob NAME means. "no progress after 38m" reads as
+	// "has not advanced in 38 minutes", not "has never moved at all", and the
+	// operator set it expecting the former.
+	//
+	// This is the one stage that needs memory, and it earns it: the provider
+	// list carries no instantaneous speed, so a delta between observations is
+	// the only honest stall signal available without a per-torrent call.
+	if s.noProgressAfter > 0 && stalledFor > 0 && stalledFor >= s.noProgressAfter {
+		return fmt.Sprintf("provider reports %.1f%% and it has not advanced in %s",
+			c.progress*100, stalledFor.Round(time.Minute))
 	}
 
 	// Stage 2: projected completion beyond the ceiling, at the lifetime average.
@@ -187,6 +274,7 @@ func (m *Manager) pruneProviderStalled(ctx context.Context, settings stallPruneS
 	// measured the provider from outside.
 	failed := 0
 
+	considered := 0
 	m.clients.Range(func(name string, client debrid.Client) bool {
 		if client == nil || ctx.Err() != nil {
 			return ctx.Err() == nil
@@ -199,6 +287,18 @@ func (m *Manager) pruneProviderStalled(ctx context.Context, settings stallPruneS
 				Msg("Provider stall prune: could not enumerate; skipping this provider for this sweep")
 			return true
 		}
+		considered += len(candidates)
+
+		// Feed the stall tracker and drop anything the provider no longer
+		// lists, so it follows the live set.
+		live := make(map[string]struct{}, len(candidates))
+		stalls := make(map[string]time.Duration, len(candidates))
+		for _, candidate := range candidates {
+			key := candidate.provider + "\x00" + candidate.id
+			live[key] = struct{}{}
+			stalls[key] = m.progress.observe(key, candidate.progress, now)
+		}
+		m.progress.retain(live)
 
 		for _, candidate := range candidates {
 			if ctx.Err() != nil {
@@ -210,7 +310,8 @@ func (m *Manager) pruneProviderStalled(ctx context.Context, settings stallPruneS
 					Msg("Provider stall prune hit its per-sweep cap; the rest will be reconsidered next pass")
 				return false
 			}
-			reason := providerPrunableReason(candidate, settings, now)
+			reason := providerPrunableReason(candidate, settings, now,
+				stalls[candidate.provider+"\x00"+candidate.id])
 			if reason == "" {
 				continue
 			}
@@ -228,12 +329,24 @@ func (m *Manager) pruneProviderStalled(ctx context.Context, settings stallPruneS
 		return true
 	})
 
-	if released > 0 || failed > 0 {
-		m.logger.Info().
-			Int("released", released).
-			Int("failed", failed).
-			Msg("Provider stall prune completed")
-	}
+	// ALWAYS LOGGED, including a sweep that released nothing.
+	//
+	// This is the third time in this codebase a sweep has been silent on
+	// success and therefore indistinguishable from one that never ran. An
+	// operator watched 35 minutes of uptime with ~56 transfers they believed
+	// prunable, saw zero lines, and reasonably concluded the job was not
+	// registered. It was registered and running; it just had nothing to say.
+	//
+	// `considered` is the load-bearing field: it separates "the sweep is not
+	// running" (absent line) from "the sweep ran and the provider had nothing
+	// in flight" (considered=0) from "it ran, saw work, and judged none of it
+	// prunable" (considered>0, released=0) — three very different situations
+	// that previously produced identical silence.
+	m.logger.Info().
+		Int("considered", considered).
+		Int("released", released).
+		Int("failed", failed).
+		Msg("Provider stall prune completed")
 	return released
 }
 

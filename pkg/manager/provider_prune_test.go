@@ -52,6 +52,10 @@ func newProviderPruneFixture(t *testing.T, torrents ...*debridTypes.Torrent) (*M
 	client := &providerPruneClient{torrents: torrents}
 	m.clients = xsync.NewMap[string, debrid.Client]()
 	m.clients.Store("prov", client)
+	// The real manager always has one. The sweep tolerates nil (a nil tracker
+	// reports no stall, which is the safe direction), but a fixture without one
+	// would silently exercise a different code path than production.
+	m.progress = newProgressTracker()
 	return m, client
 }
 
@@ -233,4 +237,83 @@ func (c *failingListClient) GetAllTorrents() ([]*debridTypes.Torrent, error) {
 func (c *failingListClient) DeleteTorrent(string) error {
 	c.deletes++
 	return nil
+}
+
+// THE STALL THAT NEITHER ORIGINAL STAGE COULD SEE.
+//
+// Stage 1 requires progress == 0, so it only catches a transfer that never
+// started. Stage 2 projects from the LIFETIME average, which flatters anything
+// that downloaded fast and then died. Measured on a live account, 28 transfers
+// sat at speed 0 with progress well above zero and neither stage touched them —
+// while the operator, reading the knob as "has not advanced in 38m", reasonably
+// expected all 28 to go.
+
+func TestStalledProgressIsPrunedByTheDelta(t *testing.T) {
+	stuck := remoteActive("rd-stuck", strings.Repeat("7", 40), 0.76, 1<<30, 30*time.Hour)
+	m, client := newProviderPruneFixture(t, stuck)
+	settings := stallSettings(nil)
+
+	// FIRST sweep only baselines. A first sighting can never be a verdict — we
+	// cannot tell a fresh transfer from one frozen for a day, and guessing
+	// would delete live work on every sweep after a restart.
+	if released := m.pruneProviderStalled(context.Background(), settings); released != 0 {
+		t.Fatalf("released = %d on the first sighting; it must only baseline", released)
+	}
+	if got := client.released(); len(got) != 0 {
+		t.Fatalf("deleted %v on a first sighting", got)
+	}
+
+	// Backdate the observation so the next sweep sees a stall older than the
+	// window, without sleeping through it.
+	key := "prov\x00rd-stuck"
+	m.progress.mu.Lock()
+	m.progress.seen[key] = progressObservation{progress: 0.76, since: time.Now().Add(-2 * time.Hour)}
+	m.progress.mu.Unlock()
+
+	if released := m.pruneProviderStalled(context.Background(), settings); released != 1 {
+		t.Fatalf("released = %d, want 1: 76%% frozen for 2h against a 1h window is a stall", released)
+	}
+}
+
+// TestMovingProgressResetsTheStallClock: the delta must measure a stall, not
+// merely elapsed time since we first saw the transfer.
+func TestMovingProgressResetsTheStallClock(t *testing.T) {
+	p := newProgressTracker()
+	start := time.Now()
+
+	if got := p.observe("k", 0.10, start); got != 0 {
+		t.Fatalf("first sighting reported a stall of %s", got)
+	}
+	// Advanced: clock restarts.
+	if got := p.observe("k", 0.20, start.Add(time.Hour)); got != 0 {
+		t.Fatalf("progress advanced but reported a stall of %s", got)
+	}
+	// Frozen since that advance — one hour, not two.
+	if got := p.observe("k", 0.20, start.Add(2*time.Hour)); got != time.Hour {
+		t.Fatalf("stall = %s, want 1h measured from the last ADVANCE, not from first sight", got)
+	}
+	// A provider reporting less than before is not evidence of progress.
+	if got := p.observe("k", 0.15, start.Add(3*time.Hour)); got != 2*time.Hour {
+		t.Fatalf("stall = %s after a backwards report, want the clock to keep running", got)
+	}
+}
+
+// TestTrackerForgetsWhatTheProviderNoLongerLists keeps it bounded by the live
+// set rather than growing for the process lifetime.
+func TestTrackerForgetsWhatTheProviderNoLongerLists(t *testing.T) {
+	p := newProgressTracker()
+	now := time.Now()
+	p.observe("gone", 0.5, now)
+	p.observe("kept", 0.5, now)
+
+	p.retain(map[string]struct{}{"kept": {}})
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.seen["gone"]; ok {
+		t.Fatal("an observation survived for a transfer the provider no longer lists")
+	}
+	if _, ok := p.seen["kept"]; !ok {
+		t.Fatal("a live transfer's observation was dropped")
+	}
 }

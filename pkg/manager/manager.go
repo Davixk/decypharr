@@ -48,6 +48,10 @@ type Manager struct {
 	// claims — the divergence the local consistency checker cannot see, because
 	// it only compares our index against our own scan.
 	providerOrphans *providerOrphanTracker
+	// progress remembers where each in-flight provider transfer had got to, so
+	// the stall sweep can measure an absence of movement instead of inferring it
+	// from a lifetime average that flatters anything that started fast.
+	progress        *progressTracker
 	arr             *arr.Storage
 	logger       zerolog.Logger
 	ready        chan struct{}
@@ -209,6 +213,7 @@ func New() *Manager {
 		clients:                xsync.NewMap[string, debrid.Client](),
 		fillCache:              newProviderFillCache(),
 		providerOrphans:        newProviderOrphanTracker(),
+		progress:               newProgressTracker(),
 		capacityHold:           newCapacityHoldQueue(),
 		logger:                 _logger,
 		migrationJobs:          xsync.NewMap[string, *storage.SwitcherJob](),
