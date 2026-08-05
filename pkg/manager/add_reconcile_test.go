@@ -305,3 +305,55 @@ func TestCooldownIsScopedPerProvider(t *testing.T) {
 			"chain depends on being able to try the next one")
 	}
 }
+
+// ⚠️ THE EXPENSIVE REFUSALS MUST COOL OFF TOO — and they were the only ones that
+// did not.
+//
+// The cooldown was wired to the SubmitMagnet failure path alone, which is the
+// CHEAP case: one rejected request. A post-submit refusal (seeder gate,
+// uncached-disabled) has already spent a provider write, a status check, a UDP
+// tracker scrape, and then a provider DELETE to clean up the transfer it just
+// created — roughly four operations to reach the same "no".
+//
+// Caught in the field: an *arr walked three indexer variants of one dead release
+// in fifteen seconds and paid that full cost each time, four seconds apart,
+// because nothing remembered the previous answer.
+func TestPostSubmitRefusalsCoolOff(t *testing.T) {
+	m := newActionLifecycleFixture(t, 1)
+	now := time.Now()
+
+	if cooling, _ := m.declines.cooling("rd", reconcileHash, now); cooling {
+		t.Fatal("fixture started with a parked hash")
+	}
+
+	// The seeder gate's verdict, verbatim from the field.
+	m.parkPostSubmitRefusal("rd", reconcileHash,
+		errors.New("uncached release has 0 seeders per udp_scrape, below the minimum of 1"))
+
+	cooling, why := m.declines.cooling("rd", reconcileHash, now)
+	if !cooling {
+		t.Fatal("a seeder-gate refusal did not park the hash; the next indexer variant seconds later " +
+			"pays for another submit + status check + scrape + delete to be told the same thing")
+	}
+	if why == "" {
+		t.Fatal("the cooldown must carry the reason, or the decline log says nothing useful")
+	}
+}
+
+// Stable but NOT permanent: seeders can return and a release can become cached.
+// Same rule as everywhere else — permanent requires a positive, release-specific
+// refusal from the provider, and this is neither.
+func TestPostSubmitRefusalsAreTransientNotPermanent(t *testing.T) {
+	m := newActionLifecycleFixture(t, 1)
+	now := time.Now()
+
+	m.parkPostSubmitRefusal("rd", reconcileHash,
+		errors.New("torrent is not cached and uncached downloads are disabled"))
+
+	// Past the transient ceiling, far short of the permanent duration.
+	if cooling, _ := m.declines.cooling("rd", reconcileHash, now.Add(declineBackoffMax+time.Minute)); cooling {
+		t.Fatalf("still parked after %s; parking a post-submit refusal for the permanent %s would "+
+			"refuse a release that has since become cached or regained seeders",
+			declineBackoffMax+time.Minute, declinePermanentCooldown)
+	}
+}

@@ -143,6 +143,44 @@ func (l *declineLedger) coolingCount(now time.Time) int {
 	return n
 }
 
+// parkPostSubmitRefusal cools off a hash refused AFTER the provider already
+// accepted it — the seeder gate and the uncached-disabled veto.
+//
+// ⚠️ THESE ARE THE EXPENSIVE REFUSALS, AND THEY WERE THE ONLY ONES NOT COOLING
+// OFF. The cooldown was wired to the SubmitMagnet failure path alone, which is
+// the CHEAP case: one rejected request. A post-submit refusal has already spent
+// a provider write, a status check, and — for the seeder gate — a UDP tracker
+// scrape, and it then spends a provider DELETE cleaning up the transfer it just
+// created. Roughly four provider operations to reach the same "no".
+//
+// Caught in the field: an *arr walked three indexer variants of one dead release
+// in fifteen seconds, and each variant paid the full cost again, four seconds
+// apart, because nothing remembered the previous answer. Bounded that time by
+// the indexer result set — but the whole reason the decline ledger exists is
+// that cheap-per-instance multiplied by high-frequency is what the storm was.
+//
+// And these are the most STABLE verdicts in the system. "Zero seeders" and "this
+// provider will not take uncached" do not change in four seconds. Re-testing
+// them is pure waste in a way a transient submit failure is not.
+//
+// Classified TRANSIENT, deliberately, despite being stable: seeders can return
+// and a release can become cached, so the same rule holds as everywhere else —
+// permanent requires a positive, release-specific refusal from the provider, and
+// a bounded backoff is the safe direction. The point here is to stop the
+// four-second re-hammer, which the base backoff already does.
+func (m *Manager) parkPostSubmitRefusal(provider, infoHash string, err error) {
+	if err == nil || infoHash == "" {
+		return
+	}
+	cooldown := m.declines.record(provider, infoHash, declineTransient, err.Error(), time.Now())
+	m.logger.Debug().
+		Str("provider", provider).
+		Str("hash", infoHash).
+		Dur("cooling_off", cooldown).
+		Msg("Parked this release after a post-submit refusal; the next grab of the same hash will be " +
+			"declined locally instead of paying for the provider round-trip again")
+}
+
 // isRateLimitSignal reports whether a failure means "you are asking too fast",
 // as opposed to anything about this particular release.
 //

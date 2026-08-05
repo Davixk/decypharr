@@ -46,6 +46,14 @@ func newActionLifecycleFixture(t *testing.T, actionGate int) *Manager {
 		arr:               arr.NewStorage(),
 		processingEntries: xsync.NewMap[string, struct{}](),
 		actionInflight:    xsync.NewMap[string, struct{}](),
+		// ⚠️ These ledgers no-op silently when nil, so a fixture that omits them
+		// makes every cooldown/pacing assertion vacuously pass. Manager.New wires
+		// them; the fixture must too, or a test can "verify" machinery that is
+		// not running.
+		declines:    newDeclineLedger(),
+		pendingAdds: newPendingAddLedger(),
+		addPace:     newAddPacer(),
+		progress:    newProgressTracker(),
 	}
 	if actionGate > 0 {
 		m.actionSem = make(chan struct{}, actionGate)

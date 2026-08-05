@@ -831,6 +831,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 				cleanupDebridAttempt(db, providerName, cleanupID),
 			))
 			logDebridAttemptFailure(_logger, providerName, "status check", debridTorrent.InfoHash, uncachedErr)
+			m.parkPostSubmitRefusal(providerName, debridTorrent.InfoHash, uncachedErr)
 			continue
 		}
 		// SEEDER GATE. The provider took an UNCACHED torrent and started it, so
@@ -861,6 +862,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 					cleanupDebridAttempt(db, providerName, cleanupID),
 				))
 				logDebridAttemptFailure(_logger, providerName, "seeder gate", debridTorrent.InfoHash, gateErr)
+				m.parkPostSubmitRefusal(providerName, debridTorrent.InfoHash, gateErr)
 				continue
 			}
 		}
