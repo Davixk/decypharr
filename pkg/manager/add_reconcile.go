@@ -87,22 +87,27 @@ func (l *pendingAddLedger) resolve(provider, infoHash string) {
 	delete(l.entries, pendingKey(provider, infoHash))
 }
 
-// pending reports whether this hash is still within its reconcilable window.
-func (l *pendingAddLedger) pending(provider, infoHash string, now time.Time) bool {
+// pending reports whether this hash is still within its reconcilable window,
+// and WHEN it was submitted.
+//
+// The timestamp is not incidental. A listing fetched before the submission
+// cannot answer "is it there?" in the negative, so every caller needs to know
+// how old the answer is allowed to be. See reconcileListing.fromCacheLocked.
+func (l *pendingAddLedger) pending(provider, infoHash string, now time.Time) (time.Time, bool) {
 	if l == nil {
-		return false
+		return time.Time{}, false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entry, ok := l.entries[pendingKey(provider, infoHash)]
 	if !ok {
-		return false
+		return time.Time{}, false
 	}
 	if now.Sub(entry.at) > pendingAddTTL {
 		delete(l.entries, pendingKey(provider, infoHash))
-		return false
+		return time.Time{}, false
 	}
-	return true
+	return entry.at, true
 }
 
 // expired returns and clears entries past the window, for the final lookup.
@@ -144,73 +149,101 @@ func newReconcileListing() *reconcileListing {
 	}
 }
 
-// lookup returns the provider's ID for a hash, and whether the listing could be
-// obtained at all.
+// fromCacheLocked answers from the cached listing, but only when that listing is
+// entitled to answer.
+//
+// ⚠️ A HIT AND A MISS DO NOT HAVE THE SAME EVIDENTIAL VALUE, and treating them
+// alike reintroduces the exact orphan this file exists to prevent.
+//
+//	HIT  — our own hash appearing in ANY snapshot proves the provider has it.
+//	       Always meaningful, however old the snapshot is.
+//	MISS — only meaningful if the snapshot was taken AFTER we submitted. A
+//	       listing fetched before the POST could not possibly have contained the
+//	       hash, so reading its silence as "confirmed absent" would declare a
+//	       clean failure on a transfer that actually landed.
+//
+// The dangerous case is not hypothetical and not rare — it is the storm. One
+// ambiguous add fetches a snapshot; the next ambiguous add, seconds later, hits
+// that same cached snapshot, which predates it entirely.
+func (r *reconcileListing) fromCacheLocked(name, hash string, since, now time.Time) (string, bool) {
+	at, ok := r.fetched[name]
+	if !ok || now.Sub(at) >= reconcileListingTTL {
+		return "", false
+	}
+	if id := r.byHash[name][hash]; id != "" {
+		return id, true
+	}
+	if at.After(since) {
+		return "", true
+	}
+	// Absent from a listing older than the submission: no information at all.
+	return "", false
+}
+
+// lookup returns the provider's ID for a hash, and whether the listing could
+// answer the question.
 //
 // The second return is KNOWN. False never means "the provider does not have it"
 // — it means we could not ask, and a caller must treat that as "still
 // ambiguous" rather than as a confirmed failure.
-func (r *reconcileListing) lookup(name string, client debrid.Client, infoHash string, now time.Time) (string, bool) {
+//
+// `since` is when the add was submitted; see fromCacheLocked for why a cached
+// listing older than that cannot settle a miss.
+func (r *reconcileListing) lookup(name string, client debrid.Client, infoHash string, since, now time.Time) (string, bool) {
 	if r == nil || client == nil {
 		return "", false
 	}
 	hash := strings.ToLower(infoHash)
 
-	r.mu.Lock()
-	if at, ok := r.fetched[name]; ok && now.Sub(at) < reconcileListingTTL {
-		id := r.byHash[name][hash]
-		r.mu.Unlock()
-		return id, true
-	}
-	if wg, ok := r.inflight[name]; ok {
-		r.mu.Unlock()
-		wg.Wait()
+	// Bounded, and exhaustion returns UNKNOWN rather than "absent" — the safe
+	// direction. Normal paths settle in at most three passes: wait on someone
+	// else's fetch, find it predates us, fetch our own.
+	for range 4 {
 		r.mu.Lock()
-		id, ok := "", false
-		if _, fresh := r.fetched[name]; fresh {
-			id, ok = r.byHash[name][hash], true
+		if id, known := r.fromCacheLocked(name, hash, since, now); known {
+			r.mu.Unlock()
+			return id, true
+		}
+		if wg, ok := r.inflight[name]; ok {
+			// Single-flight: one enumeration serves every waiter, so a storm of
+			// ambiguous adds cannot become a storm of full listings. On waking we
+			// re-test rather than trusting the result, because the fetch we
+			// waited on may itself have started before our submission.
+			r.mu.Unlock()
+			wg.Wait()
+			continue
+		}
+		wg := &sync.WaitGroup{}
+		wg.Add(1)
+		r.inflight[name] = wg
+		r.mu.Unlock()
+
+		torrents, err := client.GetAllTorrents()
+		fetchedAt := time.Now()
+
+		r.mu.Lock()
+		delete(r.inflight, name)
+		if err == nil {
+			index := make(map[string]string, len(torrents))
+			for _, t := range torrents {
+				if t == nil || t.InfoHash == "" || t.Id == "" {
+					continue
+				}
+				index[strings.ToLower(t.InfoHash)] = t.Id
+			}
+			r.byHash[name] = index
+			r.fetched[name] = fetchedAt
 		}
 		r.mu.Unlock()
-		return id, ok
-	}
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	r.inflight[name] = wg
-	r.mu.Unlock()
+		wg.Done()
 
-	torrents, err := client.GetAllTorrents()
-
-	r.mu.Lock()
-	delete(r.inflight, name)
-	if err == nil {
-		index := make(map[string]string, len(torrents))
-		for _, t := range torrents {
-			if t == nil || t.InfoHash == "" || t.Id == "" {
-				continue
-			}
-			index[strings.ToLower(t.InfoHash)] = t.Id
+		if err != nil {
+			return "", false
 		}
-		r.byHash[name] = index
-		r.fetched[name] = now
+		// Our own fetch strictly follows the submission, so on the next pass the
+		// cache is authoritative in BOTH directions.
 	}
-	id, known := "", false
-	if _, fresh := r.fetched[name]; fresh && err == nil {
-		id, known = r.byHash[name][hash], true
-	}
-	r.mu.Unlock()
-	wg.Done()
-	return id, known
-}
-
-// invalidate drops a provider's cached listing, so a reconcile after a known
-// change re-reads rather than answering from a snapshot taken before it.
-func (r *reconcileListing) invalidate(name string) {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	delete(r.fetched, name)
-	r.mu.Unlock()
+	return "", false
 }
 
 // reconcileAmbiguousAdd asks whether a submitted hash actually landed.
@@ -221,7 +254,11 @@ func (r *reconcileListing) invalidate(name string) {
 // because both mean "no ID to recover here"; they are distinguished in the log
 // so an unreachable provider is not mistaken for a clean failure.
 func (m *Manager) reconcileAmbiguousAdd(providerName, infoHash string) string {
-	if infoHash == "" || !m.pendingAdds.pending(providerName, infoHash, time.Now()) {
+	if infoHash == "" {
+		return ""
+	}
+	submittedAt, ok := m.pendingAdds.pending(providerName, infoHash, time.Now())
+	if !ok {
 		return ""
 	}
 	client := m.ProviderClient(providerName)
@@ -229,7 +266,9 @@ func (m *Manager) reconcileAmbiguousAdd(providerName, infoHash string) string {
 		return ""
 	}
 
-	id, known := m.reconcileList.lookup(providerName, client, infoHash, time.Now())
+	// submittedAt is what keeps a stale snapshot from answering "absent" for a
+	// hash it could never have contained.
+	id, known := m.reconcileList.lookup(providerName, client, infoHash, submittedAt, time.Now())
 	if !known {
 		m.logger.Warn().
 			Str("provider", providerName).

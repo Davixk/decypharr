@@ -22,18 +22,18 @@ func TestOnlyLedgeredHashesAreReconcilable(t *testing.T) {
 	l := newPendingAddLedger()
 	now := time.Now()
 
-	if l.pending("rd", reconcileHash, now) {
+	if _, ok := l.pending("rd", reconcileHash, now); ok {
 		t.Fatal("a hash that was never submitted must not be reconcilable — that is the adoption line")
 	}
 
 	l.begin("rd", reconcileHash)
-	if !l.pending("rd", reconcileHash, now) {
+	if _, ok := l.pending("rd", reconcileHash, now); !ok {
 		t.Fatal("a hash we just submitted must be reconcilable")
 	}
 
 	// Scoped per provider: submitting to one does not make it recoverable from
 	// another, where it might belong to somebody else entirely.
-	if l.pending("ad", reconcileHash, now) {
+	if _, ok := l.pending("ad", reconcileHash, now); ok {
 		t.Fatal("the ledger must be scoped per provider")
 	}
 }
@@ -44,10 +44,10 @@ func TestTheWindowExpires(t *testing.T) {
 	l := newPendingAddLedger()
 	l.begin("rd", reconcileHash)
 
-	if !l.pending("rd", reconcileHash, time.Now()) {
+	if _, ok := l.pending("rd", reconcileHash, time.Now()); !ok {
 		t.Fatal("expected the entry to be live")
 	}
-	if l.pending("rd", reconcileHash, time.Now().Add(pendingAddTTL+time.Second)) {
+	if _, ok := l.pending("rd", reconcileHash, time.Now().Add(pendingAddTTL+time.Second)); ok {
 		t.Fatal("a stale ledger entry must expire rather than authorise a late recovery")
 	}
 }
@@ -56,7 +56,7 @@ func TestResolveClearsTheLedger(t *testing.T) {
 	l := newPendingAddLedger()
 	l.begin("rd", reconcileHash)
 	l.resolve("rd", reconcileHash)
-	if l.pending("rd", reconcileHash, time.Now()) {
+	if _, ok := l.pending("rd", reconcileHash, time.Now()); ok {
 		t.Fatal("a resolved add must leave nothing behind")
 	}
 }
@@ -72,8 +72,63 @@ func TestExpiredReturnsAndClears(t *testing.T) {
 	if len(got) != 1 || got[0].infoHash != reconcileHash {
 		t.Fatalf("expired = %+v, want the stale entry", got)
 	}
-	if l.pending("rd", reconcileHash, time.Now()) {
+	if _, ok := l.pending("rd", reconcileHash, time.Now()); ok {
 		t.Fatal("expired entries must be cleared as they are reported")
+	}
+}
+
+// A CACHED LISTING MAY NOT SETTLE A MISS IT COULD NOT HAVE SEEN.
+//
+// This is the storm case, and getting it wrong reintroduces the exact orphan the
+// ledger exists to prevent: ambiguous add A fetches a snapshot, ambiguous add B
+// arrives seconds later and hits that same cached snapshot — which was taken
+// BEFORE B was ever submitted. Reading its silence as "confirmed absent" would
+// declare a clean failure on a transfer that landed.
+func TestAStaleSnapshotCannotConfirmAbsence(t *testing.T) {
+	r := newReconcileListing()
+	snapshotAt := time.Now()
+
+	// A snapshot exists and is within its TTL, but it predates this submission.
+	r.byHash["rd"] = map[string]string{}
+	r.fetched["rd"] = snapshotAt
+
+	submittedAt := snapshotAt.Add(5 * time.Second)
+	now := snapshotAt.Add(6 * time.Second)
+
+	if _, known := r.fromCacheLocked("rd", reconcileHash, submittedAt, now); known {
+		t.Fatal("a listing taken before the add was submitted answered \"absent\"; " +
+			"that orphans the transfer this code exists to recover")
+	}
+
+	// Taken after the submission, the same empty snapshot IS authoritative.
+	r.fetched["rd"] = submittedAt.Add(time.Second)
+	if _, known := r.fromCacheLocked("rd", reconcileHash, submittedAt, now); !known {
+		t.Fatal("a listing taken after the submission must be able to confirm absence")
+	}
+}
+
+// A HIT is good regardless of the snapshot's age: our own hash appearing in any
+// listing proves the provider has it.
+func TestAStaleSnapshotStillConfirmsPresence(t *testing.T) {
+	r := newReconcileListing()
+	snapshotAt := time.Now()
+	r.byHash["rd"] = map[string]string{reconcileHash: "TRANSFER-1"}
+	r.fetched["rd"] = snapshotAt
+
+	id, known := r.fromCacheLocked("rd", reconcileHash, snapshotAt.Add(5*time.Second), snapshotAt.Add(6*time.Second))
+	if !known || id != "TRANSFER-1" {
+		t.Fatalf("id=%q known=%v; presence in any snapshot proves the add landed", id, known)
+	}
+}
+
+func TestAnExpiredSnapshotAnswersNothing(t *testing.T) {
+	r := newReconcileListing()
+	at := time.Now()
+	r.byHash["rd"] = map[string]string{reconcileHash: "TRANSFER-1"}
+	r.fetched["rd"] = at
+
+	if _, known := r.fromCacheLocked("rd", reconcileHash, at, at.Add(reconcileListingTTL)); known {
+		t.Fatal("a snapshot past its TTL must force a re-read")
 	}
 }
 

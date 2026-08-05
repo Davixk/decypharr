@@ -736,7 +736,6 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			if recovered := m.reconcileAmbiguousAdd(providerName, debridTorrent.InfoHash); recovered != "" {
 				m.pendingAdds.resolve(providerName, debridTorrent.InfoHash)
 				m.declines.clear(providerName, debridTorrent.InfoHash)
-				m.reconcileList.invalidate(providerName)
 				dbt = debridTorrent
 				dbt.Id = recovered
 				dbt.Debrid = providerName
