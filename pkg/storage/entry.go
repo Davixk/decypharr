@@ -1108,6 +1108,7 @@ func (s *Storage) logQueueRemoval(entry *Entry, op string) {
 		Str("op", op).
 		Str("state", string(entry.State)).
 		Str("status", string(entry.Status)).
+		Str("origin", queueRemovalOrigin()).
 		Str("caller", queueRemovalCaller())
 	if entry.ActiveProvider != "" {
 		event = event.Str("provider", entry.ActiveProvider)
@@ -1119,6 +1120,97 @@ func (s *Storage) logQueueRemoval(entry *Entry, op string) {
 		}
 	}
 	event.Msg("Queue row removed")
+}
+
+// Queue-row removal origins. These name the ROUTE a removal came in by, which
+// is the thing an operator actually needs to know, and which the raw caller
+// cannot tell them.
+//
+// ⚠️ WHY THE RAW CALLER IS NOT ENOUGH. Every removal funnels through
+// deleteCurrentWhere, so `caller` reads `deleteCurrentWhere:NNN` for all of
+// them and identifies nothing. In the field this showed up immediately: seven
+// takes at state=downloading in the first minutes after deploy looked like
+// defects under a "state alone" rule, when every one was an *arr deleting
+// through the shim — the exact lifecycle the design blesses. State cannot
+// discriminate; only the route can.
+const (
+	// originShimQBit / originShimSAB — the *arr removed it through the download
+	// client API. THE NORMAL ROUTE, and the only one that should be common.
+	originShimQBit = "shim-delete-qbit"
+	originShimSAB  = "shim-delete-sab"
+	// originAPI — decypharr's own REST API, i.e. an operator or the UI.
+	originAPI = "api-delete"
+	// originCompletion — the download succeeded and migrated to the main store.
+	originCompletion = "completion"
+	// originAddRefusal — a synchronous refusal at add time. The row existed for
+	// milliseconds and the *arr was answered with a 4xx; it never had a queue
+	// item, so nothing is owed.
+	originAddRefusal = "add-refusal"
+	// originRepair / originMigration — sweeps that legitimately move entries.
+	originRepair    = "repair"
+	originMigration = "migration"
+
+	// 🔴 THESE MUST NEVER APPEAR AFTER fork.53. A reaper deleting a row is the
+	// defect that silently lost 15,004 rows in 24h. They are named rather than
+	// folded into "unknown" so that if one ever fires, the log says exactly
+	// which reaper regressed instead of leaving it to be inferred.
+	originStalledSweep = "DEFECT-stalled-sweep"
+	originPrune        = "DEFECT-prune"
+
+	// originUnknown is the default, and it is deliberately a SIGNAL rather than
+	// a shrug: a removal route nobody has classified is either new or
+	// unexpected, and both are worth a grep. Keeping the default useless-looking
+	// preserves the property that a new deletion path cannot quietly blend in.
+	originUnknown = "unknown"
+)
+
+// queueRemovalOrigin classifies a removal by walking the stack for a known entry
+// point, rather than trusting any caller to declare itself honestly.
+//
+// Stack-derived on purpose, exactly like queueRemovalCaller: a route threaded
+// through function arguments can be forgotten by whoever adds the next deletion
+// path, and the whole reason this instrumentation exists is that a previous
+// generation of deletion paths left no evidence at all.
+func queueRemovalOrigin() string {
+	pcs := make([]uintptr, 32)
+	n := runtime.Callers(3, pcs)
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		frame, more := frames.Next()
+		if frame.Function == "" {
+			break
+		}
+		fn := frame.Function
+		switch {
+		case strings.Contains(fn, "/pkg/server/qbit."):
+			return originShimQBit
+		case strings.Contains(fn, "/pkg/server/sabnzbd."):
+			return originShimSAB
+		case strings.Contains(fn, ").deleteActionNone"),
+			strings.Contains(fn, ").persistCompletedEntry"),
+			strings.Contains(fn, ").completeEntry"):
+			return originCompletion
+		case strings.Contains(fn, ").AddNewTorrent"), strings.Contains(fn, ").AddNewNZB"):
+			return originAddRefusal
+		case strings.Contains(fn, ").MarkStalledFailed"):
+			return originStalledSweep
+		case strings.Contains(fn, ").PruneEntry"), strings.Contains(fn, ").pruneStalled"),
+			strings.Contains(fn, ").pruneProviderStalled"):
+			return originPrune
+		case strings.Contains(fn, "/pkg/manager.(*Repair)"):
+			return originRepair
+		case strings.Contains(fn, ").MoveTorrent"), strings.Contains(fn, "Switcher"):
+			return originMigration
+		// Checked LAST of the server packages: pkg/server is the parent of the
+		// shim packages, so testing it first would swallow every shim delete.
+		case strings.Contains(fn, "/pkg/server."):
+			return originAPI
+		}
+		if !more {
+			break
+		}
+	}
+	return originUnknown
 }
 
 // queueRemovalCaller walks past this package's own frames to name the code that
