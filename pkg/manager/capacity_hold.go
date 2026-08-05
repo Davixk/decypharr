@@ -163,7 +163,46 @@ func (m *Manager) releaseHeldForCapacity(n int) {
 
 // releaseHeldEntryOnSlotFree is the single call every slot-free site makes. One
 // freed slot, one admitted entry.
+//
+// ⚠️ PACED, EVEN THOUGH IT IS ONE AT A TIME — because "one at a time" bounds the
+// BATCH and says nothing about the RATE.
+//
+// The event fires from waitForDownloadCompletion on EVERY exit: completed,
+// failed, or capped. A mass-failure therefore fires it as fast as entries fail,
+// and mass failures are a thing that has actually happened here — ~1,900 usenet
+// entries flipped to error at ~5/sec, peaking at 333/min. Each one would admit
+// an entry immediately, and at ~3 requests per add that is ~1,000 requests/min
+// against RealDebrid's 250/min TOTAL allowance. The original storm, arriving
+// through the one door the admission controller does not guard.
+//
+// Raising max_active_downloads makes this strictly more likely, not less: more
+// concurrent downloads means more simultaneous failures when something upstream
+// breaks.
+//
+// A denied permit is NOT a lost admission. The entry stays held and the 30s
+// admission tick picks it up — the only thing lost is the instant-admit
+// optimisation, and only while the budget is genuinely exhausted.
 func (m *Manager) releaseHeldEntryOnSlotFree() {
+	if m.capacityHold.len() == 0 {
+		return
+	}
+	// The freed slot's provider is not known here, and this path deliberately
+	// makes NO provider calls — so charge every configured lane. The pacer is
+	// purely local, so this costs nothing but a mutex.
+	now := time.Now()
+	permitted := true
+	m.clients.Range(func(name string, client debrid.Client) bool {
+		if client == nil {
+			return true
+		}
+		if m.addPace.take(name, 1, now) < 1 {
+			permitted = false
+		}
+		return true
+	})
+	if !permitted {
+		return
+	}
 	m.releaseHeldForCapacity(1)
 }
 

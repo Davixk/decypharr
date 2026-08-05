@@ -134,6 +134,56 @@ func TestAdmissionProbesOnceWhenCapacityIsUnknowable(t *testing.T) {
 	}
 }
 
+// ⚠️ THE MASS-FAILURE BURST. The slot-free event fires from
+// waitForDownloadCompletion on EVERY exit, including failure — so a mass failure
+// fires it as fast as entries fail. Measured here before: ~1,900 usenet entries
+// flipped to error at ~5/sec, peaking at 333/min.
+//
+// "One at a time" bounds the batch and says NOTHING about the rate. Unpaced,
+// 333 admissions/min at ~3 requests each is ~1,000 requests/min against
+// RealDebrid's 250/min total allowance — the original storm, arriving through
+// the one door the admission controller does not guard. Raising
+// max_active_downloads makes this more likely, not less.
+func TestSlotFreeStormIsPaced(t *testing.T) {
+	rd := &slotsClient{slots: 100}
+	m := newCapacityFixture(t, map[string]debrid.Client{"rd": rd})
+	for i := range 200 {
+		m.holdForCapacity(heldJob(fmt.Sprintf("held-%d", i)))
+	}
+
+	// 200 downloads failing back-to-back, as fast as the events can fire.
+	for range 200 {
+		m.releaseHeldEntryOnSlotFree()
+	}
+
+	admitted := 200 - m.capacityHold.len()
+	if admitted > addPacerBurst {
+		t.Fatalf("a burst of 200 slot-free events admitted %d entries at once (burst cap %d); "+
+			"a mass failure would reproduce the storm the pacer exists to prevent", admitted, addPacerBurst)
+	}
+	if admitted == 0 {
+		t.Fatal("nothing was admitted at all; the normal instant-admit path must still work")
+	}
+}
+
+// A denied permit must not LOSE the entry — it stays held for the next tick.
+func TestPacedSlotFreeKeepsTheEntryHeld(t *testing.T) {
+	rd := &slotsClient{slots: 100}
+	m := newCapacityFixture(t, map[string]debrid.Client{"rd": rd})
+	for i := range 50 {
+		m.holdForCapacity(heldJob(fmt.Sprintf("held-%d", i)))
+	}
+	for range 50 {
+		m.releaseHeldEntryOnSlotFree()
+	}
+	// Everything the pacer denied is still waiting, not dropped on the floor —
+	// a lost entry leaves the arr with a queue row nothing is working on.
+	if got := m.capacityHold.len(); got < 50-addPacerBurst {
+		t.Fatalf("held = %d, want at least %d; denied admissions must stay in the hold, not vanish",
+			got, 50-addPacerBurst)
+	}
+}
+
 // TestAdmissionIgnoresProvidersThatError: a provider that cannot answer must
 // contribute no admissions, never a guessed count.
 func TestAdmissionIgnoresProvidersThatError(t *testing.T) {
