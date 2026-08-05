@@ -2,6 +2,7 @@ package qbit
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -172,6 +173,53 @@ func (q *QBit) handleTorrentsAdd(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// deleteCaller is the attribution attached to a shim delete.
+type deleteCaller struct {
+	agent string // User-Agent, trimmed
+	addr  string // remote address, host only
+	auth  string // how the caller authenticated — NEVER the credential itself
+}
+
+// describeDeleteCaller identifies who asked for a delete, for attribution only.
+//
+// 🔴 IT MUST NEVER LOG A CREDENTIAL. An API key or session cookie in a log line
+// is a leaked secret that outlives the investigation it was added for, gets
+// copied into bug reports, and survives in log shipping nobody audits. So `auth`
+// records the SCHEME that was used — apikey / basic / cookie / none — and never
+// a byte of the value.
+//
+// That is enough for the question being asked. Distinguishing "sonarr's own
+// client" from "the operator's resolver script" is answered by the User-Agent
+// and the source address; knowing WHICH key was presented adds nothing to it.
+func describeDeleteCaller(r *http.Request) deleteCaller {
+	c := deleteCaller{
+		agent: strings.TrimSpace(r.UserAgent()),
+		addr:  r.RemoteAddr,
+		auth:  "none",
+	}
+	if c.agent == "" {
+		c.agent = "(no user-agent)"
+	}
+	// Host only: the ephemeral port changes per connection and identifies
+	// nothing, while making every line look distinct.
+	if host, _, err := net.SplitHostPort(c.addr); err == nil && host != "" {
+		c.addr = host
+	}
+	switch {
+	case r.Header.Get("X-Api-Key") != "":
+		c.auth = "apikey"
+	case strings.HasPrefix(strings.ToLower(r.Header.Get("Authorization")), "basic "):
+		c.auth = "basic"
+	case r.Header.Get("Authorization") != "":
+		c.auth = "authorization-header"
+	default:
+		if _, err := r.Cookie("SID"); err == nil {
+			c.auth = "cookie"
+		}
+	}
+	return c
+}
+
 func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	hashes := getHashes(ctx)
@@ -196,7 +244,9 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 	// the flag means releasing the placement. That is not a guess about what the
 	// operator wants — it is doing what the caller explicitly asked for.
 	_ = r.ParseForm()
-	deleteFiles := strings.EqualFold(strings.TrimSpace(r.FormValue("deleteFiles")), "true")
+	rawDeleteFiles := r.FormValue("deleteFiles")
+	deleteFiles := strings.EqualFold(strings.TrimSpace(rawDeleteFiles), "true")
+	caller := describeDeleteCaller(r)
 
 	var cleanup func(*storage.Entry) error
 	if deleteFiles {
@@ -251,11 +301,40 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 		err := q.manager.Queue().Delete(hash, cleanup)
 		switch {
 		case err == nil:
-			q.logger.Info().
+			// ⚠️ THE ATTRIBUTION IS THE POINT, NOT THE OUTCOME.
+			//
+			// Measured on .53: 170 deletes arrived with delete_files=false in four
+			// hours against 108 with true. Each false one is decypharr correctly
+			// keeping the provider copy the caller asked it to keep — and each one
+			// leaves a transfer burning a slot for content the *arr has already
+			// replaced. The behaviour is right; the REQUESTS are the question.
+			//
+			// So the line records what was received and who sent it. The operator's
+			// queue-resolver script sends removeFromClient=true, which means the
+			// translation to delete_files=false happens somewhere between that and
+			// here — and narrowing "somewhere" needs the caller on the line, not
+			// just the flag.
+			//
+			// raw_delete_files is kept ALONGSIDE the parsed bool deliberately: an
+			// absent parameter and an explicit "false" are indistinguishable once
+			// parsed, and they implicate completely different code on the caller's
+			// side.
+			ev := q.logger.Info().
 				Str("infohash", hash).
 				Bool("delete_files", deleteFiles).
-				Msg("Queue entry deleted via the qBittorrent API. delete_files=false keeps the provider copy, " +
+				Str("raw_delete_files", rawDeleteFiles).
+				Str("caller", caller.agent).
+				Str("caller_addr", caller.addr).
+				Str("auth", caller.auth)
+			if category := r.FormValue("category"); category != "" {
+				ev = ev.Str("category", category)
+			}
+			if deleteFiles {
+				ev.Msg("Queue entry deleted via the qBittorrent API; delete_files=true released the provider copy")
+			} else {
+				ev.Msg("Queue entry deleted via the qBittorrent API. delete_files=false keeps the provider copy, " +
 					"which continues to occupy a slot")
+			}
 		case errors.Is(err, storage.ErrEntryNotFound):
 			// An entry that is already absent is a satisfied delete, not a
 			// failure. This previously matched on the message text containing
