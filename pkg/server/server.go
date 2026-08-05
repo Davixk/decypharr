@@ -166,12 +166,22 @@ func (s *Server) SetRestartFunc(restartFunc func()) {
 	s.restartFunc = restartFunc
 }
 
+// CanRestart reports whether a restart can actually be carried out.
+//
+// Callers that TELL A CLIENT a restart is happening must consult this first:
+// without a restart function nothing will restart, and saying otherwise leaves
+// the caller believing new configuration is live when the old one still is.
+func (s *Server) CanRestart() bool {
+	return s.restartFunc != nil
+}
+
 func (s *Server) Restart() {
 	if s.restartFunc != nil {
 		time.Sleep(200 * time.Millisecond)
 		s.restartFunc()
 	} else {
-		s.logger.Warn().Msg("Restart function not set")
+		s.logger.Error().Msg("A restart was requested but no restart function is set; " +
+			"the running configuration remains the old one")
 	}
 }
 

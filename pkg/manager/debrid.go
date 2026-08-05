@@ -57,6 +57,13 @@ func (m *Manager) createClient(dc config.Debrid) (debrid.Client, error) {
 	rateLimits["repair"] = repairRL
 	rateLimits["download"] = downloadRL
 
+	// The add-rate budget is keyed by the CONFIGURED NAME, which is what every
+	// admission path uses, while the researched default is chosen from the
+	// PROVIDER type. Passing the provider explicitly keeps a deployment that
+	// names its RealDebrid account "rd-main" on RealDebrid's budget rather than
+	// silently falling through to the conservative unknown-provider default.
+	m.addPace.configure(dc.Name, cmp.Or(dc.AddRateLimit, defaultAddRateFor(dc.Provider)))
+
 	switch dc.Provider {
 	case "realdebrid":
 		client, err = realdebrid.New(dc, rateLimits)

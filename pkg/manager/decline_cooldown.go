@@ -143,6 +143,36 @@ func (l *declineLedger) coolingCount(now time.Time) int {
 	return n
 }
 
+// isRateLimitSignal reports whether a failure means "you are asking too fast",
+// as opposed to anything about this particular release.
+//
+// This is what closes the loop on the pacer: without it the adaptive backoff has
+// no input and the budget is just a static number with extra steps.
+//
+// The strings are each vendor's own vocabulary:
+//
+//	429             the HTTP status, used by both RealDebrid and AllDebrid
+//	503             AllDebrid also answers overload with this
+//	"slow down"     RealDebrid error code 5
+//	"too many requests" RealDebrid error code 34, and AllDebrid's 429 text
+//
+// ⚠️ NOT to be confused with a CAPACITY refusal ("too many ACTIVE downloads").
+// That means the account is full, not that we are asking too fast, and slowing
+// down would not help — it is handled by the hold ledger. Checked first, below,
+// precisely so the two never blur.
+func isRateLimitSignal(err error) bool {
+	if err == nil || isTooManyActiveDownloads(err) || isProviderAddQuotaExhausted(err) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	for _, sig := range []string{"429", "503", "slow down", "too many requests"} {
+		if strings.Contains(text, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 // classifyDecline decides how long a failed add should park.
 //
 // The distinction is between a verdict about the CONTENT and a failure of the

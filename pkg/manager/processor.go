@@ -744,6 +744,22 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		}
 		if err != nil {
 			m.pendingAdds.resolve(providerName, debridTorrent.InfoHash)
+			// THE PROVIDER SAID WE ARE ASKING TOO FAST. Back the whole lane off,
+			// not just this hash — a rate limit is a statement about our request
+			// rate, so parking one release would leave the rate unchanged and the
+			// next admission would hit the same wall. On RealDebrid this matters
+			// doubly: refused requests count against the same budget, so an
+			// unadjusted rate actively shrinks the room to recover.
+			if isRateLimitSignal(err) {
+				interval := m.addPace.penalise(providerName, time.Now())
+				budget, current := m.addPace.rates(providerName)
+				m.logger.Warn().
+					Str("provider", providerName).
+					Dur("now_one_add_every", interval).
+					Float64("rate_per_min", current).
+					Float64("budget_per_min", budget).
+					Msg("Provider signalled a rate limit; halving the add rate for this provider")
+			}
 			cooldown := m.declines.record(providerName, debridTorrent.InfoHash,
 				classifyDecline(err), err.Error(), time.Now())
 			attemptErr := providerStageError(providerName, "submit", err)
@@ -761,6 +777,10 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		}
 		m.pendingAdds.resolve(providerName, debridTorrent.InfoHash)
 		m.declines.clear(providerName, debridTorrent.InfoHash)
+		// An add landed, so climb back toward the configured budget. Gradual by
+		// design: one success does not prove a provider that just throttled us
+		// has recovered, and jumping straight back to full rate would oscillate.
+		m.addPace.reward(providerName)
 		if dbt == nil {
 			errs = append(errs, providerStageError(providerName, "submit", errors.New("provider returned a nil torrent")))
 			continue

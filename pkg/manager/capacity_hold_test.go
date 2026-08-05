@@ -49,6 +49,7 @@ func newCapacityFixture(t *testing.T, clients map[string]debrid.Client) *Manager
 		m.clients.Store(name, c)
 	}
 	m.capacityHold = newCapacityHoldQueue()
+	m.addPace = newAddPacer()
 	m.logger = zerolog.Nop()
 	// Admission submits released entries to the job queue, and a failed submit
 	// deliberately returns them to the hold rather than dropping them — so

@@ -2,7 +2,9 @@ package manager
 
 import (
 	"errors"
+	"fmt"
 	"sync"
+	"time"
 
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
@@ -205,7 +207,18 @@ func (m *Manager) admitHeldFromProviderCapacity() {
 		return
 	}
 
+	// 🛑 SLOT MATH GATES *WHETHER* TO ADMIT. THE PACER SETS *HOW MANY AT ONCE*.
+	//
+	// These are two different questions and conflating them caused the storm.
+	// Free slots say the provider has room to DOWNLOAD; the pacer says how fast
+	// we may ASK. A provider can simultaneously have 90 free slots and no
+	// willingness to accept 90 requests this second, and it did.
+	//
+	// Per provider, because the budgets genuinely differ — RealDebrid allows 250
+	// requests/minute where AllDebrid allows 600 — and a single shared number
+	// would have to be the smaller one, permanently underusing the other.
 	free := 0
+	var eligible []string
 	m.clients.Range(func(name string, client debrid.Client) bool {
 		if client == nil {
 			return true
@@ -220,47 +233,55 @@ func (m *Manager) admitHeldFromProviderCapacity() {
 			// progress, and a probe that is refused simply returns to the hold
 			// at no extra cost.
 			free++
+			eligible = append(eligible, name)
 		case err != nil:
 			m.logger.Debug().Err(err).Str("provider", name).
 				Msg("Capacity admission: provider could not report free slots this round")
 		case slots > 0:
 			free += slots
+			eligible = append(eligible, name)
 		}
 		return true
 	})
 
-	if free <= 0 {
+	if free <= 0 || len(eligible) == 0 {
 		return
 	}
-	// 🛑 SLOT MATH GATES *WHETHER* TO ADMIT. IT MUST NEVER SET *HOW MANY AT ONCE*.
+
+	// ⚠️ THE HOLD QUEUE IS NOT PARTITIONED BY PROVIDER, so a released job may go
+	// to ANY eligible provider — the add path chooses, with fallback. The only
+	// bound that cannot overspend anyone is therefore the SMALLEST permit among
+	// the eligible providers: if every admitted job happened to pick the most
+	// restricted one, we would still be inside its budget.
 	//
-	// This used to admit `free` entries per tick. With a provider reporting 90
-	// free slots that is 90 simultaneous adds every 30 seconds, each retried up
-	// to four times — and it was SELF-SUSTAINING: the burst tripped the
-	// provider's rate limit, every add failed, so no slot was consumed, so the
-	// next tick saw the same 90 free and admitted 90 again. Measured on a live
-	// account at ~4 provider calls per second of pure decline traffic and
-	// 12,123 give-ups in two hours, while 90 slots sat idle throughout.
-	//
-	// I wrote "admit exactly what is free" deliberately, reasoning that
-	// admitting fewer would leave capacity unused. That is correct against a
-	// provider with no rate limit and wrong against every real one.
-	//
-	// A CONSTANT, not a knob. This controller is only the backstop — the
-	// primary path admits the instant a slot frees, as an event it witnesses —
-	// so it needs to catch up steadily rather than immediately. At this rate a
-	// fully idle hundred-slot account refills in a few minutes, which nobody
-	// can perceive, and no burst can become the thing that stops its own adds
-	// from landing.
-	admit := min(free, capacityAdmissionBatch)
-	m.logger.Debug().
+	// The cost is that a permissive provider is paced at a strict one's rate
+	// while both are eligible. Acceptable here because the slot ceiling binds
+	// first in practice (AllDebrid allows 30 active magnets against a 600
+	// req/min allowance), and being conservative errs toward the failure mode
+	// that costs nothing — a slightly slower refill — rather than the one that
+	// cost 12,123 give-ups.
+	admit := -1
+	now := time.Now()
+	for _, name := range eligible {
+		permit := m.addPace.take(name, free, now)
+		if admit < 0 || permit < admit {
+			admit = permit
+		}
+	}
+	if admit <= 0 {
+		// Budget spent for now. Not a failure and nothing is dropped: the next
+		// tick will have tokens again.
+		return
+	}
+
+	ev := m.logger.Debug().
 		Int("held", held).
 		Int("free", free).
-		Int("admitting", admit).
-		Msg("Capacity admission: provider capacity available; admitting a bounded batch of held entries")
+		Int("admitting", admit)
+	for _, name := range eligible {
+		budget, current := m.addPace.rates(name)
+		ev = ev.Str("rate_"+name, fmt.Sprintf("%.0f/%.0f per min", current, budget))
+	}
+	ev.Msg("Capacity admission: provider capacity available; admitting what the add-rate budget allows")
 	m.releaseHeldForCapacity(admit)
 }
-
-// capacityAdmissionBatch caps how many held entries one admission tick may
-// release, regardless of how much capacity the provider reports.
-const capacityAdmissionBatch = 5

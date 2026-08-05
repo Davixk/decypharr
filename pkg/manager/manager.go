@@ -59,6 +59,11 @@ type Manager struct {
 	// declines parks a hash that just failed, so the admission controller stops
 	// re-offering it every tick.
 	declines *declineLedger
+	// addPace paces admissions against each provider's DOCUMENTED request budget
+	// and backs off adaptively when the provider says we are pushing too hard.
+	// Replaces a flat constant that was identical for providers whose published
+	// limits differ by more than 2x.
+	addPace *addPacer
 	arr             *arr.Storage
 	logger       zerolog.Logger
 	ready        chan struct{}
@@ -224,6 +229,7 @@ func New() *Manager {
 		pendingAdds:            newPendingAddLedger(),
 		reconcileList:          newReconcileListing(),
 		declines:               newDeclineLedger(),
+		addPace:                newAddPacer(),
 		capacityHold:           newCapacityHoldQueue(),
 		logger:                 _logger,
 		migrationJobs:          xsync.NewMap[string, *storage.SwitcherJob](),

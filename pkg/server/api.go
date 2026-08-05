@@ -716,10 +716,28 @@ func (s *Server) applyConfigUpdate(w http.ResponseWriter, r *http.Request, mode 
 	// Only restart when a field that needs it actually changed (HTTP bind,
 	// debrid/usenet clients, or the mount). For everything else, apply the new
 	// config live so users aren't disrupted by a full restart on every save.
-	restarted := config.Get().RequiresRestart(&newConfig)
-	if restarted {
+	//
+	// ⚠️ THE RESPONSE REPORTS AN INTENT, NOT AN OUTCOME, AND THE NAMES MUST SAY SO.
+	//
+	// The restart is dispatched to a goroutine, so at the moment this response is
+	// written nothing has restarted yet — and if s.Restart() fails, nothing ever
+	// will. Reporting `"restarted": true` told the UI a restart had HAPPENED and
+	// was the only signal it had; a failed restart was indistinguishable from a
+	// successful one, which is how a config change could appear applied while the
+	// old one was still live.
+	//
+	// `restart_required` is the honest claim: this config change needs a restart
+	// and one has been dispatched. The old key is still emitted with the same
+	// value so an older UI keeps working.
+	restartRequired := config.Get().RequiresRestart(&newConfig)
+	restartDispatched := restartRequired && s.CanRestart()
+	if restartRequired && !restartDispatched {
+		s.logger.Error().Msg("This configuration change needs a restart, but no restart function is " +
+			"set — the saved config is on disk and the RUNNING config is still the old one")
+	}
+	if restartDispatched {
 		go s.Restart()
-	} else {
+	} else if !restartRequired {
 		config.Get().ApplyRuntime(&newConfig)
 		// Only expose Arr policy changes after the complete configuration is
 		// durably saved and applied. A failed write must never enable cleanup.
@@ -732,7 +750,16 @@ func (s *Server) applyConfigUpdate(w http.ResponseWriter, r *http.Request, mode 
 		}
 	}
 
-	utils.JSONResponse(w, map[string]any{"status": "success", "restarted": restarted}, http.StatusOK)
+	utils.JSONResponse(w, map[string]any{
+		"status":           "success",
+		"restart_required": restartRequired,
+		"restarting":       restartDispatched,
+		// Retained for older UI builds, which read this key to decide whether to
+		// wait for the server to come back. It tracks `restarting`, not
+		// `restart_required`: a client must not sit waiting for a restart that
+		// was never dispatched.
+		"restarted": restartDispatched,
+	}, http.StatusOK)
 }
 
 func (s *Server) handleGetRepairConfig(w http.ResponseWriter, r *http.Request) {
@@ -1101,6 +1128,28 @@ func (s *Server) handleDebridClients(w http.ResponseWriter, r *http.Request) {
 // the registry, or fallback being off on the runtime arr.
 func (s *Server) handleDebridChain(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, s.manager.DiagnoseDebridChain(chi.URLParam(r, "arr")), http.StatusOK)
+}
+
+// handleProviderUnclaimedDump returns the COMPLETE provider-vs-local picture.
+//
+// /api/stats carries provider_divergence: counts plus a 50-item sample. That is
+// the right shape for a health signal and the wrong shape for reconciling — you
+// cannot fix 800 strays from a sample of 50. This returns every item on both
+// sides, with per-row `claimed_by` (queue / main / both / none) and
+// `slot_consuming` on activeCount semantics.
+//
+// ⚠️ READ-ONLY BY DESIGN, NOT BY OMISSION. It deletes nothing and claims
+// nothing. Unclaimed provider items are never auto-pruned, because "we have no
+// local record" is an ABSENCE, and on a shared provider account that absence is
+// somebody else's live download. Every action this enables is the operator's,
+// taken deliberately and outside decypharr.
+func (s *Server) handleProviderUnclaimedDump(w http.ResponseWriter, r *http.Request) {
+	report, err := s.manager.ProviderDumpReport()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, report, http.StatusOK)
 }
 
 // handleQueueConsistency reconciles queue index membership against a full scan.

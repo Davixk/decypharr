@@ -89,7 +89,7 @@ func TestAStaleSnapshotCannotConfirmAbsence(t *testing.T) {
 	snapshotAt := time.Now()
 
 	// A snapshot exists and is within its TTL, but it predates this submission.
-	r.byHash["rd"] = map[string]string{}
+	r.byHash["rd"] = map[string][]providerMatch{}
 	r.fetched["rd"] = snapshotAt
 
 	submittedAt := snapshotAt.Add(5 * time.Second)
@@ -112,23 +112,70 @@ func TestAStaleSnapshotCannotConfirmAbsence(t *testing.T) {
 func TestAStaleSnapshotStillConfirmsPresence(t *testing.T) {
 	r := newReconcileListing()
 	snapshotAt := time.Now()
-	r.byHash["rd"] = map[string]string{reconcileHash: "TRANSFER-1"}
+	r.byHash["rd"] = map[string][]providerMatch{reconcileHash: {{id: "TRANSFER-1"}}}
 	r.fetched["rd"] = snapshotAt
 
-	id, known := r.fromCacheLocked("rd", reconcileHash, snapshotAt.Add(5*time.Second), snapshotAt.Add(6*time.Second))
-	if !known || id != "TRANSFER-1" {
-		t.Fatalf("id=%q known=%v; presence in any snapshot proves the add landed", id, known)
+	matches, known := r.fromCacheLocked("rd", reconcileHash, snapshotAt.Add(5*time.Second), snapshotAt.Add(6*time.Second))
+	if !known || len(matches) != 1 || matches[0].id != "TRANSFER-1" {
+		t.Fatalf("matches=%+v known=%v; presence in any snapshot proves the add landed", matches, known)
 	}
 }
 
 func TestAnExpiredSnapshotAnswersNothing(t *testing.T) {
 	r := newReconcileListing()
 	at := time.Now()
-	r.byHash["rd"] = map[string]string{reconcileHash: "TRANSFER-1"}
+	r.byHash["rd"] = map[string][]providerMatch{reconcileHash: {{id: "TRANSFER-1"}}}
 	r.fetched["rd"] = at
 
 	if _, known := r.fromCacheLocked("rd", reconcileHash, at, at.Add(reconcileListingTTL)); known {
 		t.Fatal("a snapshot past its TTL must force a re-read")
+	}
+}
+
+// ONE INFOHASH, TWO TRANSFERS — measured live, not theoretical.
+//
+// Pruning RealDebrid strays turned up two hashes each holding two distinct
+// transfer ids; RD does not deduplicate by infohash, so a retried add that
+// landed twice leaves two transfers, each consuming a download slot. "Present →
+// recover THE id" is underspecified in that case, so the choice is pinned here.
+func TestDuplicateTransfersKeepTheMostAdvanced(t *testing.T) {
+	keep, extras := bestMatch([]providerMatch{
+		{id: "F6TVAJLLLRQ6I", progress: 12.5},
+		{id: "T4LOUDQDI76PQ", progress: 87.0},
+	})
+	if keep.id != "T4LOUDQDI76PQ" {
+		t.Fatalf("kept %q; the most-advanced transfer represents real work the provider already did", keep.id)
+	}
+	if len(extras) != 1 || extras[0].id != "F6TVAJLLLRQ6I" {
+		t.Fatalf("extras = %+v, want exactly the losing transfer so it can be released", extras)
+	}
+}
+
+// The tie-break must be STABLE, or two runs against the same account disagree
+// about which transfer is ours and each deletes the other's keeper.
+func TestDuplicateTieBreakIsDeterministic(t *testing.T) {
+	matches := []providerMatch{
+		{id: "ZZZ", progress: 50},
+		{id: "AAA", progress: 50},
+		{id: "MMM", progress: 50},
+	}
+	first, _ := bestMatch(matches)
+	for range 20 {
+		again, _ := bestMatch([]providerMatch{
+			{id: "MMM", progress: 50},
+			{id: "ZZZ", progress: 50},
+			{id: "AAA", progress: 50},
+		})
+		if again.id != first.id {
+			t.Fatalf("tie-break is order-dependent: got %q then %q", first.id, again.id)
+		}
+	}
+}
+
+func TestSingleMatchYieldsNoExtras(t *testing.T) {
+	keep, extras := bestMatch([]providerMatch{{id: "ONLY", progress: 3}})
+	if keep.id != "ONLY" || len(extras) != 0 {
+		t.Fatalf("keep=%+v extras=%+v; the ordinary case must not delete anything", keep, extras)
 	}
 }
 

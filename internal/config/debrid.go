@@ -16,6 +16,17 @@ type Debrid struct {
 	RateLimit                    string   `json:"rate_limit,omitempty"` // 200/minute or 10/second
 	RepairRateLimit              string   `json:"repair_rate_limit,omitempty"`
 	DownloadRateLimit            string   `json:"download_rate_limit,omitempty"`
+	// AddRateLimit paces how fast held entries are OFFERED to this provider,
+	// in adds per unit ("30/minute"). Absent = the researched default for the
+	// provider; see pkg/manager/add_pacer.go for each vendor's published limit
+	// and how the default is derived from it.
+	//
+	// ⚠️ NOT the same thing as RateLimit. RateLimit throttles every HTTP request
+	// decypharr makes; this budgets ADDS specifically, because one add costs
+	// several requests and because a provider's limit is shared with refresh,
+	// availability and enumeration traffic that cannot be paused. Setting this
+	// to the provider's full documented rate WILL trip it.
+	AddRateLimit string `json:"add_rate_limit,omitempty"`
 	Proxy                        string   `json:"proxy,omitempty"`
 	UnpackRar                    bool     `json:"unpack_rar,omitempty"`
 	// MinimumFreeSlot reserves N of this provider's concurrent slots for OTHER

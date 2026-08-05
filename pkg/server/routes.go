@@ -79,6 +79,14 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/debrids", s.handleDebridClients)
 			r.Get("/debrids/chain/{arr}", s.handleDebridChain)
 
+			// Full provider-vs-local reconcile dump -- READ-ONLY, and the
+			// complete list rather than the 50-item sample in
+			// /api/stats' provider_divergence. Expensive (one full enumeration
+			// per provider plus a scan of both stores), so it is triggered by an
+			// operator, never by a sweep. It changes NO state: decypharr must
+			// never auto-prune unclaimed provider items.
+			r.Get("/debrids/unclaimed", s.handleProviderUnclaimedDump)
+
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)

@@ -520,7 +520,40 @@ func (s *Store) NeedsCompaction() bool {
 	return deadRatio > s.config.CompactionThreshold
 }
 
-// Compact removes deleted entries and rewrites the log
+// compactionYield is a test-only seam, nil in production. It is called at the
+// start of the lock-free rewrite — the exact point where the old implementation
+// held the exclusive lock — so a test can assert that a reader still makes
+// progress there rather than inferring it from timing.
+var compactionYield func()
+
+// Compact removes deleted entries and rewrites the log.
+//
+// ⚠️ THE EXPENSIVE PART RUNS WITHOUT THE STORE LOCK, AND THAT IS THE WHOLE
+// POINT OF THE THREE PHASES BELOW.
+//
+// This used to hold s.mu (the EXCLUSIVE lock) for the entire rewrite: read
+// every live entry off disk, append every one to a new file, then swap. On a
+// large store that is minutes of held write lock, and because it is the write
+// lock, every Get/ForEach/Put waits behind it — the HTTP API included.
+//
+// Measured: a repair sweep (797 dead findings, 13 deletions) spiked the dead
+// ratio, the compaction ticker fired, and decypharr's API went unresponsive for
+// ~2 minutes, producing 420 *arr client errors before recovering on its own. The
+// *arrs depend on that API continuously, so a background housekeeping task must
+// never be able to stall it.
+//
+// The rewrite is safe to do lock-free because THE LOG IS APPEND-ONLY: bytes at
+// an already-written offset never change, and appendLog.ReadAt is a positioned
+// read that takes no lock. So a snapshot of (key -> offset/size) stays readable
+// no matter what concurrent writers append after it.
+//
+//	phase 1  brief RLock  — snapshot the index
+//	phase 2  NO LOCK      — read every snapshotted record, write the new log
+//	phase 3  brief Lock   — copy whatever changed during phase 2, then swap
+//
+// Phase 3 is bounded by the writes that happened DURING the compaction, not by
+// the size of the store, which is what turns an O(store) stall into an O(delta)
+// one.
 func (s *Store) Compact() error {
 	if s.closed.Load() {
 		return ErrStoreClosed
@@ -531,44 +564,42 @@ func (s *Store) Compact() error {
 	}
 	defer s.compacting.Store(false)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// ── phase 1: snapshot ────────────────────────────────────────────────────
+	// Index entries are replaced by Put, never mutated in place, so these
+	// pointers stay valid and describe the record as it was at snapshot time.
+	s.mu.RLock()
+	oldLog := s.log
+	keys := s.index.KeysSortedByOffset()
+	snapshot := make(map[string]*IndexEntry, len(keys))
+	for _, key := range keys {
+		if entry := s.index.Get(key); entry != nil {
+			snapshot[key] = entry
+		}
+	}
+	s.mu.RUnlock()
 
-	// Create new log file
-	newLogPath := s.log.path + ".compact"
+	newLogPath := oldLog.path + ".compact"
 	newLog, err := createAppendLog(newLogPath)
 	if err != nil {
 		return fmt.Errorf("failed to create compaction log: %w", err)
 	}
+	abort := func(format string, err error) error {
+		_ = newLog.Close()
+		_ = os.Remove(newLogPath)
+		return fmt.Errorf(format, err)
+	}
 
-	// Write all live entries to new log
-	newIndex := newIndex()
-	keys := s.index.KeysSortedByOffset()
-
-	for _, key := range keys {
-		entry := s.index.Get(key)
-		if entry == nil {
-			continue
-		}
-
-		// Read value from old log
-		value, err := s.log.ReadAt(entry.Offset, entry.Size)
+	copyRecord := func(target *appendLog, dst *Index, src *appendLog, key string, entry *IndexEntry) error {
+		value, err := src.ReadAt(entry.Offset, entry.Size)
 		if err != nil {
-			_ = newLog.Close()
-			_ = os.Remove(newLogPath)
 			return fmt.Errorf("failed to read during compaction: %w", err)
 		}
-
-		// Write to new log
-		offset, size, err := newLog.Append(key, value, false, entry.Category, entry.Provider, entry.Status, entry.Name, entry.TotalSize, entry.Protocol, entry.Bad, entry.AddedOn)
+		offset, size, err := target.Append(key, value, false, entry.Category, entry.Provider,
+			entry.Status, entry.Name, entry.TotalSize, entry.Protocol, entry.Bad, entry.AddedOn)
 		if err != nil {
-			_ = newLog.Close()
-			_ = os.Remove(newLogPath)
 			return fmt.Errorf("failed to write during compaction: %w", err)
 		}
-
-		// Update new index
-		newIndex.Put(key, &IndexEntry{
+		dst.Put(key, &IndexEntry{
 			Offset:    offset,
 			Size:      size,
 			Category:  entry.Category,
@@ -580,19 +611,63 @@ func (s *Store) Compact() error {
 			Bad:       entry.Bad,
 			AddedOn:   entry.AddedOn,
 		})
+		return nil
 	}
 
-	// Sync new log
+	// ── phase 2: the bulk copy, holding NOTHING ──────────────────────────────
+	if compactionYield != nil {
+		compactionYield()
+	}
+	newIndex := newIndex()
+	for _, key := range keys {
+		entry := snapshot[key]
+		if entry == nil {
+			continue
+		}
+		if err := copyRecord(newLog, newIndex, oldLog, key, entry); err != nil {
+			return abort("%w", err)
+		}
+	}
+
+	// ── phase 3: catch up and swap, under the exclusive lock ──────────────────
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Anything written while phase 2 ran has a different offset than the
+	// snapshot (or no snapshot entry at all) and must be copied now. Anything
+	// deleted while phase 2 ran is absent from the live index and is dropped.
+	live := make(map[string]struct{}, len(snapshot))
+	var catchUpErr error
+	caughtUp := 0
+	_ = s.index.ForEach(func(key string, entry *IndexEntry) error {
+		if catchUpErr != nil || entry == nil {
+			return nil
+		}
+		live[key] = struct{}{}
+		if prev, ok := snapshot[key]; ok && prev.Offset == entry.Offset && prev.Size == entry.Size {
+			return nil // unchanged since the snapshot; already copied
+		}
+		if err := copyRecord(newLog, newIndex, s.log, key, entry); err != nil {
+			catchUpErr = err
+			return nil
+		}
+		caughtUp++
+		return nil
+	})
+	if catchUpErr != nil {
+		return abort("%w", catchUpErr)
+	}
+	for key := range snapshot {
+		if _, ok := live[key]; !ok {
+			newIndex.Delete(key)
+		}
+	}
+
 	if err := newLog.Sync(); err != nil {
-		_ = newLog.Close()
-		_ = os.Remove(newLogPath)
-		return fmt.Errorf("failed to sync compaction log: %w", err)
+		return abort("failed to sync compaction log: %w", err)
 	}
 
-	// Swap logs
-	oldLog := s.log
 	oldPath := oldLog.path
-
 	s.log = newLog
 	s.index = newIndex
 	s.cache.Clear()
@@ -604,6 +679,10 @@ func (s *Store) Compact() error {
 	s.log.path = oldPath
 
 	s.stats.Compactions.Add(1)
+	if caughtUp > 0 {
+		s.logger.Debug().Int("caught_up", caughtUp).Int("live", len(live)).
+			Msg("Compaction copied records written while it ran")
+	}
 
 	return nil
 }
