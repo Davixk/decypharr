@@ -22,14 +22,25 @@ const stallPruneSweepInterval = "5m"
 // Anything unparseable resolves to "stage disabled" rather than to a default —
 // for a destructive feature, an unreadable setting must mean do nothing.
 type stallPruneSettings struct {
-	noProgressAfter time.Duration // stage 1; 0 = disabled
-	maxETA          time.Duration // stage 2; 0 = disabled
-	minAge          time.Duration // stage 2 grace period
-	maxPerSweep     int
+	// sampleWindow is BOTH the warm-up before a verdict is possible and the
+	// window the speed is averaged over — they are the same thing. See
+	// config.StallPruneConfig.
+	sampleWindow time.Duration
+	maxETA       time.Duration
+	// maxDownloading is the hard failsafe. 0 = none configured.
+	maxDownloading time.Duration
+	maxPerSweep    int
+	// misconfigured records WHY the feature refused to arm, so a sweep can say
+	// so rather than looking idle. A destructive feature that silently declines
+	// to run is the same class of problem as one that silently runs.
+	misconfigured string
 }
 
+// enabled requires BOTH the window and the ceiling. The test is meaningless
+// without either: no window means no trustworthy speed, no ceiling means
+// nothing to judge the ETA against.
 func (s stallPruneSettings) enabled() bool {
-	return s.noProgressAfter > 0 || s.maxETA > 0
+	return s.misconfigured == "" && s.maxETA > 0 && s.sampleWindow > 0
 }
 
 func resolveStallPruneSettings(cfg config.StallPruneConfig) stallPruneSettings {
@@ -45,42 +56,59 @@ func resolveStallPruneSettings(cfg config.StallPruneConfig) stallPruneSettings {
 	}
 
 	s := stallPruneSettings{
-		noProgressAfter: parse(cfg.NoProgressAfter),
-		maxETA:          parse(cfg.MaxETA),
-		minAge:          parse(cfg.MinAge),
-		maxPerSweep:     cfg.MaxPerSweep,
-	}
-	if s.minAge <= 0 {
-		s.minAge = parse(config.DefaultStallPruneMinAge)
+		sampleWindow:   parse(cfg.ETASampleWindow),
+		maxETA:         parse(cfg.MaxETA),
+		maxDownloading: parse(cfg.MaxDownloadingTime),
+		maxPerSweep:    cfg.MaxPerSweep,
 	}
 	if s.maxPerSweep <= 0 {
 		s.maxPerSweep = config.DefaultStallPruneMaxPerSweep
 	}
+
+	// THE FAILSAFE MUST NOT CONTRADICT THE TEST IT BACKS UP.
+	//
+	// A max_downloading_time below sample_window + max_eta would delete
+	// transfers that are still inside the ETA they were explicitly allowed —
+	// the backstop firing before the rule it exists to catch failures of.
+	//
+	// Refusing to arm (rather than clamping to something we invented) is the
+	// same discipline as everywhere else here: for a destructive feature, a
+	// setting we cannot honour must mean DO NOTHING, never "do something
+	// adjusted". It disables this feature only — a media stack should not fail
+	// to boot over one knob — and the sweep reports the reason every pass, so
+	// it cannot be mistaken for an idle account.
+	if s.maxDownloading > 0 && s.sampleWindow > 0 && s.maxETA > 0 {
+		if minimum := s.sampleWindow + s.maxETA; s.maxDownloading < minimum {
+			s.misconfigured = fmt.Sprintf(
+				"max_downloading_time (%s) is below eta_sample_window + max_eta (%s); it would prune "+
+					"transfers still inside the ETA they were allowed. Raise it to at least %s",
+				s.maxDownloading, minimum, minimum)
+		}
+	}
 	return s
 }
 
-// prunableReason reports why an entry should be deleted, or "" to keep it.
+// prunableReason reports why a locally-tracked entry should be failed, or ""
+// to keep it.
 //
-// TWO STAGES, AND THE FIRST IS THE ONE TO TRUST.
+// ONE TEST: the failsafe, then the ETA.
 //
-// Stage 1 — zero bytes for a window. Progress is MONOTONIC, so "0 now, added
-// an hour ago" already proves zero bytes across that entire hour: no sampling,
-// no buffer, no window state. Seeders are deliberately not consulted, because
-// if seeders had been present and useful, bytes would have moved. Progress
-// measures the outcome; the seeder count is only a proxy for it.
+// The stall detector that used to live here is GONE. It tested "has this moved
+// zero bytes since it was added", which nobody ever asked for — it was invented
+// in the first version of this feature and then reasoned about for days as
+// though it were a requirement. A transfer that has stopped is caught by the
+// ETA being infinite; it needs no separate rule.
 //
-// Stage 2 — projected completion beyond MaxETA, computed from the LIFETIME
-// AVERAGE. Weaker on purpose: some genuinely slow torrents do finish, and this
-// stage cannot distinguish them. It uses the average rather than the
-// instantaneous rate so a dead torrent that briefly spikes cannot look healthy,
-// and it will not act before MinAge because an average over a few seconds
-// projects to an absurd ETA and would delete every new torrent on arrival.
-//
-// Both stages only ever consider entries the PROVIDER reports as downloading —
-// a queued entry has not been given a chance to move bytes, and pruning it
-// would punish provider-side queueing rather than a stall.
+// Only entries the PROVIDER reports as downloading are considered — a queued
+// entry has not been given a chance to move bytes, and pruning it would punish
+// provider-side queueing rather than a genuine failure to progress.
 //
 // Torrents only. A usenet entry has no swarm and has its own add-time gate.
+//
+// NOTE this local sweep still projects from the LIFETIME average, because a
+// local entry carries no sample history. The provider-sourced sweep measures
+// speed over the sample window and is strictly better informed; see
+// provider_prune.go.
 func prunableReason(e *storage.Entry, s stallPruneSettings, now time.Time) string {
 	if e == nil || !s.enabled() {
 		return ""
@@ -97,23 +125,31 @@ func prunableReason(e *storage.Entry, s stallPruneSettings, now time.Time) strin
 	}
 	age := now.Sub(e.AddedOn)
 
-	// Stage 1: zero bytes for the whole window.
-	if s.noProgressAfter > 0 && e.Progress <= 0 && age >= s.noProgressAfter {
-		return fmt.Sprintf("no bytes transferred in %s", age.Round(time.Minute))
+	// The failsafe. Needs no measurement at all, which is why it is first and
+	// why it still works when nothing else can be computed.
+	if s.maxDownloading > 0 && age >= s.maxDownloading {
+		return fmt.Sprintf("has been downloading for %s, over the %s hard limit",
+			age.Round(time.Minute), s.maxDownloading)
 	}
 
-	// Stage 2: projected completion beyond the ceiling, at the average rate.
-	if s.maxETA > 0 && age >= s.minAge {
-		eta := e.ETAAtAverageSpeed()
-		// EtaUnknown means "no rate to extrapolate from". For an entry old
-		// enough to judge that is a stall, but it is stage 1's call to make,
-		// not stage 2's — stage 2 refuses to invent a projection it does not
-		// have. If stage 1 is disabled, such an entry is kept.
-		if eta != storage.EtaUnknown && time.Duration(eta)*time.Second > s.maxETA {
-			return fmt.Sprintf("projected %s to complete at its average rate of %s/s, over the %s ceiling",
-				(time.Duration(eta) * time.Second).Round(time.Minute),
-				utils.FormatSize(e.AverageSpeed()), s.maxETA)
-		}
+	// Below the sampling window there is NO VERDICT — not "probably fine", but
+	// "we do not yet have the data to compute one".
+	if age < s.sampleWindow {
+		return ""
+	}
+
+	eta := e.ETAAtAverageSpeed()
+	if eta == storage.EtaUnknown {
+		// Nothing to extrapolate from: no bytes have moved at all. Past the
+		// sampling window that IS an infinite ETA, and infinite is over any
+		// ceiling.
+		return fmt.Sprintf("no measurable rate after %s, so it will not complete",
+			age.Round(time.Minute))
+	}
+	if time.Duration(eta)*time.Second > s.maxETA {
+		return fmt.Sprintf("projected %s to complete at %s/s, over the %s ceiling",
+			(time.Duration(eta) * time.Second).Round(time.Minute),
+			utils.FormatSize(e.AverageSpeed()), s.maxETA)
 	}
 	return ""
 }

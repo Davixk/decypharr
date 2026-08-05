@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -10,25 +9,24 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
-// Two stages, and they fail in different directions.
+// ONE TEST: the failsafe, then the ETA.
 //
-// Stage 1 (zero bytes for a window) is the trustworthy one: progress is
-// monotonic, so the window needs no sampling and the verdict is not an
-// estimate. Stage 2 (projected ETA over a ceiling) is a projection and can be
-// wrong about a slow torrent that would have finished — which is why it is
-// separately configurable, separately disabled by default, and refuses to act
-// before the average means anything.
+// The stall detector that used to live here is gone. It asked "has this moved
+// zero bytes since it was added", which nobody ever specified — it was invented
+// in the first version of this feature and then reasoned about for days as
+// though it were a requirement. A stopped transfer is caught by an infinite
+// ETA and needs no separate rule.
 //
-// The tests below mostly guard against the two ways this feature could delete
-// something it should not: acting on a fluctuating input, and acting before
-// there is enough evidence.
+// The sampling window is NOT a grace period against stalls. It is the point
+// before which no verdict exists, because torrent speeds float constantly and a
+// reading taken over a few seconds is noise.
 
 func stallSettings(mods func(*stallPruneSettings)) stallPruneSettings {
 	s := stallPruneSettings{
-		noProgressAfter: time.Hour,
-		maxETA:          24 * time.Hour,
-		minAge:          30 * time.Minute,
-		maxPerSweep:     25,
+		sampleWindow:   30 * time.Minute,
+		maxETA:         24 * time.Hour,
+		maxDownloading: 48 * time.Hour,
+		maxPerSweep:    25,
 	}
 	if mods != nil {
 		mods(&s)
@@ -53,91 +51,97 @@ func stallEntry(mods func(*storage.Entry)) *storage.Entry {
 	return e
 }
 
-// --- stage 1 -------------------------------------------------------------
-
-func TestStage1PrunesZeroBytesOverTheWindow(t *testing.T) {
-	if prunableReason(stallEntry(nil), stallSettings(nil), time.Now()) == "" {
-		t.Fatal("a torrent the provider calls 'downloading' with zero bytes after 2h must be prunable")
-	}
-}
-
-// Seeders must not enter the predicate in either direction. A stalled torrent
-// reporting seeders is still stalled — if those seeders were useful, bytes
-// would have moved — and a moving torrent reporting none is still moving.
-func TestSeedersAreNotPartOfThePredicate(t *testing.T) {
-	withSeeders := stallEntry(func(e *storage.Entry) { e.Seeders = 12 })
-	if prunableReason(withSeeders, stallSettings(nil), time.Now()) == "" {
-		t.Fatal("seeders must not rescue an entry that moved zero bytes for the window")
-	}
-
-	// Moving fast, no seeders reported, young enough that stage 2 cannot act.
-	moving := stallEntry(func(e *storage.Entry) {
-		e.Seeders = 0
-		e.Progress = 0.9
-		e.AddedOn = time.Now().Add(-10 * time.Minute)
-	})
-	if got := prunableReason(moving, stallSettings(nil), time.Now()); got != "" {
-		t.Fatalf("reason = %q: a transferring entry must never be pruned, whatever its seeder count says", got)
-	}
-}
-
-func TestStage1DoesNotActBeforeItsWindow(t *testing.T) {
+// TestNoVerdictInsideTheSamplingWindow. Zero progress is the NORMAL state of a
+// transfer that has just started, and the window exists precisely because a
+// measurement taken this early means nothing.
+func TestNoVerdictInsideTheSamplingWindow(t *testing.T) {
 	fresh := stallEntry(func(e *storage.Entry) { e.AddedOn = time.Now().Add(-5 * time.Minute) })
 	if got := prunableReason(fresh, stallSettings(nil), time.Now()); got != "" {
-		t.Fatalf("reason = %q, want empty: zero progress is the NORMAL state of a recent add, and the "+
-			"window is the entire diagnostic content", got)
+		t.Fatalf("reason = %q; inside the sampling window there is no verdict to reach", got)
 	}
 }
 
-// --- stage 2 -------------------------------------------------------------
+// TestNoMeasurableRateIsAnInfiniteETA: past the window, a transfer that has
+// moved nothing has an infinite ETA, and infinite exceeds any ceiling. This is
+// the case the deleted stall detector used to claim as its own.
+func TestNoMeasurableRateIsAnInfiniteETA(t *testing.T) {
+	dead := stallEntry(nil) // 2h old, zero progress
+	if got := prunableReason(dead, stallSettings(nil), time.Now()); got == "" {
+		t.Fatal("a transfer with no measurable rate after 2h must be pruned by the ETA test")
+	}
+}
 
-// A torrent crawling badly enough to project past the ceiling is prunable — but
-// the projection must use the LIFETIME AVERAGE, so a momentary spike cannot
-// make a dead torrent look healthy.
-func TestStage2PrunesOnProjectedETAUsingTheAverage(t *testing.T) {
-	// 1 GB, 1% done over 2h => ~1.4 KB/s average => ~200h remaining.
+// TestSlowTransferPrunesOnProjectedETA — the ordinary case the feature exists
+// for, and the reason the projection uses an average rather than the
+// instantaneous rate.
+func TestSlowTransferPrunesOnProjectedETA(t *testing.T) {
+	// 1 GB, 1% done over 2h => ~1.4 KB/s => ~200h remaining, over a 24h ceiling.
 	crawling := stallEntry(func(e *storage.Entry) {
 		e.Size = 1_000_000_000
 		e.Progress = 0.01
-		e.Speed = 50_000_000 // instantaneous burst that would project ~20s
+		e.Speed = 50_000_000 // an instantaneous burst that would project ~20s
 	})
-
-	// Stage 1 must not be what fires here: there IS progress.
-	stage2Only := stallSettings(func(s *stallPruneSettings) { s.noProgressAfter = 0 })
-	if prunableReason(crawling, stage2Only, time.Now()) == "" {
-		t.Fatal("a torrent projecting ~200h at its average rate must exceed a 24h ceiling — using the " +
-			"instantaneous 50 MB/s burst instead would have called it 20 seconds from done")
+	if prunableReason(crawling, stallSettings(nil), time.Now()) == "" {
+		t.Fatal("a transfer projecting ~200h must exceed a 24h ceiling — reading the instantaneous " +
+			"50 MB/s burst instead would have called it 20 seconds from done")
 	}
 }
 
-// The grace period is what stops every new torrent being deleted on arrival: a
-// lifetime average over a few seconds projects to an absurd ETA.
-func TestStage2WaitsForTheAverageToMeanSomething(t *testing.T) {
-	newborn := stallEntry(func(e *storage.Entry) {
+// TestHealthyTransferSurvives is the mirror: a suite that only proves it prunes
+// would pass on an implementation that prunes everything.
+func TestHealthyTransferSurvives(t *testing.T) {
+	healthy := stallEntry(func(e *storage.Entry) {
 		e.Size = 1_000_000_000
-		e.Progress = 0.0001
-		e.AddedOn = time.Now().Add(-20 * time.Second)
+		e.Progress = 0.75 // 750 MB in 2h => ~104 KB/s => ~40min remaining
 	})
-	stage2Only := stallSettings(func(s *stallPruneSettings) { s.noProgressAfter = 0 })
-
-	if got := prunableReason(newborn, stage2Only, time.Now()); got != "" {
-		t.Fatalf("reason = %q: a 20-second-old torrent projects absurdly and must be protected by MinAge", got)
+	if got := prunableReason(healthy, stallSettings(nil), time.Now()); got != "" {
+		t.Fatalf("reason = %q; this transfer finishes comfortably inside the ceiling", got)
 	}
 }
 
-// An unknown ETA is not stage 2's verdict to make. Zero rate means "nothing to
-// extrapolate from", which is stage 1's question; stage 2 must not invent a
-// projection it does not have.
-func TestStage2DoesNotActOnAnUnknownETA(t *testing.T) {
-	stalled := stallEntry(nil) // zero progress => average 0 => EtaUnknown
-	stage2Only := stallSettings(func(s *stallPruneSettings) { s.noProgressAfter = 0 })
-
-	if got := prunableReason(stalled, stage2Only, time.Now()); got != "" {
-		t.Fatalf("reason = %q: with stage 1 disabled, an unknown ETA must not be treated as an infinite one", got)
+// TestFailsafePrunesRegardlessOfETA. The backstop needs no measurement at all,
+// which is why it still works when nothing else can be computed.
+func TestFailsafePrunesRegardlessOfETA(t *testing.T) {
+	ancient := stallEntry(func(e *storage.Entry) {
+		e.Size = 1_000_000_000
+		e.Progress = 0.99 // healthy by every other measure
+		e.AddedOn = time.Now().Add(-72 * time.Hour)
+	})
+	if got := prunableReason(ancient, stallSettings(nil), time.Now()); got == "" {
+		t.Fatal("72h exceeds the 48h hard limit and must prune whatever the ETA says")
 	}
 }
 
-// --- shared guards -------------------------------------------------------
+// TestFailsafeMustNotContradictTheTestItBacksUp: a max_downloading_time below
+// sample_window + max_eta would delete transfers still inside the ETA they were
+// explicitly allowed — the backstop firing before the rule it exists to catch
+// failures of. The feature refuses to arm rather than doing that, and refuses
+// rather than clamping to a number we invented.
+func TestFailsafeMustNotContradictTheTestItBacksUp(t *testing.T) {
+	bad := resolveStallPruneSettings(config.StallPruneConfig{
+		ETASampleWindow:    "38m",
+		MaxETA:             "16h",
+		MaxDownloadingTime: "2h", // below 38m + 16h
+	})
+	if bad.misconfigured == "" {
+		t.Fatal("a failsafe below sample_window + max_eta must be refused, not silently clamped")
+	}
+	if bad.enabled() {
+		t.Fatal("a misconfigured stall prune must not arm")
+	}
+	if got := prunableReason(stallEntry(nil), bad, time.Now()); got != "" {
+		t.Fatalf("reason = %q from a refused configuration", got)
+	}
+
+	ok := resolveStallPruneSettings(config.StallPruneConfig{
+		ETASampleWindow:    "38m",
+		MaxETA:             "16h",
+		MaxDownloadingTime: "24h",
+	})
+	if ok.misconfigured != "" || !ok.enabled() {
+		t.Fatalf("a valid configuration was refused: %q", ok.misconfigured)
+	}
+}
 
 func TestNeverPrunesWhatItCannotJudge(t *testing.T) {
 	cases := []struct {
@@ -166,85 +170,45 @@ func TestNeverPrunesWhatItCannotJudge(t *testing.T) {
 	}
 }
 
-func TestBothStagesDisabledPrunesNothing(t *testing.T) {
-	off := stallSettings(func(s *stallPruneSettings) {
-		s.noProgressAfter = 0
-		s.maxETA = 0
+// TestBothKnobsRequired: the test is meaningless without either. No window
+// means no trustworthy speed; no ceiling means nothing to judge against.
+func TestBothKnobsRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  config.StallPruneConfig
+	}{
+		{"nothing set", config.StallPruneConfig{}},
+		{"window only", config.StallPruneConfig{ETASampleWindow: "38m"}},
+		{"ceiling only", config.StallPruneConfig{MaxETA: "16h"}},
+		{"unparseable", config.StallPruneConfig{ETASampleWindow: "nonsense", MaxETA: "also-nonsense"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := resolveStallPruneSettings(tc.cfg)
+			if s.enabled() {
+				t.Fatal("stall pruning armed without both a sampling window and a ceiling")
+			}
+			if got := prunableReason(stallEntry(nil), s, time.Now()); got != "" {
+				t.Fatalf("reason = %q while disabled", got)
+			}
+		})
+	}
+}
+
+// TestSeedersAreNotConsulted. A seeder count is a proxy; the ETA measures the
+// outcome directly. This pins that no seeder logic crept back into the sweep —
+// the grab-time gate is a separate feature with its own knob.
+func TestSeedersAreNotConsulted(t *testing.T) {
+	withSeeders := stallEntry(func(e *storage.Entry) { e.Seeders = 12 })
+	if prunableReason(withSeeders, stallSettings(nil), time.Now()) == "" {
+		t.Fatal("seeders must not rescue a transfer with no measurable rate")
+	}
+
+	healthy := stallEntry(func(e *storage.Entry) {
+		e.Size = 1_000_000_000
+		e.Progress = 0.75
+		e.Seeders = 0
 	})
-	if got := prunableReason(stallEntry(nil), off, time.Now()); got != "" {
-		t.Fatalf("reason = %q: with every stage disabled nothing may be deleted", got)
-	}
-}
-
-// --- configuration -------------------------------------------------------
-
-// For a destructive feature an unreadable setting must mean "do nothing", never
-// "fall back to a default". This is the opposite of how the rest of the config
-// resolves, and it is deliberate.
-func TestUnparseableThresholdsDisableTheirStage(t *testing.T) {
-	s := resolveStallPruneSettings(config.StallPruneConfig{
-		NoProgressAfter: "not-a-duration",
-		MaxETA:          "also-nonsense",
-	})
-	if s.enabled() {
-		t.Fatal("unparseable thresholds must disable their stages, not resolve to a guessed default")
-	}
-	if got := prunableReason(stallEntry(nil), s, time.Now()); got != "" {
-		t.Fatalf("reason = %q, want empty", got)
-	}
-}
-
-func TestEmptyConfigIsFullyDisabled(t *testing.T) {
-	if resolveStallPruneSettings(config.StallPruneConfig{}).enabled() {
-		t.Fatal("stall pruning must be off unless explicitly configured — it deletes data")
-	}
-}
-
-func TestOmittedSafetyKnobsGetDefaultsRatherThanZero(t *testing.T) {
-	s := resolveStallPruneSettings(config.StallPruneConfig{MaxETA: "24h"})
-
-	if s.minAge <= 0 {
-		t.Fatal("MinAge must default rather than resolve to 0: a zero grace period deletes every new " +
-			"torrent on arrival, because a lifetime average over seconds projects absurdly")
-	}
-	if s.maxPerSweep <= 0 {
-		t.Fatal("MaxPerSweep must default rather than resolve to 0")
-	}
-	if s.noProgressAfter != 0 {
-		t.Fatal("stage 1 must stay disabled when only MaxETA was configured — stages are independent")
-	}
-}
-
-// The operator's requirement, in his words: "if you just PRUNE it without
-// reporting it as FAILED, the arr doesnt see a failure and can't react to it."
-//
-// An earlier version of this feature called DeleteEntry, which freed the
-// provider slot and told the arr nothing. The arr kept a queue row for a
-// download that no longer existed anywhere, believed it was still progressing,
-// and would never re-grab — turning a stalled torrent into a permanently
-// missing episode. That is worse than leaving the stall in place, because a
-// stall is at least visible.
-//
-// MarkAsError is the path every other failure in decypharr takes to reach the
-// arr: it sets EntryStateError, which the qBittorrent shim reports as state
-// "error". This asserts the entry ends up in exactly that state rather than
-// being deleted out from under the arr.
-func TestPrunedEntryIsFailedSoTheArrCanSeeIt(t *testing.T) {
-	entry := stallEntry(nil)
-
-	entry.MarkAsError(fmt.Errorf("stall prune: no bytes transferred in 2h"))
-
-	if entry.State != storage.EntryStateError {
-		t.Fatalf("State = %q, want %q: the qbit shim reports State verbatim, and it is the only signal "+
-			"the arr has that this download failed", entry.State, storage.EntryStateError)
-	}
-	if entry.Status != debridTypes.TorrentStatusError {
-		t.Fatalf("Status = %q, want error", entry.Status)
-	}
-	if entry.LastError == "" {
-		t.Fatal("LastError must record why, or the operator cannot tell a stall prune from any other failure")
-	}
-	if entry.IsDownloading {
-		t.Fatal("a failed entry must not still claim to be downloading")
+	if got := prunableReason(healthy, stallSettings(nil), time.Now()); got != "" {
+		t.Fatalf("reason = %q; a transfer that is moving must not be pruned for reporting no seeders", got)
 	}
 }

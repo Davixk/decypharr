@@ -307,9 +307,9 @@ class ConfigManager {
             const el = document.querySelector(`[name="stall_prune.${key}"]`);
             if (el) el.value = value || '';
         };
-        setStall('no_progress_after', stall.no_progress_after);
+        setStall('eta_sample_window', stall.eta_sample_window);
         setStall('max_eta', stall.max_eta);
-        setStall('min_age', stall.min_age);
+        setStall('max_downloading_time', stall.max_downloading_time);
         setStall('max_per_sweep', stall.max_per_sweep);
 
         // The grab-time seeder gate is its own config block, not part of
@@ -1369,9 +1369,9 @@ class ConfigManager {
             // the form must not substitute a default for a blank field — for a
             // destructive setting, silence has to stay silence.
             stall_prune: {
-                no_progress_after: document.querySelector('[name="stall_prune.no_progress_after"]')?.value?.trim() || "",
+                eta_sample_window: document.querySelector('[name="stall_prune.eta_sample_window"]')?.value?.trim() || "",
                 max_eta: document.querySelector('[name="stall_prune.max_eta"]')?.value?.trim() || "",
-                min_age: document.querySelector('[name="stall_prune.min_age"]')?.value?.trim() || "",
+                max_downloading_time: document.querySelector('[name="stall_prune.max_downloading_time"]')?.value?.trim() || "",
                 max_per_sweep: parseInt(document.querySelector('[name="stall_prune.max_per_sweep"]')?.value) || 0,
             },
             // Comma-separated text fields that reach the backend as arrays. An

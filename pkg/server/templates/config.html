@@ -370,28 +370,28 @@
 
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div>
-                                    <label class="label" for="stall_prune.no_progress_after">
-                                        <span class="font-medium">Delete after no progress for</span>
+                                    <label class="label" for="stall_prune.eta_sample_window">
+                                        <span class="font-medium">Measure speed over</span>
                                     </label>
-                                    <input type="text" class="input w-full" name="stall_prune.no_progress_after"
-                                           id="stall_prune.no_progress_after" placeholder="e.g. 45m &mdash; empty = off">
-                                    <span class="text-sm opacity-70"><strong>Stage 1, the reliable one.</strong> Deletes a torrent that has transferred <em>zero</em> bytes for this long &mdash; not "slow", zero. Don't go below <strong>30m</strong>: AllDebrid prunes its own no-peer magnets at 30 minutes, and anything shorter races it while risking torrents that are merely slow to start.</span>
+                                    <input type="text" class="input w-full" name="stall_prune.eta_sample_window"
+                                           id="stall_prune.eta_sample_window" placeholder="e.g. 38m &mdash; empty = off">
+                                    <span class="text-sm opacity-70">How long a torrent must have been running before its estimated finish time means anything &mdash; and the period that speed is averaged over. <strong>Torrent speeds and peer counts float constantly</strong>, so a reading taken over a few seconds is noise, and this window is what makes the number trustworthy. It is also what stops a brief quiet spell from looking like a dead torrent: a pause is averaged against the rest of the window instead of reading as stopped. Below this age nothing is judged at all.</span>
                                 </div>
                                 <div>
                                     <label class="label" for="stall_prune.max_eta">
                                         <span class="font-medium">Delete if it would take longer than</span>
                                     </label>
                                     <input type="text" class="input w-full" name="stall_prune.max_eta"
-                                           id="stall_prune.max_eta" placeholder="e.g. 24h &mdash; empty = off">
-                                    <span class="text-sm opacity-70"><strong>Stage 2, a projection &mdash; it can be wrong.</strong> Estimates completion from the torrent's <em>average</em> speed since it was added, not its current speed, so a dead torrent that briefly spikes can't look healthy. Some genuinely slow torrents do finish; this cannot tell them apart. Set it from what you actually see, not from intuition.</span>
+                                           id="stall_prune.max_eta" placeholder="e.g. 16h &mdash; empty = off">
+                                    <span class="text-sm opacity-70"><strong>This is the whole test.</strong> Once there is enough speed data, decypharr estimates how long the torrent needs and deletes it if that exceeds this. A dead torrent goes because its estimate is infinite; a trickling one goes because 40 KB/s against 8 GB is 55 hours. Both for the same reason &mdash; there is no separate "stalled" rule.</span>
                                 </div>
                                 <div>
-                                    <label class="label" for="stall_prune.min_age">
-                                        <span class="font-medium">Grace period before estimating</span>
+                                    <label class="label" for="stall_prune.max_downloading_time">
+                                        <span class="font-medium">Hard limit on downloading time</span>
                                     </label>
-                                    <input type="text" class="input w-full" name="stall_prune.min_age"
-                                           id="stall_prune.min_age" placeholder="30m">
-                                    <span class="text-sm opacity-70">Stage 2 only. An average over a few seconds projects to an absurd time-remaining, so without this every new torrent would be deleted on arrival. Stage 1 doesn't need it &mdash; its own window is the grace period.</span>
+                                    <input type="text" class="input w-full" name="stall_prune.max_downloading_time"
+                                           id="stall_prune.max_downloading_time" placeholder="e.g. 24h">
+                                    <span class="text-sm opacity-70">A failsafe: nothing may sit downloading longer than this, whatever its estimate, speed or progress say. It needs no measurement at all, so it still works right after a restart when the speed history is empty. <strong>Must be at least "measure speed over" + "delete if longer than"</strong> &mdash; below that it would delete torrents still inside the time they were explicitly allowed, so decypharr refuses to run the whole feature and says so in the log rather than quietly picking a number for you.</span>
                                 </div>
                                 <div>
                                     <label class="label" for="stall_prune.max_per_sweep">

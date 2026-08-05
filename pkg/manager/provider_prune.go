@@ -90,44 +90,87 @@ func (c providerCandidate) averageSpeed(now time.Time) int64 {
 // nothing.
 type progressTracker struct {
 	mu   sync.Mutex
-	seen map[string]progressObservation
+	seen map[string]sampleSeries
 }
 
+// progressObservation is one reading of how far a transfer had got.
 type progressObservation struct {
 	progress float64
-	// since is when this progress value was FIRST observed, not when it was
-	// last confirmed. That is what makes the elapsed time a stall duration
-	// rather than a sweep interval.
-	since time.Time
+	at       time.Time
 }
 
 func newProgressTracker() *progressTracker {
-	return &progressTracker{seen: map[string]progressObservation{}}
+	return &progressTracker{seen: map[string]sampleSeries{}}
 }
 
-// observe records the current progress and reports how long it has been stuck.
+// sampleSeries is the readings kept for one transfer, oldest first.
+type sampleSeries []progressObservation
+
+// speedOver returns bytes/second measured across the window, and whether the
+// series covers enough of it to be trusted.
 //
-// Returns 0 for anything it has not seen before. A FIRST sighting can never be
-// a stall verdict: we have no idea whether it just started or has been frozen
-// for a day, and guessing would delete live transfers on the first sweep after
-// every restart.
-func (p *progressTracker) observe(key string, progress float64, now time.Time) time.Duration {
+// THE WINDOW IS THE SMOOTHING, and that is the whole reason it exists. Torrent
+// speeds and peer counts float constantly, so a delta between two consecutive
+// sweeps is noise: a swarm that goes quiet for one five-minute window would
+// read as stopped, and under a pure-ETA test that means deleted. Averaged
+// across the window, the same lull moves the number instead of zeroing it,
+// while a genuinely dead transfer still reads zero across every sample.
+//
+// Not trusted until the series actually spans the window. A partial series
+// would answer from a few minutes of data — precisely the untrustworthy
+// reading the window was introduced to prevent.
+func (s sampleSeries) speedOver(window time.Duration, size int64, now time.Time) (int64, bool) {
+	if len(s) < 2 || size <= 0 || window <= 0 {
+		return 0, false
+	}
+	oldest := s[0]
+	newest := s[len(s)-1]
+	if now.Sub(oldest.at) < window {
+		return 0, false
+	}
+	elapsed := newest.at.Sub(oldest.at).Seconds()
+	if elapsed <= 0 {
+		return 0, false
+	}
+	moved := (newest.progress - oldest.progress) * float64(size)
+	if moved <= 0 {
+		// Zero or backwards across the whole window. A real reading of zero,
+		// not an absence of one — the caller may act on it.
+		return 0, true
+	}
+	return int64(moved / elapsed), true
+}
+
+// observe records a reading and returns the series for this transfer, trimmed
+// to the window plus one sample either side of it.
+//
+// Retaining one sample OLDER than the window is deliberate: it is what lets the
+// series span the full window as soon as it possibly can, instead of always
+// measuring slightly less than asked for.
+func (p *progressTracker) observe(key string, progress float64, window time.Duration, now time.Time) sampleSeries {
 	if p == nil || key == "" {
-		return 0
+		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	prior, known := p.seen[key]
-	if !known || progress > prior.progress {
-		// New, or it moved. Either way the clock restarts from now.
-		p.seen[key] = progressObservation{progress: progress, since: now}
-		return 0
+	series := append(p.seen[key], progressObservation{progress: progress, at: now})
+
+	// Drop anything older than the window, keeping the last one that is, so a
+	// full-width measurement is available at the earliest honest moment.
+	cutoff := now.Add(-window)
+	trimAt := 0
+	for i, sample := range series {
+		if sample.at.After(cutoff) {
+			break
+		}
+		trimAt = i
 	}
-	// Unchanged (or, defensively, went backwards — treat that as unchanged
-	// rather than as movement, since a provider reporting less than before is
-	// not evidence of progress).
-	return now.Sub(prior.since)
+	if trimAt > 0 {
+		series = append(sampleSeries(nil), series[trimAt:]...)
+	}
+	p.seen[key] = series
+	return series
 }
 
 // retain drops observations for transfers the provider no longer lists, so the
@@ -148,9 +191,17 @@ func (p *progressTracker) retain(keys map[string]struct{}) {
 // providerPrunableReason reports why a provider-side transfer should be killed,
 // or "" to keep it.
 //
-// stalledFor is how long the provider's own reported progress has been frozen,
-// or 0 when unknown (first sighting, or it is still moving).
-func providerPrunableReason(c providerCandidate, s stallPruneSettings, now time.Time, stalledFor time.Duration) string {
+// ONE TEST — the failsafe, then the ETA. Not a ladder of stages, and not a
+// stall detector: a transfer that has stopped prunes because its ETA is
+// infinite, and one that trickles prunes because its rate will not finish in
+// time. Both fall out of the same question.
+//
+// samples is this transfer's reading history. When it does not yet span the
+// sampling window there is NO VERDICT — the point of the window is that a
+// reading taken over less than it is not trustworthy, and acting on one anyway
+// would defeat the only thing protecting healthy transfers from a momentary
+// lull.
+func providerPrunableReason(c providerCandidate, s stallPruneSettings, now time.Time, samples sampleSeries) string {
 	if !s.enabled() {
 		return ""
 	}
@@ -169,45 +220,47 @@ func providerPrunableReason(c providerCandidate, s stallPruneSettings, now time.
 	}
 	age := c.age(now)
 
-	// Stage 1: zero bytes for the whole window. Progress is monotonic, so
-	// "0 now, added an hour ago" already proves zero across that hour.
-	if s.noProgressAfter > 0 && c.progress <= 0 && age >= s.noProgressAfter {
-		return fmt.Sprintf("provider reports no bytes transferred in %s", age.Round(time.Minute))
+	// THE FAILSAFE, first because it needs no measurement at all.
+	//
+	// The provider's own `added` timestamp is enough, so this still works after
+	// a restart when no samples exist yet — which is exactly when the ETA test
+	// cannot answer. It is the backstop for whatever that test gets wrong.
+	if s.maxDownloading > 0 && age >= s.maxDownloading {
+		return fmt.Sprintf("has been downloading for %s, over the %s hard limit",
+			age.Round(time.Minute), s.maxDownloading)
 	}
 
-	// Stage 1b: NO PROGRESS SINCE WE LAST LOOKED.
-	//
-	// Stage 1 only catches a transfer that never started. It cannot see the
-	// commonest real stall: one that downloaded 76% and then died. Measured on
-	// a live account, 28 transfers sat at speed 0 with progress well above
-	// zero, and neither stage touched them — stage 1 because progress > 0, and
-	// stage 2 because a lifetime average computed over the fast early hours
-	// still projects a comfortable finish.
-	//
-	// That is also what the knob NAME means. "no progress after 38m" reads as
-	// "has not advanced in 38 minutes", not "has never moved at all", and the
-	// operator set it expecting the former.
-	//
-	// This is the one stage that needs memory, and it earns it: the provider
-	// list carries no instantaneous speed, so a delta between observations is
-	// the only honest stall signal available without a per-torrent call.
-	if s.noProgressAfter > 0 && stalledFor > 0 && stalledFor >= s.noProgressAfter {
-		return fmt.Sprintf("provider reports %.1f%% and it has not advanced in %s",
-			c.progress*100, stalledFor.Round(time.Minute))
+	// Below the sampling window: NO VERDICT. Not "probably healthy" — we do not
+	// yet have the data to compute one.
+	if age < s.sampleWindow {
+		return ""
 	}
 
-	// Stage 2: projected completion beyond the ceiling, at the lifetime average.
-	if s.maxETA > 0 && age >= s.minAge {
-		speed := c.averageSpeed(now)
-		remaining := c.size - int64(float64(c.size)*c.progress)
-		if speed > 0 && remaining > 0 {
-			eta := time.Duration(remaining/speed) * time.Second
-			if eta > s.maxETA {
-				return fmt.Sprintf("provider reports %.1f%% after %s, projecting %s to finish at %s/s, over the %s ceiling",
-					c.progress*100, age.Round(time.Minute), eta.Round(time.Minute),
-					utils.FormatSize(speed), s.maxETA)
-			}
-		}
+	speed, trusted := samples.speedOver(s.sampleWindow, c.size, now)
+	if !trusted {
+		// Our own history does not span the window yet, even though the
+		// transfer is old enough. Happens after a restart. Waiting one window
+		// costs nothing; guessing from a lifetime average would flatter a
+		// transfer that died hours ago, which is the whole reason the window
+		// exists.
+		return ""
+	}
+
+	remaining := c.size - int64(float64(c.size)*c.progress)
+	if remaining <= 0 {
+		return ""
+	}
+	if speed <= 0 {
+		// A measured zero across the entire window, not an absent reading.
+		// That is an infinite ETA, and infinite is over any ceiling.
+		return fmt.Sprintf("provider reports %.1f%% and no bytes moved in the last %s, so it will not complete",
+			c.progress*100, s.sampleWindow)
+	}
+	eta := time.Duration(remaining/speed) * time.Second
+	if eta > s.maxETA {
+		return fmt.Sprintf("provider reports %.1f%%, projecting %s to finish at %s/s measured over %s, over the %s ceiling",
+			c.progress*100, eta.Round(time.Minute), utils.FormatSize(speed),
+			s.sampleWindow, s.maxETA)
 	}
 	return ""
 }
@@ -262,6 +315,16 @@ func (m *Manager) providerActiveCandidates(name string, client debrid.Client) ([
 //
 // Returns how many provider slots it released.
 func (m *Manager) pruneProviderStalled(ctx context.Context, settings stallPruneSettings) int {
+	if settings.misconfigured != "" {
+		// LOUD, and every sweep. A destructive feature that silently declines
+		// to run is the same class of problem as one that silently runs — the
+		// operator would see no prunes and no explanation, which is exactly
+		// the state that cost a day of investigation.
+		m.logger.Error().
+			Str("reason", settings.misconfigured).
+			Msg("Stall prune refuses to arm: its configuration would make the failsafe contradict the ETA test")
+		return 0
+	}
 	if !settings.enabled() {
 		return 0
 	}
@@ -289,14 +352,14 @@ func (m *Manager) pruneProviderStalled(ctx context.Context, settings stallPruneS
 		}
 		considered += len(candidates)
 
-		// Feed the stall tracker and drop anything the provider no longer
-		// lists, so it follows the live set.
+		// Record a reading for each transfer and drop anything the provider no
+		// longer lists, so the tracker follows the live set.
 		live := make(map[string]struct{}, len(candidates))
-		stalls := make(map[string]time.Duration, len(candidates))
+		series := make(map[string]sampleSeries, len(candidates))
 		for _, candidate := range candidates {
 			key := candidate.provider + "\x00" + candidate.id
 			live[key] = struct{}{}
-			stalls[key] = m.progress.observe(key, candidate.progress, now)
+			series[key] = m.progress.observe(key, candidate.progress, settings.sampleWindow, now)
 		}
 		m.progress.retain(live)
 
@@ -311,7 +374,7 @@ func (m *Manager) pruneProviderStalled(ctx context.Context, settings stallPruneS
 				return false
 			}
 			reason := providerPrunableReason(candidate, settings, now,
-				stalls[candidate.provider+"\x00"+candidate.id])
+				series[candidate.provider+"\x00"+candidate.id])
 			if reason == "" {
 				continue
 			}
