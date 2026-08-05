@@ -8,6 +8,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/netbind"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // runInitialCalls performs any initial calls of worker functions
@@ -99,7 +100,9 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		} else {
 			// Schedule the job
 			if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
-				err := m.queue.DeleteStalled()
+				err := m.queue.MarkStalledFailed(func(entry *storage.Entry) (bool, error) {
+					return m.markFailedAndPark(entry, "stalled-sweep")
+				})
 				if err != nil {
 					m.logger.Error().Err(err).Msg("Failed to process remove stalled torrents")
 				}

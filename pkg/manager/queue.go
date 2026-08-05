@@ -209,7 +209,6 @@ func (q *Queue) replaceInvisibleDuplicate(infohash string) bool {
 	return true
 }
 
-
 func (q *Queue) GetTorrent(infohash string) (*storage.Entry, error) {
 	return q.storage.GetQueued(infohash)
 }
@@ -382,7 +381,28 @@ func (q *Queue) DeleteWhere(category string, protocol config.Protocol, state sto
 	return errors.Join(errs...)
 }
 
-func (q *Queue) DeleteStalled() error {
+// MarkStalledFailed presents stalled rows as failed downloads and PARKS them.
+//
+// 🔴 IT USED TO DELETE THEM, AND THAT WAS THE ENTIRE DEFECT. Named DeleteStalled,
+// it ran every 60 seconds and removed matching rows with a NIL cleanup — drop the
+// local row, tell nobody. Measured over 24h: 15,004 rows removed against 78 + 13
+// = 91 downloadFailed events at the two *arrs. ~99% of removals informed no one.
+//
+// It also raced the stall prune, which it could not lose: the prune marked a row
+// failed for the *arr to poll, and this sweep deleted that row inside the minute,
+// usually before any *arr looked. The "released the provider slot but could not
+// record the failure" errors were the prune discovering its row had been taken.
+//
+// ⚠️ DECYPHARR IS THE DOWNLOAD CLIENT AND DOES NOT DELETE ITS OWN ROWS. It marks
+// a download failed and leaves it parked; the *arr polls, sees the failure, and
+// does whatever it is configured to do. The row leaves only when the *arr removes
+// it through the shim's delete API. Deletion was never this sweep's to perform,
+// which is why the deletion branches are excised rather than rerouted.
+//
+// The predicate still selects CANDIDATES. Whether a candidate is a statement
+// about the RELEASE — and so may be presented as failed at all — belongs to
+// classifyReap, because most of what lands here is decypharr's own state.
+func (q *Queue) MarkStalledFailed(fail func(*storage.Entry) (bool, error)) error {
 	cutoff := time.Now().Add(-q.removeStalledAfter)
 	predicate := func(t *storage.Entry) bool {
 		if t.IsDownloading {
@@ -392,6 +412,18 @@ func (q *Queue) DeleteStalled() error {
 			return false
 		}
 		if t.Status == debridTypes.TorrentStatusQueued {
+			return false
+		}
+		// ⚠️ NEVER PLACED IS QUEUED, AND QUEUED IS UNTOUCHABLE.
+		//
+		// The check above skips provider status "queued", which reads like it
+		// honours the operator's no-reaper-touches-queued doctrine. It does not:
+		// a row that never received a placement has an EMPTY provider status, so
+		// it fell through to the progress-0 branch below and was deleted. During
+		// a provider storm "never got a placement" is the NORMAL condition, which
+		// is how thousands of never-dispatched rows were reaped by a sweep that
+		// appeared to exclude them.
+		if placementIDOf(t) == "" && strings.TrimSpace(string(t.Status)) == "" {
 			return false
 		}
 		// Torrent entries: not downloading, no seeders, no progress
@@ -409,39 +441,47 @@ func (q *Queue) DeleteStalled() error {
 		return err
 	}
 	var errs []error
-	held := 0
+	held, failed, parked := 0, 0, 0
 	for _, entry := range entries {
-		// AIRTIGHT GUARD: never remove a row that still holds a provider
-		// placement.
-		//
-		// This pass deletes with a NIL cleanup — it removes the local row and
-		// touches nothing remote, by design, because its job is clearing junk
-		// rows rather than managing provider state. But its second branch
-		// (State == Error && Progress == 0) can match an entry that errored
-		// LOCALLY while the provider carries on downloading; one transient
-		// CheckStatus failure is enough to put a row in that shape. Deleting it
-		// strands the transfer with nothing able to release it, because every
-		// release path in decypharr starts from a local entry.
-		//
-		// So a row with a live placement is left alone and reported. The
-		// provider-sourced stall prune is the right tool for it — that one
-		// works from the provider's own active list and can free the slot —
-		// and leaving the row costs only a queue entry the operator can see.
+		// A row still holding a provider placement is left to the
+		// provider-sourced stall prune, which works from the provider's own
+		// active list and can actually free the slot. This sweep touches only
+		// local state, so marking such a row failed here would present a failure
+		// for a transfer the provider may still be running.
 		if placementIDOf(entry) != "" {
 			held++
 			continue
 		}
-		if _, err := q.deleteCurrentWhere(entry, predicate, nil); err != nil {
+		if fail == nil {
+			parked++
+			continue
+		}
+		marked, err := fail(entry)
+		if err != nil {
 			errs = append(errs, err)
+			continue
+		}
+		if marked {
+			failed++
+		} else {
+			parked++
 		}
 	}
 	if held > 0 {
 		q.logger.Warn().
 			Int("kept", held).
-			Msg("Stalled-entry cleanup left rows alone because they still hold a provider placement; " +
-				"removing them would strand the transfer with nothing able to release it. The " +
-				"provider-sourced stall prune handles these.")
+			Msg("Stalled-entry sweep left rows alone because they still hold a provider placement; " +
+				"the provider-sourced stall prune handles those, and it can release the slot.")
 	}
+	// ALWAYS LOGGED, including the all-zero case. A silent sweep is how this
+	// family of defects hid: no line is indistinguishable from not running.
+	q.logger.Info().
+		Int("considered", len(entries)).
+		Int("marked_failed", failed).
+		Int("parked", parked).
+		Int("held", held).
+		Int("deleted", 0). // structurally zero: this sweep no longer deletes rows
+		Msg("Stalled-entry sweep completed")
 	return errors.Join(errs...)
 }
 

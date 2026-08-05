@@ -330,6 +330,20 @@ func (m *Manager) PruneEntry(ctx context.Context, entry *storage.Entry, reason s
 		return fmt.Errorf("%w: %s: %w", errPruneSlotStillHeld, entry.InfoHash, err)
 	}
 
+	// ⚠️ MARK FAILED AND PARK. THE ROW IS NOT OURS TO DELETE.
+	//
+	// decypharr is the download client here and nothing more. It marks the row
+	// failed through the shim and leaves it parked; the *arr polls, sees a failed
+	// download, and does whatever IT is configured to do — blocklist, re-search,
+	// neither. That decision is the *arr's, and decypharr never reaches into an
+	// *arr API to make it.
+	//
+	// So this function ends here, deliberately. The pull mechanism is the DESIGN,
+	// not a workaround: the defect was never that we failed to push, it was that
+	// another sweep DELETED these rows within 60 seconds, before any *arr could
+	// poll them. Measured: 15,004 rows removed in 24h against 91 downloadFailed
+	// events at the *arrs. The fix is upstream of here — reapers no longer
+	// delete — and this code was correct all along.
 	entry.MarkAsError(fmt.Errorf("%s", reason))
 	if err := m.queue.Update(entry); err != nil {
 		m.logger.Error().Err(err).
