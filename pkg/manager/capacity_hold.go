@@ -232,9 +232,35 @@ func (m *Manager) admitHeldFromProviderCapacity() {
 	if free <= 0 {
 		return
 	}
+	// 🛑 SLOT MATH GATES *WHETHER* TO ADMIT. IT MUST NEVER SET *HOW MANY AT ONCE*.
+	//
+	// This used to admit `free` entries per tick. With a provider reporting 90
+	// free slots that is 90 simultaneous adds every 30 seconds, each retried up
+	// to four times — and it was SELF-SUSTAINING: the burst tripped the
+	// provider's rate limit, every add failed, so no slot was consumed, so the
+	// next tick saw the same 90 free and admitted 90 again. Measured on a live
+	// account at ~4 provider calls per second of pure decline traffic and
+	// 12,123 give-ups in two hours, while 90 slots sat idle throughout.
+	//
+	// I wrote "admit exactly what is free" deliberately, reasoning that
+	// admitting fewer would leave capacity unused. That is correct against a
+	// provider with no rate limit and wrong against every real one.
+	//
+	// A CONSTANT, not a knob. This controller is only the backstop — the
+	// primary path admits the instant a slot frees, as an event it witnesses —
+	// so it needs to catch up steadily rather than immediately. At this rate a
+	// fully idle hundred-slot account refills in a few minutes, which nobody
+	// can perceive, and no burst can become the thing that stops its own adds
+	// from landing.
+	admit := min(free, capacityAdmissionBatch)
 	m.logger.Debug().
 		Int("held", held).
 		Int("free", free).
-		Msg("Capacity admission: provider capacity available; admitting held entries")
-	m.releaseHeldForCapacity(free)
+		Int("admitting", admit).
+		Msg("Capacity admission: provider capacity available; admitting a bounded batch of held entries")
+	m.releaseHeldForCapacity(admit)
 }
+
+// capacityAdmissionBatch caps how many held entries one admission tick may
+// release, regardless of how much capacity the provider reports.
+const capacityAdmissionBatch = 5

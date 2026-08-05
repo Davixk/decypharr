@@ -1,0 +1,205 @@
+package manager
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/sirrobot01/decypharr/internal/customerror"
+)
+
+// The received-but-lost window, and the doctrine line it must not cross.
+//
+// Recovering the ID of a transfer decypharr ITSELF submitted is not adoption.
+// Adoption claims transfers we never started, presumes exclusive ownership of
+// the account, and is forbidden. The ledger is what keeps these apart: only a
+// hash written down seconds earlier can ever be matched, so a foreign transfer
+// is invisible to this code by construction.
+
+const reconcileHash = "0123456789abcdef0123456789abcdef01234567"
+
+func TestOnlyLedgeredHashesAreReconcilable(t *testing.T) {
+	l := newPendingAddLedger()
+	now := time.Now()
+
+	if l.pending("rd", reconcileHash, now) {
+		t.Fatal("a hash that was never submitted must not be reconcilable — that is the adoption line")
+	}
+
+	l.begin("rd", reconcileHash)
+	if !l.pending("rd", reconcileHash, now) {
+		t.Fatal("a hash we just submitted must be reconcilable")
+	}
+
+	// Scoped per provider: submitting to one does not make it recoverable from
+	// another, where it might belong to somebody else entirely.
+	if l.pending("ad", reconcileHash, now) {
+		t.Fatal("the ledger must be scoped per provider")
+	}
+}
+
+// TestTheWindowExpires. A long window would start to resemble a claim on
+// anything that appeared later, which is the line this must not cross.
+func TestTheWindowExpires(t *testing.T) {
+	l := newPendingAddLedger()
+	l.begin("rd", reconcileHash)
+
+	if !l.pending("rd", reconcileHash, time.Now()) {
+		t.Fatal("expected the entry to be live")
+	}
+	if l.pending("rd", reconcileHash, time.Now().Add(pendingAddTTL+time.Second)) {
+		t.Fatal("a stale ledger entry must expire rather than authorise a late recovery")
+	}
+}
+
+func TestResolveClearsTheLedger(t *testing.T) {
+	l := newPendingAddLedger()
+	l.begin("rd", reconcileHash)
+	l.resolve("rd", reconcileHash)
+	if l.pending("rd", reconcileHash, time.Now()) {
+		t.Fatal("a resolved add must leave nothing behind")
+	}
+}
+
+func TestExpiredReturnsAndClears(t *testing.T) {
+	l := newPendingAddLedger()
+	l.begin("rd", reconcileHash)
+
+	if got := l.expired(time.Now()); len(got) != 0 {
+		t.Fatalf("expired = %v on a fresh entry", got)
+	}
+	got := l.expired(time.Now().Add(pendingAddTTL + time.Second))
+	if len(got) != 1 || got[0].infoHash != reconcileHash {
+		t.Fatalf("expired = %+v, want the stale entry", got)
+	}
+	if l.pending("rd", reconcileHash, time.Now()) {
+		t.Fatal("expired entries must be cleared as they are reported")
+	}
+}
+
+// DECLINE CLASSIFICATION.
+//
+// The critical property is the one that is easiest to get wrong: a CAPACITY
+// refusal must never be treated as a verdict about the release. Parking such a
+// hash for hours would break the hold mechanism, which exists precisely to wait
+// for capacity that frees in minutes.
+
+func TestCapacityIsNeverAPermanentDecline(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"slots exhausted", customerror.TooManyActiveDownloadsError},
+		{"add quota exhausted", customerror.ProviderAddQuotaExhaustedError},
+		{"wrapped in a provider stage error",
+			providerStageError("rd", "submit", customerror.TooManyActiveDownloadsError)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyDecline(tc.err); got != declineTransient {
+				t.Fatal("a capacity refusal was classified as a verdict about the release; " +
+					"parking it would starve an entry that is merely waiting for a slot")
+			}
+		})
+	}
+}
+
+func TestPerReleaseRefusalIsPermanent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"451 from the provider", errors.New("realdebrid API error: Status: 451")},
+		{"wrapped in a stage error",
+			providerStageError("rd", "submit", errors.New("realdebrid API error: Status: 451"))},
+		{"named refusal", errors.New("infringing content")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyDecline(tc.err); got != declinePermanent {
+				t.Fatalf("class = %v; this provider will refuse this release every time", got)
+			}
+		})
+	}
+}
+
+// TestUnrecognisedFailuresAreTransient is the asymmetry, and it is deliberate.
+//
+// A transient misclassification costs one more attempt after a bounded backoff.
+// A permanent one parks a perfectly good release for hours. So permanent
+// requires a POSITIVE, release-specific signal and everything else falls
+// through to transient — including account-wide failures like a bad API key,
+// which are permanent for every release and must not be answered by quietly
+// shedding one hash at a time.
+func TestUnrecognisedFailuresAreTransient(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"timeout", errors.New("context deadline exceeded")},
+		{"retries exhausted", errors.New("POST /torrents/addMagnet gave up after 4 attempt(s): status 429")},
+		{"auth failure is account-wide, not per-release",
+			customerror.NewPermanentError(errors.New("401 unauthorized"))},
+		{"unknown", errors.New("something nobody classified")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyDecline(tc.err); got != declineTransient {
+				t.Fatalf("class = %v; only a positive release-specific refusal may park a hash", got)
+			}
+		})
+	}
+}
+
+func TestTransientDeclineBacksOffAndRecovers(t *testing.T) {
+	l := newDeclineLedger()
+	now := time.Now()
+
+	first := l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	if first != declineBackoffBase {
+		t.Fatalf("first cooldown = %s, want %s", first, declineBackoffBase)
+	}
+	if cooling, _ := l.cooling("rd", reconcileHash, now); !cooling {
+		t.Fatal("a just-declined hash must be parked")
+	}
+
+	second := l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	if second <= first {
+		t.Fatalf("second cooldown = %s, want longer than %s", second, first)
+	}
+
+	// Bounded, so a provider that recovers is retried within a known time.
+	for range 20 {
+		l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	}
+	capped := l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	if capped != declineBackoffMax {
+		t.Fatalf("cooldown = %s, want it capped at %s", capped, declineBackoffMax)
+	}
+
+	// Past its cooldown it is eligible again.
+	if cooling, _ := l.cooling("rd", reconcileHash, now.Add(declineBackoffMax+time.Second)); cooling {
+		t.Fatal("an expired cooldown must release the hash")
+	}
+}
+
+// TestSuccessClearsTheCooldown: an add that finally lands must not leave the
+// hash parked, or a recovered release would be refused on its next grab.
+func TestSuccessClearsTheCooldown(t *testing.T) {
+	l := newDeclineLedger()
+	now := time.Now()
+	l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	l.clear("rd", reconcileHash)
+
+	if cooling, _ := l.cooling("rd", reconcileHash, now); cooling {
+		t.Fatal("a successful add must clear the cooldown")
+	}
+}
+
+func TestCooldownIsScopedPerProvider(t *testing.T) {
+	l := newDeclineLedger()
+	now := time.Now()
+	l.record("rd", reconcileHash, declinePermanent, "451", now)
+
+	if cooling, _ := l.cooling("ad", reconcileHash, now); cooling {
+		t.Fatal("one provider refusing a release says nothing about another — the fallback " +
+			"chain depends on being able to try the next one")
+	}
+}

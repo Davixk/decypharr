@@ -311,6 +311,32 @@ func New(options ...ClientOption) *Client {
 		return false, nil
 	}
 
+	// SURFACE THE STATUS THE LIBRARY THROWS AWAY.
+	//
+	// retryablehttp's default give-up path drains and closes the response and
+	// returns `giving up after N attempt(s)` carrying NO status at all. That is
+	// by design on its side, and it cost three separate diagnoses here: an
+	// operator staring at 12,123 identical warnings had no way to tell a 429
+	// (self-inflicted rate limit — the interesting case) from a 503 (provider
+	// outage) from a transport failure.
+	//
+	// The body snippet is bounded because a provider error page can be large
+	// and this is a log line, not a payload. What matters is the status and the
+	// first line of whatever it said.
+	retryClient.ErrorHandler = func(resp *http.Response, err error, attempts int) (*http.Response, error) {
+		if resp == nil {
+			return nil, fmt.Errorf("request failed after %d attempt(s): %w", attempts, err)
+		}
+		defer resp.Body.Close()
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		detail := strings.TrimSpace(string(snippet))
+		if detail == "" {
+			detail = "(empty body)"
+		}
+		return nil, fmt.Errorf("%s %s gave up after %d attempt(s): status %d: %s",
+			resp.Request.Method, resp.Request.URL, attempts, resp.StatusCode, detail)
+	}
+
 	client.client = retryClient
 
 	return client

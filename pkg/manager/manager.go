@@ -52,6 +52,13 @@ type Manager struct {
 	// the stall sweep can measure an absence of movement instead of inferring it
 	// from a lifetime average that flatters anything that started fast.
 	progress        *progressTracker
+	// pendingAdds records submitted infohashes so an ambiguous outcome can be
+	// settled by asking the provider, rather than losing a transfer we started.
+	pendingAdds   *pendingAddLedger
+	reconcileList *reconcileListing
+	// declines parks a hash that just failed, so the admission controller stops
+	// re-offering it every tick.
+	declines *declineLedger
 	arr             *arr.Storage
 	logger       zerolog.Logger
 	ready        chan struct{}
@@ -214,6 +221,9 @@ func New() *Manager {
 		fillCache:              newProviderFillCache(),
 		providerOrphans:        newProviderOrphanTracker(),
 		progress:               newProgressTracker(),
+		pendingAdds:            newPendingAddLedger(),
+		reconcileList:          newReconcileListing(),
+		declines:               newDeclineLedger(),
 		capacityHold:           newCapacityHoldQueue(),
 		logger:                 _logger,
 		migrationJobs:          xsync.NewMap[string, *storage.SwitcherJob](),

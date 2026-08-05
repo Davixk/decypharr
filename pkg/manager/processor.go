@@ -707,16 +707,61 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			Str("Action", string(importRequest.Action)).
 			Msg("Processing torrent")
 
+		// A hash the provider just refused is parked, so the admission
+		// controller stops re-offering it on every tick. Skipping here rather
+		// than at admission keeps the decision next to the error that caused
+		// it, and still costs nothing — no request goes out.
+		if cooling, why := m.declines.cooling(providerName, debridTorrent.InfoHash, time.Now()); cooling {
+			errs = append(errs, providerStageError(providerName, "submit",
+				fmt.Errorf("cooling off after an earlier decline: %s", why)))
+			continue
+		}
+
+		// RECORDED BEFORE THE REQUEST GOES OUT. A crash between this and the
+		// POST leaves a harmless stale ledger entry; the reverse order leaves a
+		// transfer nobody can find.
+		m.pendingAdds.begin(providerName, debridTorrent.InfoHash)
+
 		dbt, err := db.SubmitMagnet(debridTorrent)
 		if err != nil {
+			// AMBIGUOUS OUTCOME. The provider may have created the transfer and
+			// lost the response on the way back — no retry required for that,
+			// one attempt is enough. Ask whether it has the hash we just sent
+			// before concluding nothing happened.
+			//
+			// This is NOT adoption: it is scoped to a hash THIS process
+			// submitted seconds ago, keyed by that exact hash. A transfer
+			// decypharr did not start can never match, because it was never
+			// written to the ledger.
+			if recovered := m.reconcileAmbiguousAdd(providerName, debridTorrent.InfoHash); recovered != "" {
+				m.pendingAdds.resolve(providerName, debridTorrent.InfoHash)
+				m.declines.clear(providerName, debridTorrent.InfoHash)
+				m.reconcileList.invalidate(providerName)
+				dbt = debridTorrent
+				dbt.Id = recovered
+				dbt.Debrid = providerName
+				err = nil
+			}
+		}
+		if err != nil {
+			m.pendingAdds.resolve(providerName, debridTorrent.InfoHash)
+			cooldown := m.declines.record(providerName, debridTorrent.InfoHash,
+				classifyDecline(err), err.Error(), time.Now())
 			attemptErr := providerStageError(providerName, "submit", err)
 			if dbt != nil && dbt.Id != "" {
 				attemptErr = errors.Join(attemptErr, cleanupDebridAttempt(db, providerName, dbt.Id))
 			}
 			errs = append(errs, attemptErr)
 			logDebridAttemptFailure(_logger, providerName, "submit", debridTorrent.InfoHash, err)
+			_logger.Debug().
+				Str("Provider", providerName).
+				Str("Hash", debridTorrent.InfoHash).
+				Dur("cooling_off", cooldown).
+				Msg("Parked this release on this provider after a decline")
 			continue
 		}
+		m.pendingAdds.resolve(providerName, debridTorrent.InfoHash)
+		m.declines.clear(providerName, debridTorrent.InfoHash)
 		if dbt == nil {
 			errs = append(errs, providerStageError(providerName, "submit", errors.New("provider returned a nil torrent")))
 			continue
