@@ -184,3 +184,81 @@ func TestCompactionHonoursDeletesTakenAfterTheSnapshot(t *testing.T) {
 		t.Fatal("a deleted key came back after compaction")
 	}
 }
+
+// 🔴 A DELETE TAKEN DURING THE REWRITE MUST SURVIVE A RESTART.
+//
+// This is the case the test above does NOT cover, and the difference is the
+// whole bug: it deletes BEFORE compaction and asserts against the LIVE store.
+// Both of those made it pass while the store was silently broken.
+//
+// The key is live at phase 1, so phase 2 copies its record into the new log with
+// Deleted=false. If phase 3 only drops it from the in-memory index, the store
+// looks perfectly correct for the rest of the process's life — and then
+// recover() rebuilds the index by iterating the log on the next Open, replays
+// that copied record as a live Put, and the entry comes back from the dead. For
+// the queue store that is a row an *arr already deleted reappearing after a
+// restart.
+//
+// So the assertion that matters is on the REOPENED store, not the live one. A
+// test that never reopens exercises the right code and asserts the wrong scope.
+func TestCompactionTombstonesADeleteTakenDuringTheRewrite(t *testing.T) {
+	dir := t.TempDir()
+	config.SetConfigPath(dir)
+	path := filepath.Join(dir, "store.log")
+
+	s, err := New(Config{DataPath: path, SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for i := range 50 {
+		if err := s.Put(fmt.Sprintf("k-%03d", i), []byte("v"), nil); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	// Rewrite every key so the log carries dead bytes worth compacting.
+	for i := range 50 {
+		if err := s.Put(fmt.Sprintf("k-%03d", i), []byte("v2"), nil); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	// Delete INSIDE phase 2 — after the snapshot was taken, while no lock is
+	// held. The seam fires before the copy loop, so the record is copied anyway,
+	// which is exactly the window being tested.
+	var once sync.Once
+	var deleteErr error
+	compactionYield = func() {
+		once.Do(func() { deleteErr = s.Delete("k-000") })
+	}
+	t.Cleanup(func() { compactionYield = nil })
+
+	if err := s.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if deleteErr != nil {
+		t.Fatalf("Delete during compaction: %v", deleteErr)
+	}
+
+	// Passes with or without the fix — kept to show the live store is not where
+	// the defect is visible.
+	if _, err := s.Get("k-000"); err == nil {
+		t.Fatal("deleted key is still readable from the live store after compaction")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := New(Config{DataPath: path, SyncInterval: -1})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	if _, err := reopened.Get("k-000"); err == nil {
+		t.Fatal("A KEY DELETED DURING COMPACTION RESURRECTED ON REOPEN. Phase 2 copied its " +
+			"record into the new log, so dropping it from the index alone is not a delete — " +
+			"recover() replays the copied record as a live Put. Phase 3 must append a tombstone.")
+	}
+}

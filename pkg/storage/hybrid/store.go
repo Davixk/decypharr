@@ -635,7 +635,8 @@ func (s *Store) Compact() error {
 
 	// Anything written while phase 2 ran has a different offset than the
 	// snapshot (or no snapshot entry at all) and must be copied now. Anything
-	// deleted while phase 2 ran is absent from the live index and is dropped.
+	// deleted while phase 2 ran needs a TOMBSTONE, not just an index removal —
+	// see below.
 	live := make(map[string]struct{}, len(snapshot))
 	var catchUpErr error
 	caughtUp := 0
@@ -657,10 +658,33 @@ func (s *Store) Compact() error {
 	if catchUpErr != nil {
 		return abort("%w", catchUpErr)
 	}
+	// 🔴 A TOMBSTONE, NOT JUST AN INDEX REMOVAL — deleting from newIndex alone
+	// RESURRECTS THE KEY ON THE NEXT RESTART.
+	//
+	// The key was live at phase 1, so phase 2 already copied its record into the
+	// new log with Deleted=false. Dropping it from the in-memory index hides it
+	// for the rest of this process's life and looks completely correct — but
+	// recover() rebuilds the index by ITERATING THE LOG, so on the next Open the
+	// copied record is replayed as a live Put and the entry comes back from the
+	// dead. For the queue store that is a row an *arr already deleted reappearing
+	// after a restart.
+	//
+	// This hole is specific to the unlocked phase 2. The original single-lock
+	// compaction could not hit it: no delete could interleave with the rewrite,
+	// so "absent from the live index" and "absent from the new log" were the same
+	// statement. Splitting the lock separated them.
+	//
+	// It survived compact_test.go because every assertion there ran against the
+	// live in-memory store and none reopened it — the test exercised the right
+	// code and asserted the wrong scope.
 	for key := range snapshot {
-		if _, ok := live[key]; !ok {
-			newIndex.Delete(key)
+		if _, ok := live[key]; ok {
+			continue
 		}
+		if _, _, err := newLog.Append(key, nil, true, "", "", "", "", 0, "", false, 0); err != nil {
+			return abort("failed to write compaction tombstone: %w", err)
+		}
+		newIndex.Delete(key)
 	}
 
 	if err := newLog.Sync(); err != nil {
