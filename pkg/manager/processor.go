@@ -88,8 +88,37 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 	job.Entry = torrent
 	job.DebridTorrent = debridTorrent
 	if err := m.SubmitJob(job); err != nil {
-		torrent.MarkAsError(err)
-		_ = m.queue.Update(torrent)
+		// GRAB-TIME-KNOWABLE, SO IT FAILS THE GRAB — IT DOES NOT PARK A CORPSE.
+		//
+		// This used to MarkAsError and keep the row, while also returning an
+		// error. The arr therefore got both: a failed add AND a queue entry sat
+		// in `error`, which the arr renders as a dead-end warning it can neither
+		// retry nor clear. That is the exact shape the operator ruled out —
+		// a synchronous refusal must resolve synchronously, leaving nothing
+		// behind, because the arr is still holding its ranked candidate list and
+		// can take the next release for free. A parked error row instead costs a
+		// full indexer re-search later.
+		//
+		// The placement goes with it. SendToDebrid already succeeded here, so the
+		// provider is holding a transfer for a grab we are about to refuse;
+		// dropping the row alone would strand it as an orphan burning a slot that
+		// no local record can ever release. Release first, then delete.
+		if _, deleteErr := m.queue.DeleteCurrent(torrent, m.RemoveTorrentPlacements); deleteErr != nil {
+			m.logger.Error().Err(deleteErr).
+				Str("infohash", torrent.InfoHash).
+				Str("name", torrent.Name).
+				Msg("Could not withdraw the reservation for a torrent that failed to queue; " +
+					"the row may be left behind in a state the arr cannot act on")
+			return errors.Join(
+				fmt.Errorf("failed to queue torrent: %w", err),
+				fmt.Errorf("withdraw failed reservation: %w", deleteErr),
+			)
+		}
+		m.logger.Error().Err(err).
+			Str("infohash", torrent.InfoHash).
+			Str("name", torrent.Name).
+			Msg("Could not queue the torrent for download; refusing the grab and withdrawing the reservation " +
+				"so the arr can take its next candidate immediately")
 		return fmt.Errorf("failed to queue torrent: %w", err)
 	}
 	return nil
@@ -297,6 +326,41 @@ func (m *Manager) processQueuedEntries() {
 	}
 }
 
+// failQueuedEntry marks a queued entry failed, persists it, and emits ONE line
+// that can actually be found afterwards.
+//
+// Every site below used to open-code the same three steps, and they had drifted
+// in the way that matters most: the Error line carried `name` and NEVER the
+// infohash. A hash-scoped trace of a row that died therefore showed the grab and
+// then nothing at all — the marking WAS logged, just not under the key anyone
+// searches by, which reads as silence and sent an investigation looking for a
+// silent writer that does not exist. A line that cannot be correlated is barely
+// better than no line. Two of these sites (NZB generation, metadata mismatch)
+// really were silent as well.
+//
+// source names WHICH verdict marked the row, so "what failed this?" is answered
+// by the line itself rather than by matching timestamps against source.
+func (m *Manager) failQueuedEntry(entry *storage.Entry, source string, cause error) {
+	if entry == nil {
+		return
+	}
+	entry.MarkAsError(cause)
+	m.logger.Error().Err(cause).
+		Str("source", source).
+		Str("infohash", entry.InfoHash).
+		Str("name", entry.Name).
+		Msg("Marked a queued entry failed; it stays parked for the arr to collect")
+	if err := m.queue.Update(entry); err != nil {
+		// Benign in the common case: a stale generation means the row was
+		// deleted or superseded while this verdict was being reached, so there
+		// is nothing left to mark.
+		m.logger.Debug().Err(err).
+			Str("source", source).
+			Str("infohash", entry.InfoHash).
+			Msg("Did not persist the failure; the queue row had already moved on")
+	}
+}
+
 func (m *Manager) processQueuedNZB(entry *storage.Entry) {
 	defer m.processingEntries.Delete(entry.InfoHash)
 	current, err := m.queue.RefreshSnapshot(entry)
@@ -308,65 +372,39 @@ func (m *Manager) processQueuedNZB(entry *storage.Entry) {
 	}
 	generation, err := m.ensureNZBGeneration(entry)
 	if err != nil {
-		entry.MarkAsError(err)
-		if updateErr := m.queue.Update(entry); updateErr != nil {
-			m.logger.Debug().Err(updateErr).Str("name", entry.Name).Msg("Stopped stale NZB generation error update")
-		}
+		m.failQueuedEntry(entry, "nzb-generation", err)
 		return
 	}
 	// Check if the nzb is already processed. Only header fields (status, file
 	// list) are needed here; processNZB does not touch the segment map.
 	metadata, err := m.usenet.GetNZBHeader(entry.InfoHash)
 	if err != nil {
-		m.logger.Error().Err(err).Str("name", entry.Name).Msg("Error getting NZB metadata")
-		entry.MarkAsError(err)
-		if updateErr := m.queue.Update(entry); updateErr != nil {
-			m.logger.Debug().Err(updateErr).Str("name", entry.Name).Msg("Stopped stale NZB metadata-load error update")
-		}
+		m.failQueuedEntry(entry, "nzb-metadata-load", err)
 		return
 	}
 	if metadata == nil {
-		m.logger.Error().Str("name", entry.Name).Msg("NZB metadata not found")
-		entry.MarkAsError(fmt.Errorf("nzb metadata not found"))
-		if updateErr := m.queue.Update(entry); updateErr != nil {
-			m.logger.Debug().Err(updateErr).Str("name", entry.Name).Msg("Stopped stale missing-NZB error update")
-		}
+		m.failQueuedEntry(entry, "nzb-metadata-missing", fmt.Errorf("nzb metadata not found"))
 		return
 	}
 	if metadata.Generation != generation {
-		err := fmt.Errorf("%w: queued generation %q, metadata generation %q", usenet.ErrStaleNZBGeneration, generation, metadata.Generation)
-		entry.MarkAsError(err)
-		if updateErr := m.queue.Update(entry); updateErr != nil {
-			m.logger.Debug().Err(updateErr).Str("name", entry.Name).Msg("Stopped stale NZB metadata mismatch update")
-		}
+		m.failQueuedEntry(entry, "nzb-generation-mismatch",
+			fmt.Errorf("%w: queued generation %q, metadata generation %q", usenet.ErrStaleNZBGeneration, generation, metadata.Generation))
 		return
 	}
 	switch metadata.Status {
 	case usenet.NZBStatusFailed:
-		m.logger.Error().Str("name", entry.Name).Msg("NZB processing failed")
-		entry.MarkAsError(fmt.Errorf("nzb processing failed"))
-		if updateErr := m.queue.Update(entry); updateErr != nil {
-			m.logger.Debug().Err(updateErr).Str("name", entry.Name).Msg("Stopped stale NZB processing-failure update")
-		}
+		m.failQueuedEntry(entry, "nzb-parse-failed", fmt.Errorf("nzb processing failed"))
 		return
 	case usenet.NZBStatusParsing, usenet.NZBStatusDownloading:
 		// Still processing, skip for now
 		return
 	case usenet.NZBStatusCompleted:
 		if err := m.processNZB(context.Background(), entry, metadata); err != nil {
-			m.logger.Error().Err(err).Str("name", entry.Name).Msg("Error processing queued NZB")
-			entry.MarkAsError(err)
-			if updateErr := m.queue.Update(entry); updateErr != nil {
-				m.logger.Debug().Err(updateErr).Str("name", entry.Name).Msg("Stopped stale completed-NZB error update")
-			}
+			m.failQueuedEntry(entry, "nzb-completion", err)
 			return
 		}
 	default:
-		m.logger.Error().Str("name", entry.Name).Msgf("Unknown NZB status: %s", metadata.Status)
-		entry.MarkAsError(fmt.Errorf("unknown nzb status: %s", metadata.Status))
-		if updateErr := m.queue.Update(entry); updateErr != nil {
-			m.logger.Debug().Err(updateErr).Str("name", entry.Name).Msg("Stopped stale unknown-NZB-status update")
-		}
+		m.failQueuedEntry(entry, "nzb-unknown-status", fmt.Errorf("unknown nzb status: %s", metadata.Status))
 		return
 	}
 }
@@ -383,21 +421,14 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 	}
 	placement := entry.GetActiveProvider()
 	if placement == nil {
-		m.logger.Error().Str("name", entry.Name).Msg("No active placement found for queued entry")
-		entry.MarkAsError(fmt.Errorf("no active placement found"))
-		if err := m.queue.Update(entry); err != nil {
-			m.logger.Debug().Err(err).Str("name", entry.Name).Msg("Stopped stale queued torrent error update")
-		}
+		m.failQueuedEntry(entry, "no-active-placement", fmt.Errorf("no active placement found"))
 		return
 	}
 
 	client := m.ProviderClient(entry.ActiveProvider)
 	if client == nil {
-		m.logger.Error().Str("debrid", entry.ActiveProvider).Msg("Provider client not found")
-		entry.MarkAsError(fmt.Errorf("debrid client not found: %s", entry.ActiveProvider))
-		if err := m.queue.Update(entry); err != nil {
-			m.logger.Debug().Err(err).Str("name", entry.Name).Msg("Stopped stale queued torrent error update")
-		}
+		m.failQueuedEntry(entry, "provider-client-missing",
+			fmt.Errorf("debrid client not found: %s", entry.ActiveProvider))
 		return
 	}
 
@@ -421,35 +452,32 @@ func (m *Manager) processQueuedTorrent(entry *storage.Entry) {
 
 	dbT, err := client.CheckStatus(debridTorrent)
 	if err != nil {
-		m.logger.Error().Err(err).Str("name", entry.Name).Msg("Error checking status")
-		entry.MarkAsError(err)
-		if updateErr := m.queue.Update(entry); updateErr != nil {
-			m.logger.Debug().Err(updateErr).Str("name", entry.Name).Msg("Stopped stale queued torrent status error")
-		}
+		// THE PROVIDER DROPPED A TRANSFER IT HAD ALREADY ACCEPTED.
+		//
+		// A measured case: RealDebrid took the grab, started downloading, then
+		// answered 404 for the very torrent id it had just issued, 18 seconds
+		// later. That is a genuinely deferred death — nothing at grab time could
+		// have predicted it — so failing the row here is correct and the arr
+		// learns by polling. It carries the provider and its id because "the
+		// provider forgot an id it gave us" is a provider-side fault worth being
+		// able to count, not a decypharr one.
+		m.failQueuedEntry(entry, "provider-status-check:"+entry.ActiveProvider,
+			fmt.Errorf("provider %s rejected a status check for its own transfer %s: %w",
+				entry.ActiveProvider, placement.ID, err))
 		return
 	}
 
 	debridTorrent = dbT
 
 	if debridTorrent == nil {
-		m.logger.Error().Str("name", entry.Name).Msg("Provider entry not found")
-		entry.MarkAsError(fmt.Errorf("debrid entry not found"))
-		if err := m.queue.Update(entry); err != nil {
-			m.logger.Debug().Err(err).Str("name", entry.Name).Msg("Stopped stale missing-provider update")
-		}
+		m.failQueuedEntry(entry, "provider-entry-missing:"+entry.ActiveProvider,
+			fmt.Errorf("debrid entry not found"))
 		return
 	}
 
 	if debridTorrent.Status == debridTypes.TorrentStatusError {
-		m.logger.Error().
-			Str("debrid", debridTorrent.Debrid).
-			Str("name", debridTorrent.Name).
-			Str("status", string(debridTorrent.Status)).
-			Msg("Entry in error state")
-		entry.MarkAsError(fmt.Errorf("entry in error state on debrid: %s", debridTorrent.Debrid))
-		if err := m.queue.Update(entry); err != nil {
-			m.logger.Debug().Err(err).Str("name", entry.Name).Msg("Stopped stale provider-error update")
-		}
+		m.failQueuedEntry(entry, "provider-error-state:"+debridTorrent.Debrid,
+			fmt.Errorf("entry in error state on debrid: %s", debridTorrent.Debrid))
 		return
 	}
 
@@ -712,8 +740,13 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		// than at admission keeps the decision next to the error that caused
 		// it, and still costs nothing — no request goes out.
 		if cooling, why := m.declines.cooling(providerName, debridTorrent.InfoHash, time.Now()); cooling {
-			errs = append(errs, providerStageError(providerName, "submit",
-				fmt.Errorf("cooling off after an earlier decline: %s", why)))
+			coolErr := fmt.Errorf("cooling off after an earlier decline: %s", why)
+			errs = append(errs, providerStageError(providerName, "submit", coolErr))
+			// SAY SO. This branch skipped a provider in total silence, which made
+			// a grab that resolved entirely inside its own second look like the
+			// provider had simply never been asked — "Processing torrent" and
+			// then nothing at all, with the row's fate decided elsewhere.
+			logDebridAttemptFailure(_logger, providerName, "decline cooldown", debridTorrent.InfoHash, coolErr)
 			continue
 		}
 
@@ -782,11 +815,15 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		// has recovered, and jumping straight back to full rate would oscillate.
 		m.addPace.reward(providerName)
 		if dbt == nil {
-			errs = append(errs, providerStageError(providerName, "submit", errors.New("provider returned a nil torrent")))
+			nilErr := errors.New("provider returned a nil torrent")
+			errs = append(errs, providerStageError(providerName, "submit", nilErr))
+			logDebridAttemptFailure(_logger, providerName, "submit", debridTorrent.InfoHash, nilErr)
 			continue
 		}
 		if dbt.Id == "" {
-			errs = append(errs, providerStageError(providerName, "submit", errors.New("provider returned an empty torrent id")))
+			emptyErr := errors.New("provider returned an empty torrent id")
+			errs = append(errs, providerStageError(providerName, "submit", emptyErr))
+			logDebridAttemptFailure(_logger, providerName, "submit", debridTorrent.InfoHash, emptyErr)
 			continue
 		}
 		dbt.Arr = importRequest.Arr
@@ -797,6 +834,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 				fmt.Errorf("debrid request canceled: %w", err),
 				cleanupDebridAttempt(db, providerName, dbt.Id),
 			))
+			logDebridAttemptFailure(_logger, providerName, "canceled after submit", debridTorrent.InfoHash, err)
 			break
 		}
 
@@ -814,10 +852,12 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			continue
 		}
 		if torrent == nil {
+			nilStatusErr := errors.New("provider returned a nil torrent")
 			errs = append(errs, errors.Join(
-				providerStageError(providerName, "status check", errors.New("provider returned a nil torrent")),
+				providerStageError(providerName, "status check", nilStatusErr),
 				cleanupDebridAttempt(db, providerName, dbt.Id),
 			))
+			logDebridAttemptFailure(_logger, providerName, "status check", debridTorrent.InfoHash, nilStatusErr)
 			continue
 		}
 		if !downloadUncached && torrent.Status != debridTypes.TorrentStatusDownloaded {
@@ -871,6 +911,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			// succeeded; deleting it now would remove content the user asked
 			// for. Keep the remote torrent and surface only the cancellation.
 			errs = append(errs, fmt.Errorf("debrid request canceled: %w", err))
+			logDebridAttemptFailure(_logger, providerName, "canceled after status check", debridTorrent.InfoHash, err)
 			break
 		}
 		return torrent, nil

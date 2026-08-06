@@ -57,7 +57,22 @@ const (
 	repairStopSchedulerTag = "repair-sweep-stop"
 	repairDefaultWorkers   = 5
 	repairDefaultRecheck   = 7 * 24 * time.Hour
-	repairHistoryRetained  = 100
+
+	// NO IMPORT FAST LANE, deliberately — the obvious idea here is wrong.
+	//
+	// A fresh import looks like the urgent case (it carries no health verdict,
+	// and the nightly 03:00 sweep may not reach it for ~24h), so an hourly lane
+	// over no-verdict entries is the natural fix. It was built and removed.
+	//
+	// A FRESHLY IMPORTED FILE IS THE MOST-VETTED FILE IN THE SYSTEM, not the
+	// least: it has just been through admission, the cache/seeder gates and the
+	// import path. Re-probing it an hour later re-asks a question that was
+	// answered minutes ago. The defect the payload ladder exists to catch —
+	// serves its head, dies at the tail — is content ROT, which develops with
+	// age; it is the settled library, not the new arrival, that needs re-reading.
+	// A lane biased toward the newest entries spends the probe budget where the
+	// evidence is freshest and the risk is lowest.
+	repairHistoryRetained = 100
 	// repairDefaultMaxDeletionsPerRun bounds how many entries a single sweep/run
 	// may destructively heal when config leaves it unset. Mirrors the
 	// missing-download reconciler's missingDownloadSweepLimit so a provider-wide
