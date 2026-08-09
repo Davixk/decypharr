@@ -75,6 +75,12 @@ func (c *Config) applyEnvOverrides() {
 	if val := getEnv("DEBRID_READ_TIMEOUT"); val != "" {
 		c.DebridReadTimeout = val
 	}
+	if val := getEnv("DEBRID_LINK_TIMEOUT"); val != "" {
+		c.DebridLinkTimeout = val
+	}
+	if val := getEnv("METADATA_READ_TIMEOUT"); val != "" {
+		c.MetadataReadTimeout = val
+	}
 	if val := getEnv("ENABLE_WEBDAV_AUTH"); val != "" {
 		c.EnableWebdavAuth = parseBool(val)
 	}

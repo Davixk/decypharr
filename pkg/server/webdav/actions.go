@@ -16,24 +16,54 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
+// handlePropfind answers a listing under a ceiling.
+//
+// A listing used to have no deadline of ANY kind. Only byte-streams did, so a
+// stalled metadata call had nothing to trip and the handler simply waited on
+// whatever the upstream did — which for Usenet entries is a live per-file
+// preparation against the NNTP providers. A wedged listing takes down `ls`, an
+// *arr scan and a Plex refresh exactly as hard as a wedged read, and it never
+// produced an error any of them could act on.
 func (h *Handler) handlePropfind(current *manager.FileInfo, children []manager.FileInfo, w http.ResponseWriter, r *http.Request) {
 	if current == nil {
 		http.Error(w, "Not Found", http.StatusNotFound)
 		return
 	}
 
+	// One ceiling, applied to each backend phase below. The two phases cannot
+	// both do backend work on any real route: `current` is only a non-directory
+	// on /{group}/{torrent}/{file}, and that route resolves with children == nil,
+	// so the child batch is an empty no-op there. The configured number is
+	// therefore the wait an operator actually experiences, not half of it.
+	ceiling := h.metadataReadTimeout()
+
 	if !current.IsDir() && current.IsRemote() {
-		_, prepared, err := h.prepareRemoteFile(current)
-		if err != nil {
-			h.writeMetadataError(w, err)
+		prepared, ok := awaitBounded(ceiling, func() preparedFile {
+			entry, info, err := h.prepareRemoteFile(current)
+			return preparedFile{entry: entry, info: info, err: err}
+		})
+		if !ok {
+			h.writeBackendTimeout(w, "propfind_self", ceiling)
 			return
 		}
-		current = prepared
+		if prepared.err != nil {
+			h.writeMetadataError(w, prepared.err)
+			return
+		}
+		current = prepared.info
 	}
 
 	var preparedChildren []manager.FileInfo
 	if propfindIncludesChildren(r) {
-		batch, batchErrors := h.manager.PrepareFileInfos(children)
+		result, ok := awaitBounded(ceiling, func() preparedBatch {
+			infos, errs := h.preparer.PrepareFileInfos(children)
+			return preparedBatch{infos: infos, errors: errs}
+		})
+		if !ok {
+			h.writeBackendTimeout(w, "propfind_children", ceiling)
+			return
+		}
+		batch, batchErrors := result.infos, result.errors
 		preparedChildren = make([]manager.FileInfo, 0, len(batch))
 		for i := range batch {
 			if err := batchErrors[i]; err != nil {
@@ -94,12 +124,23 @@ func (h *Handler) handleHead(info *manager.FileInfo, w http.ResponseWriter, r *h
 		return
 	}
 	if !info.IsDir() && info.IsRemote() {
-		_, prepared, err := h.prepareRemoteFile(info)
-		if err != nil {
-			h.writeMetadataError(w, err)
+		// Same ceiling as PROPFIND: HEAD is a metadata request that reaches the
+		// same preparer, and a media player probing a file must never be the
+		// thing that wedges on a stalled backend.
+		ceiling := h.metadataReadTimeout()
+		prepared, ok := awaitBounded(ceiling, func() preparedFile {
+			entry, prepInfo, err := h.prepareRemoteFile(info)
+			return preparedFile{entry: entry, info: prepInfo, err: err}
+		})
+		if !ok {
+			h.writeBackendTimeout(w, "head", ceiling)
 			return
 		}
-		info = prepared
+		if prepared.err != nil {
+			h.writeMetadataError(w, prepared.err)
+			return
+		}
+		info = prepared.info
 	}
 
 	w.Header().Set("Content-Type", utils.GetContentType(info.Name()))
@@ -132,16 +173,30 @@ func (h *Handler) prepareRemoteFile(info *manager.FileInfo) (*storage.Entry, *ma
 	if entry == nil {
 		return nil, nil, fmt.Errorf("entry for %s/%s is nil", info.Parent(), info.Name())
 	}
-	return h.manager.PrepareFileInfo(entry, info)
+	return h.preparer.PrepareFileInfo(entry, info)
 }
 
 func (h *Handler) writeMetadataError(w http.ResponseWriter, err error) {
 	var customErr *customerror.Error
 	if errors.As(err, &customErr) {
+		setTransientRetryAfter(w, customErr)
 		http.Error(w, customErr.Error(), customErr.StatusCode())
 		return
 	}
 	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+}
+
+// setTransientRetryAfter attaches a backoff hint to errors the type system
+// already says are transient (Retryable and not Permanent). It is driven off
+// that existing classification rather than off the status code on purpose:
+// TrafficExceededError is also a 503 but clears on the provider's billing
+// cycle, not in five seconds, and it is deliberately NOT marked retryable — so
+// it correctly gets no hint. Advertising a wrong one would be worse than none.
+func setTransientRetryAfter(w http.ResponseWriter, err *customerror.Error) {
+	if err == nil || !err.IsRetryable() {
+		return
+	}
+	w.Header().Set("Retry-After", transientRetryAfter)
 }
 
 func (h *Handler) handleCopy(current *manager.FileInfo, w http.ResponseWriter, r *http.Request, delete bool) {
@@ -244,12 +299,25 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 	}
 
 	originalInfo := info
-	entry, preparedInfo, err := h.prepareRemoteFile(info)
-	if err != nil {
-		h.handleDownloadError(originalInfo, w, err)
+	// The PREPARE phase is bounded like any other metadata call; the transfer
+	// that follows is not, and must not be — a healthy stream is long by design
+	// and has its own idle deadline (debrid_read_timeout). What this ceiling
+	// covers is the window before a single byte exists, which nothing else
+	// watches.
+	ceiling := h.metadataReadTimeout()
+	prepared, ok := awaitBounded(ceiling, func() preparedFile {
+		entry, preparedInfo, err := h.prepareRemoteFile(info)
+		return preparedFile{entry: entry, info: preparedInfo, err: err}
+	})
+	if !ok {
+		h.writeBackendTimeout(w, "download_prepare", ceiling)
 		return
 	}
-	info = preparedInfo
+	if prepared.err != nil {
+		h.handleDownloadError(originalInfo, w, prepared.err)
+		return
+	}
+	entry, info := prepared.entry, prepared.info
 	if err := h.streamPreparedResponse(entry, info, w, r); err != nil {
 		h.handleDownloadError(info, w, err)
 	}
@@ -272,6 +340,7 @@ func (h *Handler) handleDownloadError(info *manager.FileInfo, w http.ResponseWri
 	var streamErr *customerror.Error
 	if errors.As(err, &streamErr) {
 		if !streamErr.HeadersWritten {
+			setTransientRetryAfter(w, streamErr)
 			http.Error(w, streamErr.Error(), streamErr.StatusCode())
 		}
 		if !streamErr.IsSilent() {

@@ -9,6 +9,7 @@ import (
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	"github.com/sirrobot01/decypharr/pkg/manager"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 func init() {
@@ -29,6 +30,18 @@ type Handler struct {
 	logger   *logger.RateLimitedLogger
 	manager  *manager.Manager
 	metadata entryMetadataResolver
+	preparer entryPreparer
+}
+
+// entryPreparer is the seam for the only metadata work that can reach a
+// backend. Everything else a listing does is local store iteration; these two
+// calls are the ones that, for Usenet entries, fan out to the NNTP providers
+// with no deadline of their own. Split out as an interface so the ceiling that
+// now guards them can be driven directly in tests with a preparer that stalls,
+// which is the only way to prove the ceiling actually releases the handler.
+type entryPreparer interface {
+	PrepareFileInfo(*storage.Entry, *manager.FileInfo) (*storage.Entry, *manager.FileInfo, error)
+	PrepareFileInfos([]manager.FileInfo) ([]manager.FileInfo, []error)
 }
 
 type entryMetadataResolver interface {
@@ -47,6 +60,7 @@ func NewHandler(mgr *manager.Manager) *Handler {
 		logger:   log,
 		manager:  mgr,
 		metadata: mgr,
+		preparer: mgr,
 	}
 	return h
 }

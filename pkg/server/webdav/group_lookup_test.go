@@ -43,6 +43,25 @@ const (
 
 func newGroupRouter(t *testing.T) (http.Handler, *manager.Manager) {
 	t.Helper()
+	handler, mgr := newGroupHandler(t)
+	return routerFor(handler), mgr
+}
+
+// routerFor installs the production route table behind the same StripSlashes
+// the server mounts it behind, which is why a request for "/<group>/" reaches
+// the "/{group}" route at all.
+func routerFor(handler *Handler) http.Handler {
+	router := chi.NewRouter()
+	router.Use(middleware.StripSlashes)
+	handler.registerRoutes(router)
+	return router
+}
+
+// newGroupHandler builds the fixture manager and a handler over it, without
+// committing to a router — so a test that needs to substitute one of the
+// handler's seams (e.g. a stalling preparer) can do so before routing.
+func newGroupHandler(t *testing.T) (*Handler, *manager.Manager) {
+	t.Helper()
 	config.Reset()
 	config.SetConfigPath(t.TempDir())
 	t.Cleanup(config.Reset)
@@ -71,12 +90,7 @@ func newGroupRouter(t *testing.T) (http.Handler, *manager.Manager) {
 		t.Fatalf("AddOrUpdate: %v", err)
 	}
 
-	router := chi.NewRouter()
-	// The server mounts the WebDAV routes behind StripSlashes, which is why a
-	// request for "/<group>/" reaches the "/{group}" route at all.
-	router.Use(middleware.StripSlashes)
-	NewHandler(mgr).registerRoutes(router)
-	return router, mgr
+	return NewHandler(mgr), mgr
 }
 
 func propfind(t *testing.T, router http.Handler, target, depth string) *httptest.ResponseRecorder {

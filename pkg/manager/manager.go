@@ -370,6 +370,9 @@ func (m *Manager) initLinkService() {
 		m.persistLinkEntryBad,
 		m.streamClient,
 		m.config.Retries,
+		// Passed as a function, not a value: the ceiling is resolved per call so
+		// a live config apply takes effect without rebuilding the service.
+		m.debridLinkTimeout,
 		logger.New("link"),
 	)
 }

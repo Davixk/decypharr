@@ -12,7 +12,7 @@ import (
 
 func (h *Handler) StreamResponse(entry *storage.Entry, info *manager.FileInfo, w http.ResponseWriter, r *http.Request) error {
 	var err error
-	entry, info, err = h.manager.PrepareFileInfo(entry, info)
+	entry, info, err = h.preparer.PrepareFileInfo(entry, info)
 	if err != nil {
 		var customErr *customerror.Error
 		if errors.As(err, &customErr) {

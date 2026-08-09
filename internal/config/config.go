@@ -488,6 +488,48 @@ type Config struct {
 	// disables it (unbounded passthrough, matching usenet.read_timeout).
 	DebridReadTimeout string `json:"debrid_read_timeout,omitempty"`
 
+	// DebridLinkTimeout bounds how long a caller may WAIT for a debrid download
+	// link to be minted. It covers the phase BEFORE any byte exists, which
+	// DebridReadTimeout cannot see: that one is a byte-progress deadline and is
+	// only armed once link resolution has already returned.
+	//
+	// THE HANG IT PREVENTS. Minting a link can reach the provider's
+	// unrestrict endpoint, a per-account retry chain, every OTHER configured
+	// account in turn, and — when the provider answers "hoster unavailable" —
+	// a full inline re-insertion cascade (submit magnet + poll for status)
+	// repeated up to MaxReinsertionAttempt times. None of that has a ceiling of
+	// its own, and none of it is abortable by the reader: the provider call
+	// chain does not carry the request context. A WebDAV GET could therefore sit
+	// in the handler for MINUTES on a provider flap, which is what puts a FUSE
+	// reader into uninterruptible sleep instead of giving it a prompt error.
+	//
+	// The wait is bounded, not the work: an over-running resolution keeps
+	// running detached and its result still lands in the provider's link cache,
+	// so the client's retry after the 503 is usually served instantly. That is
+	// the "absorb" half; the 503 + Retry-After is the "fail fast" half.
+	//
+	// Default "20s" — a healthy mint is well under a second, and 20s still
+	// leaves room for one slow-but-working mint plus a fallback account while
+	// staying far below every reader's own patience. "0"/"off"/"none" disables
+	// the ceiling and restores the historical unbounded, context-blind wait.
+	DebridLinkTimeout string `json:"debrid_link_timeout,omitempty"`
+
+	// MetadataReadTimeout bounds how long a WebDAV metadata request — PROPFIND
+	// listings and HEAD — may wait on a backend before answering 503.
+	//
+	// THE HANG IT PREVENTS. Only byte-streams had a deadline. A listing had
+	// none of any kind, so it waited on whatever the upstream metadata call did:
+	// for Usenet entries that is a live per-file article/segment preparation
+	// against the NNTP providers, with nothing to trip if it stalls. A stalled
+	// listing wedges `ls`, an *arr scan and a Plex library refresh just as hard
+	// as a stalled read does, and it never produced an error the client could
+	// act on.
+	//
+	// Default "15s" — a listing has no bytes to trickle, so there is no
+	// "slow but progressing" state to protect; a client still waiting after 15s
+	// has already stalled its own queue. "0"/"off"/"none" disables it.
+	MetadataReadTimeout string `json:"metadata_read_timeout,omitempty"`
+
 	Repair RepairConfig `json:"repair,omitzero"`
 
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
@@ -731,6 +773,12 @@ func (c *Config) setDefaults() {
 	}
 	if c.DebridReadTimeout == "" {
 		c.DebridReadTimeout = "60s"
+	}
+	if c.DebridLinkTimeout == "" {
+		c.DebridLinkTimeout = DefaultDebridLinkTimeout
+	}
+	if c.MetadataReadTimeout == "" {
+		c.MetadataReadTimeout = DefaultMetadataReadTimeout
 	}
 
 	for i, debrid := range c.Debrids {
@@ -992,6 +1040,15 @@ func clearHotFields(c *Config) {
 	c.Retries = 0
 	c.SkipAutoMove = false
 	c.Repair = RepairConfig{}
+
+	// Both read-ceiling knobs are resolved live, per request, on the path that
+	// enforces them (Manager.debridLinkTimeout, Handler.metadataReadTimeout).
+	// Nothing caches them in a service struct, so they apply without a restart.
+	// That matters HERE in particular: these are the knobs an operator reaches
+	// for while a backend is actively flapping, and telling them to restart
+	// mid-incident would take the mount down to fix the mount.
+	c.DebridLinkTimeout = ""
+	c.MetadataReadTimeout = ""
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,
 	// so changes apply on the next cleanup cycle without a restart.

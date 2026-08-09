@@ -194,6 +194,35 @@ func IsContentPermanentlyGone(err error) bool {
 	return e.permanent && e.statusCode == http.StatusGone
 }
 
+// NewBackendTimeoutError names decypharr's OWN ceiling firing: a backend did
+// not answer within the time a reader is allowed to wait for it.
+//
+// It is deliberately the exact opposite of NewContentGoneError in every
+// attribute that any downstream consumer reads:
+//
+//   - 503, not 410 or 500. 500 is what this codebase already learned rclone
+//     retries blindly (see link.badEntryError), and 410 is a permanent verdict.
+//     503 is the only honest answer: the machinery was too slow, the content
+//     was never asked about.
+//   - Retryable() and NOT Permanent(), so IsContentPermanentlyGone is false for
+//     it. That is the load-bearing property: a timeout must never let a
+//     collection listing hide a child, let the repair probe call a file broken,
+//     or let anything downstream reach a destructive verdict. A backend that is
+//     merely slow says NOTHING about whether the content exists.
+//   - A fresh error, not a wrapped context.DeadlineExceeded — wrapping one
+//     would make IsSilentError true and the timeout would stop being logged,
+//     which is precisely the diagnostic an operator needs during a flap.
+func NewBackendTimeoutError(err error) *Error {
+	if err == nil {
+		err = errors.New("backend did not respond in time")
+	}
+	return (&Error{
+		err:        err,
+		statusCode: http.StatusServiceUnavailable,
+		Code:       "backend_timeout",
+	}).Retryable()
+}
+
 // NewContentGoneError is the debrid analog of NewArticleNotFoundError: the
 // download link resolved but the upstream reports the content is definitively
 // gone (HTTP 404/410). It carries a permanent 410 so the WebDAV layer maps it

@@ -41,6 +41,7 @@ func TestPlacementRefreshPreservesQueueWorkflowFields(t *testing.T) {
 		nil,
 		http.DefaultClient,
 		0,
+		nil, // these drive getPlacementFile directly; no ceiling is involved
 		zerolog.Nop(),
 	)
 
@@ -76,6 +77,7 @@ func TestPlacementRefreshErrorDoesNotMutateCaller(t *testing.T) {
 		nil,
 		http.DefaultClient,
 		0,
+		nil, // these drive getPlacementFile directly; no ceiling is involved
 		zerolog.Nop(),
 	)
 

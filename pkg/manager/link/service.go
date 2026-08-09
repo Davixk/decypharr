@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -19,6 +20,17 @@ import (
 
 const (
 	MaxReinsertionAttempt = 3
+
+	// backgroundResolveBudget bounds a resolution that has outlived the caller
+	// that started it. Such a resolution is deliberately NOT cancelled — see
+	// GetLink — but it still needs a ceiling or a wedged provider leaks one
+	// goroutine (and one singleflight slot) per file forever.
+	//
+	// 5 minutes because that is already the ceiling Fixer applies to an
+	// in-flight repair (pkg/manager/fixer.go): past it the repair this
+	// resolution may be waiting on has itself given up, so anything still
+	// blocked here is a leak, not work.
+	backgroundResolveBudget = 5 * time.Minute
 )
 
 var (
@@ -34,6 +46,12 @@ type EntrySaver func(entry *storage.Entry) error
 
 // Service handles download link fetching and validation.
 // It uses the account-level cache for storing links and only tracks validation state.
+// ResolveCeiling reports how long a caller may be held waiting for a download
+// link, or <= 0 to disable the ceiling. It is a function, not a value, so the
+// knob stays hot: an operator can shorten it while a provider is flapping
+// without restarting the mount.
+type ResolveCeiling func() time.Duration
+
 type Service struct {
 	validated      *xsync.Map[string, error]
 	singleflight   singleflight.Group
@@ -43,6 +61,7 @@ type Service struct {
 	entrySaver     EntrySaver
 	httpClient     *http.Client
 	retries        int
+	resolveCeiling ResolveCeiling
 	logger         zerolog.Logger
 }
 
@@ -54,6 +73,7 @@ func New(
 	entrySaver EntrySaver,
 	httpClient *http.Client,
 	retries int,
+	resolveCeiling ResolveCeiling,
 	logger zerolog.Logger,
 ) *Service {
 	return &Service{
@@ -64,24 +84,101 @@ func New(
 		entrySaver:     entrySaver,
 		httpClient:     httpClient,
 		retries:        retries,
+		resolveCeiling: resolveCeiling,
 		logger:         logger,
 	}
 }
 
+// ceiling resolves the caller-wait ceiling, treating an unset resolver as
+// "disabled" so a Service built without one keeps its historical behaviour.
+func (s *Service) ceiling() time.Duration {
+	if s.resolveCeiling == nil {
+		return 0
+	}
+	return s.resolveCeiling()
+}
+
 // GetLink fetches and validates a download link for a file in an entry.
 // Links are cached at the account level; this service only tracks validation state.
+//
+// THE WAIT IS BOUNDED; THE WORK IS NOT.
+//
+// Resolving a link is not one call. It is the provider's unrestrict endpoint,
+// behind a per-account retry chain, repeated across every other configured
+// account, and — when the provider answers "hoster unavailable" or hands back an
+// empty link — a full inline re-insertion cascade (submit magnet, then poll the
+// provider for completion) run up to MaxReinsertionAttempt times. Not one link
+// in that chain carries the caller's context: the provider clients build their
+// requests with http.NewRequest, so a disconnected reader cannot abort any of
+// it, and singleflight.Do could not be interrupted either. A WebDAV GET could
+// therefore sit inside this function for MINUTES during a provider flap, which
+// is exactly how a FUSE reader ends up in uninterruptible sleep instead of
+// receiving an error it can act on.
+//
+// So the CALLER is released on a ceiling while the resolution keeps running on
+// a DETACHED context. Both halves matter:
+//
+//   - Releasing the caller is what turns a multi-minute wedge into a prompt,
+//     typed 503 the client can retry or surface as EIO.
+//   - NOT cancelling the work is what makes the flap absorbable: a mint that
+//     lands after the caller gave up is still stored in the provider's
+//     account-level link cache, so the client's next attempt is served from it
+//     with no provider call at all. Cancelling would throw that away and
+//     guarantee the retry pays the same cost again.
+//
+// A late arrival joins the in-flight resolution through singleflight rather
+// than starting a second one, so a retrying client cannot amplify load against
+// a provider that is already struggling.
 func (s *Service) GetLink(ctx context.Context, entry *storage.Entry, filename string) (types.DownloadLink, error) {
 	// Use singleflight to deduplicate concurrent requests for the same file
 	key := entrySingleflightKey(entry, filename)
-	v, err, _ := s.singleflight.Do(key, func() (any, error) {
-		return s.fetchAndValidate(ctx, entry, filename, 0)
-	})
 
-	if err != nil {
+	ceiling := s.ceiling()
+	if ceiling <= 0 {
+		// Ceiling disabled ("0"/"off"/"none"). This is the historical path,
+		// preserved verbatim so the knob is a genuine escape hatch: an operator
+		// who suspects the ceiling itself can turn it off and get back exactly
+		// the old behaviour, unbounded wait included.
+		v, err, _ := s.singleflight.Do(key, func() (any, error) {
+			return s.fetchAndValidate(ctx, entry, filename, 0)
+		})
+		if err != nil {
+			return emptyDownloadLink, err
+		}
+		return v.(types.DownloadLink), nil
+	}
+
+	if err := ctx.Err(); err != nil {
 		return emptyDownloadLink, err
 	}
 
-	return v.(types.DownloadLink), nil
+	result := s.singleflight.DoChan(key, func() (any, error) {
+		// Detached from the caller, bounded by its own budget. context.Values
+		// are kept so anything reading request-scoped state still works.
+		workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), backgroundResolveBudget)
+		defer cancel()
+		return s.fetchAndValidate(workCtx, entry, filename, 0)
+	})
+
+	timer := time.NewTimer(ceiling)
+	defer timer.Stop()
+
+	select {
+	case res := <-result:
+		if res.Err != nil {
+			return emptyDownloadLink, res.Err
+		}
+		link, _ := res.Val.(types.DownloadLink)
+		return link, nil
+	case <-ctx.Done():
+		// The reader hung up. Its own error, not ours — the resolution carries
+		// on detached and warms the cache for whoever asks next.
+		return emptyDownloadLink, ctx.Err()
+	case <-timer.C:
+		return emptyDownloadLink, customerror.NewBackendTimeoutError(
+			fmt.Errorf("download link for %s/%s was not resolved within %s", entry.GetFolder(), filename, ceiling),
+		)
+	}
 }
 
 func entrySingleflightKey(entry *storage.Entry, filename string) string {

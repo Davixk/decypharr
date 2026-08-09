@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,22 +29,7 @@ const defaultDebridReadTimeout = 60 * time.Second
 // zero ("0", "0s", ...) mean disabled (0); negative/invalid values return an
 // error and the caller keeps the default.
 func parseDebridReadTimeout(raw string) (time.Duration, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return defaultDebridReadTimeout, nil
-	}
-	switch strings.ToLower(trimmed) {
-	case "off", "none":
-		return 0, nil
-	}
-	d, err := utils.ParseDuration(trimmed)
-	if err != nil {
-		return defaultDebridReadTimeout, err
-	}
-	if d < 0 {
-		return defaultDebridReadTimeout, fmt.Errorf("negative duration %q", raw)
-	}
-	return d, nil
+	return utils.ParseReadCeiling(raw, defaultDebridReadTimeout)
 }
 
 // debridReadTimeout resolves the effective idle deadline for a debrid stream.
@@ -61,6 +45,34 @@ func (m *Manager) debridReadTimeout() time.Duration {
 		m.logger.Warn().Err(err).Str("debrid_read_timeout", raw).
 			Msg("Invalid debrid_read_timeout; using default")
 		return defaultDebridReadTimeout
+	}
+	return timeout
+}
+
+// defaultDebridLinkTimeout is the fallback ceiling used when the config value is
+// empty (e.g. a lightweight Manager built in tests). It matches the "20s"
+// default seeded by config.setDefaults.
+const defaultDebridLinkTimeout = 20 * time.Second
+
+// debridLinkTimeout resolves how long a READ may wait for a download link to be
+// minted, before any byte exists. It is a different axis from
+// debridReadTimeout: that one is a byte-progress deadline and is not even armed
+// until link resolution has already returned, so it can never see — let alone
+// bound — a stall in the resolution itself.
+//
+// Read live, per call, so the knob applies without a restart. A parse error
+// falls back to the default and is logged, because a typo silently restoring an
+// unbounded wait is the exact failure this ceiling exists to prevent.
+func (m *Manager) debridLinkTimeout() time.Duration {
+	raw := ""
+	if m.config != nil {
+		raw = m.config.DebridLinkTimeout
+	}
+	timeout, err := utils.ParseReadCeiling(raw, defaultDebridLinkTimeout)
+	if err != nil {
+		m.logger.Warn().Err(err).Str("debrid_link_timeout", raw).
+			Msg("Invalid debrid_link_timeout; using default")
+		return defaultDebridLinkTimeout
 	}
 	return timeout
 }

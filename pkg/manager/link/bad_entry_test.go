@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -42,7 +43,11 @@ func newLinkService(t *testing.T, client *countingClient, repairer EntryRepairer
 	config.SetConfigPath(t.TempDir())
 	clients := xsync.NewMap[string, debrid.Client]()
 	clients.Store("provider", client)
-	return New(clients, nil, repairer, saver, http.DefaultClient, 0, zerolog.Nop())
+	// A deliberately generous ceiling: it must never fire in these tests, so
+	// they keep asserting the SAME semantics they always did — but they now
+	// assert them through the bounded/detached resolution path that production
+	// uses, not the disabled escape hatch.
+	return New(clients, nil, repairer, saver, http.DefaultClient, 0, func() time.Duration { return 30 * time.Second }, zerolog.Nop())
 }
 
 // TestBadEntryReadReturnsPermanentGoneWithoutProviderCalls covers FIX X and
