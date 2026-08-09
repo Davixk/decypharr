@@ -160,11 +160,11 @@ func (s *Storage) QueueConsistency() (*QueueConsistencyReport, error) {
 		} else {
 			orphan.DirectReadOK = true
 		}
-		if meta, err := s.queue.GetMeta(key); err == nil && meta != nil {
-			orphan.Name = meta.Name
-			orphan.Category = meta.Category
-			orphan.Protocol = meta.Protocol
-			orphan.Status = meta.Status
+		if meta, err := s.queue.GetMetadata(key); err == nil && meta != nil {
+			orphan.Name = meta.Attribute(attributeName)
+			orphan.Category = meta.Attribute(attributeCategory)
+			orphan.Protocol = meta.Attribute(attributeProtocol)
+			orphan.Status = meta.Attribute(attributeStatus)
 		}
 		candidates = append(candidates, candidate{key: key, orphan: orphan})
 	}
@@ -238,11 +238,11 @@ func (s *Storage) QueueKeyState(infohash string) (*QueueKeyDiagnosis, error) {
 		return nil, fmt.Errorf("scan queue for key %s: %w", key, err)
 	}
 
-	if meta, err := s.queue.GetMeta(key); err == nil && meta != nil {
-		diagnosis.Name = meta.Name
-		diagnosis.Category = meta.Category
-		diagnosis.Protocol = meta.Protocol
-		diagnosis.Status = meta.Status
+	if meta, err := s.queue.GetMetadata(key); err == nil && meta != nil {
+		diagnosis.Name = meta.Attribute(attributeName)
+		diagnosis.Category = meta.Attribute(attributeCategory)
+		diagnosis.Protocol = meta.Attribute(attributeProtocol)
+		diagnosis.Status = meta.Attribute(attributeStatus)
 	}
 
 	diagnosis.Poisoned = diagnosis.InIndex && !diagnosis.ScanYields

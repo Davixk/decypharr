@@ -5,9 +5,9 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sirrobot01/appendstore"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -316,7 +316,7 @@ func (s *Storage) persistAdoptedFileDeletions(infohash string, fileNames map[str
 	if err != nil {
 		return fmt.Errorf("marshal entry %s after legacy deletion adoption: %w", infohash, err)
 	}
-	if err := s.entries.Put(infohash, data, entryMetadata(entry)); err != nil {
+	if err := s.entries.Put(infohash, data, entryPutOptions(entry)); err != nil {
 		return fmt.Errorf("persist entry %s after legacy deletion adoption: %w", infohash, err)
 	}
 	s.logger.Info().Str("entry", infohash).Int("files", len(fileNames)).Msg("Adopted legacy file soft-deletes into authoritative entry")
@@ -326,7 +326,7 @@ func (s *Storage) persistAdoptedFileDeletions(infohash string, fileNames map[str
 // GetEntryItems returns all entry item names
 func (s *Storage) GetEntryItems() map[string]struct{} {
 	items := make(map[string]struct{})
-	_ = s.entryItems.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
+	_ = s.entryItems.ForEachMetadata(func(key string, meta *appendstore.Metadata) error {
 		items[key] = struct{}{}
 		return nil
 	})
@@ -538,9 +538,9 @@ func (s *Storage) entryItemAliasIndex() map[string]map[string]struct{} {
 	}
 
 	index := make(map[string]map[string]struct{})
-	// ForEachMeta reads the in-memory key index only — no disk reads, no
+	// ForEachMetadata reads the in-memory key index only — no disk reads, no
 	// protobuf decoding.
-	_ = s.entryItems.ForEachMeta(func(key string, _ *hybrid.IndexEntry) error {
+	_ = s.entryItems.ForEachMetadata(func(key string, _ *appendstore.Metadata) error {
 		stripped := utils.RemoveExtension(key)
 		if stripped == key {
 			return nil

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
+	"github.com/sirrobot01/appendstore"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -93,7 +93,7 @@ func (s *Storage) addOrUpdateLocked(entry *Entry) error {
 		return fmt.Errorf("failed to marshal entry: %w", err)
 	}
 
-	if err := s.entries.Put(entry.InfoHash, data, entryMetadata(entry)); err != nil {
+	if err := s.entries.Put(entry.InfoHash, data, entryPutOptions(entry)); err != nil {
 		return err
 	}
 	committed = true
@@ -368,15 +368,15 @@ type EntryMetaInfo struct {
 // ForEachMeta iterates over entry metadata without reading full entries from disk.
 // This is O(n) in-memory only - no disk reads, no protobuf deserialization.
 func (s *Storage) ForEachMeta(fn func(*EntryMetaInfo) error) error {
-	return s.entries.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
+	return s.entries.ForEachMetadata(func(key string, meta *appendstore.Metadata) error {
 		return fn(&EntryMetaInfo{
 			InfoHash: key,
-			Name:     meta.Name,
-			Size:     meta.TotalSize,
-			AddedOn:  time.Unix(meta.AddedOn, 0),
-			Provider: meta.Provider,
-			Protocol: meta.Protocol,
-			Bad:      meta.Bad,
+			Name:     meta.Attribute(attributeName),
+			Size:     metadataInt64(meta, attributeTotalSize),
+			AddedOn:  time.Unix(metadataInt64(meta, attributeAddedOn), 0),
+			Provider: meta.Attribute(attributeProvider),
+			Protocol: meta.Attribute(attributeProtocol),
+			Bad:      metadataBool(meta, attributeBad),
 		})
 	})
 }
@@ -390,13 +390,13 @@ func (s *Storage) ForEachMeta(fn func(*EntryMetaInfo) error) error {
 // failures against the underlying store still abort.
 func (s *Storage) MigrateMetadata() (int, int, error) {
 	var mainKeys []string
-	if err := s.entries.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
+	if err := s.entries.ForEachMetadata(func(key string, meta *appendstore.Metadata) error {
 		// Skip special keys
 		if strings.HasPrefix(key, "__") {
 			return nil
 		}
 		// Check if metadata needs migration (Protocol empty = old format)
-		if meta.Protocol == "" {
+		if meta.Attribute(attributeProtocol) == "" {
 			mainKeys = append(mainKeys, key)
 		}
 		return nil
@@ -404,8 +404,8 @@ func (s *Storage) MigrateMetadata() (int, int, error) {
 		return 0, 0, fmt.Errorf("scan main entry metadata: %w", err)
 	}
 	var queueKeys []string
-	if err := s.queue.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
-		if meta.Protocol == "" {
+	if err := s.queue.ForEachMetadata(func(key string, meta *appendstore.Metadata) error {
+		if meta.Attribute(attributeProtocol) == "" {
 			queueKeys = append(queueKeys, key)
 		}
 		return nil
@@ -423,7 +423,7 @@ func (s *Storage) MigrateMetadata() (int, int, error) {
 			var data []byte
 			data, err = proto.Marshal(pb)
 			if err == nil {
-				err = s.entries.Put(key, data, entryMetadata(entry))
+				err = s.entries.Put(key, data, entryPutOptions(entry))
 			}
 			if err == nil {
 				s.updateEntryItem(entry)
@@ -451,7 +451,7 @@ func (s *Storage) MigrateMetadata() (int, int, error) {
 			var data []byte
 			data, err = proto.Marshal(pb)
 			if err == nil {
-				err = s.queue.Put(strings.ToLower(key), data, entryMetadata(entry))
+				err = s.queue.Put(strings.ToLower(key), data, entryPutOptions(entry))
 			}
 		}
 		unlock()
@@ -474,7 +474,7 @@ func (s *Storage) MigrateMetadata() (int, int, error) {
 
 // loadEntryClassified separates row-level corruption from store-level I/O
 // failures. It returns (nil, nil, nil) when the key no longer exists.
-func (s *Storage) loadEntryClassified(store *hybrid.Store, key string) (*Entry, error, error) {
+func (s *Storage) loadEntryClassified(store *appendstore.Store, key string) (*Entry, error, error) {
 	data, err := store.Get(key)
 	if err != nil {
 		if !store.Exists(key) {
@@ -736,36 +736,7 @@ func (s *Storage) putQueueLocked(entry *Entry) error {
 		return err
 	}
 
-	return s.queue.Put(strings.ToLower(entry.InfoHash), data, entryMetadata(entry))
-}
-
-func entryMetadata(entry *Entry) *hybrid.EntryMeta {
-	return &hybrid.EntryMeta{
-		Category:  entry.Category,
-		Provider:  entry.ActiveProvider,
-		Status:    string(entry.Status),
-		Name:      entry.GetFolder(),
-		TotalSize: entry.Size,
-		Protocol:  string(entry.Protocol),
-		Bad:       entry.Bad,
-		AddedOn:   entry.AddedOn.Unix(),
-	}
-}
-
-func indexedEntryMetadata(indexed *hybrid.IndexEntry) *hybrid.EntryMeta {
-	if indexed == nil {
-		return nil
-	}
-	return &hybrid.EntryMeta{
-		Category:  indexed.Category,
-		Provider:  indexed.Provider,
-		Status:    indexed.Status,
-		Name:      indexed.Name,
-		TotalSize: indexed.TotalSize,
-		Protocol:  indexed.Protocol,
-		Bad:       indexed.Bad,
-		AddedOn:   indexed.AddedOn,
-	}
+	return s.queue.Put(strings.ToLower(entry.InfoHash), data, entryPutOptions(entry))
 }
 
 // GetQueued retrieves a queued entry.
@@ -779,7 +750,7 @@ func (s *Storage) GetQueued(infohash string) (*Entry, error) {
 	key := strings.ToLower(infohash)
 	data, err := s.queue.Get(key)
 	if err != nil {
-		if errors.Is(err, hybrid.ErrKeyNotFound) {
+		if errors.Is(err, appendstore.ErrKeyNotFound) {
 			return nil, fmt.Errorf("%w for queue entry %s", ErrEntryNotFound, key)
 		}
 		return nil, err
@@ -1003,11 +974,11 @@ func (s *Storage) migrateMainStoreVersion(key string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("marshal versioned main entry %s: %w", key, err)
 	}
-	indexed, metaErr := s.entries.GetMeta(key)
+	indexed, metaErr := s.entries.GetMetadata(key)
 	if metaErr != nil {
 		return false, fmt.Errorf("load legacy main metadata %s: %w", key, metaErr)
 	}
-	if err := s.entries.Put(key, data, indexedEntryMetadata(indexed)); err != nil {
+	if err := s.entries.Put(key, data, indexedPutOptions(indexed)); err != nil {
 		return false, fmt.Errorf("persist versioned main entry %s: %w", key, err)
 	}
 	return true, nil
@@ -1031,11 +1002,11 @@ func (s *Storage) migrateQueueStoreVersion(key string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("marshal versioned queue entry %s: %w", key, err)
 	}
-	indexed, metaErr := s.queue.GetMeta(key)
+	indexed, metaErr := s.queue.GetMetadata(key)
 	if metaErr != nil {
 		return false, fmt.Errorf("load legacy queue metadata %s: %w", key, metaErr)
 	}
-	if err := s.queue.Put(key, data, indexedEntryMetadata(indexed)); err != nil {
+	if err := s.queue.Put(key, data, indexedPutOptions(indexed)); err != nil {
 		return false, fmt.Errorf("persist versioned queue entry %s: %w", key, err)
 	}
 	return true, nil
@@ -1329,13 +1300,13 @@ func (s *Storage) FilterQueued(filter func(*Entry) bool) ([]*Entry, error) {
 			event := s.logger.Error().Err(err).
 				Str("infohash", key).
 				Int("record_bytes", len(value))
-			if meta, metaErr := s.queue.GetMeta(key); metaErr == nil && meta != nil {
+			if meta, metaErr := s.queue.GetMetadata(key); metaErr == nil && meta != nil {
 				event = event.
-					Str("category", meta.Category).
-					Str("protocol", meta.Protocol).
-					Str("name", meta.Name).
-					Str("status", meta.Status).
-					Int64("added_on", meta.AddedOn)
+					Str("category", meta.Attribute(attributeCategory)).
+					Str("protocol", meta.Attribute(attributeProtocol)).
+					Str("name", meta.Attribute(attributeName)).
+					Str("status", meta.Attribute(attributeStatus)).
+					Int64("added_on", metadataInt64(meta, attributeAddedOn))
 			}
 			event.Msg("Undecodable queue record skipped by scan; entry is invisible to listings but still blocks re-add")
 			return nil
