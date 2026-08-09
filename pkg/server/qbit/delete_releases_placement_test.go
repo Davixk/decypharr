@@ -12,21 +12,31 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
-// THE PROVIDER-SLOT LEAK.
+// ⚠️ THE DOCTRINE THIS FILE ONCE ASSERTED WAS REVERSED. Read this before
+// "restoring" anything.
 //
-// /api/v2/torrents/delete is the endpoint Sonarr and Radarr call when they
-// abandon a download. It passed a nil cleanup unconditionally, so the queue row
-// went and the provider transfer kept running — forever, holding a slot nothing
-// could reclaim, because every release path in decypharr starts from a local
-// entry that no longer existed.
+// /api/v2/torrents/delete is the endpoint Sonarr and Radarr call. This file used
+// to argue that honouring qBittorrent's deleteFiles parameter against the
+// PROVIDER was the fix for a slot leak — 94 of 96 active RealDebrid transfers
+// with no local record. That leak was real. Honouring the flag here was not the
+// fix, and it destroyed the library.
 //
-// Measured on a live account: 94 of 96 active RealDebrid transfers had no local
-// record, 93 still downloading, 67 of them 50-99% complete, median age 33.5h.
-// The *arrs' own stalled-download handling is the likely trigger — which means
-// the cleanup was causing the congestion it was meant to relieve.
+// An *arr's routine POST-IMPORT cleanup sends deleteFiles=true. By then it has
+// already imported the release as a symlink pointing INTO the mount, so the
+// "downloaded data" it means and the bytes the library now depends on are the
+// same bytes. Measured: 2,592 provider-copy releases in 24h; MissingFromDisk
+// reaps climbing 56/day to 8,302/day; each one re-searched and re-grabbed.
 //
-// qBittorrent's deleteFiles parameter is how the caller says whether the data
-// goes too. decypharr never read it.
+// The endpoint now passes a nil cleanup unconditionally, matching upstream. The
+// slot leak belongs to the provider-sourced stall prune, which reaps abandoned
+// transfers from the provider's OWN active list with no local record needed —
+// machinery that did not exist when the original change was made.
+//
+// ⚠️ LIMIT OF THESE TESTS, STATED HONESTLY: this fixture has no configured
+// provider, so "the provider copy was not released" is NOT mechanically
+// observable here — these tests would pass under either behaviour. The real
+// guard is at the manager layer, where a fake client can record deletes. Do not
+// read a green run in this package as proof the invariant holds.
 
 func seedDeletableEntry(t *testing.T, q *QBit, hash string) {
 	t.Helper()
@@ -59,19 +69,10 @@ func invokeDelete(t *testing.T, q *QBit, form url.Values, wantStatus int) {
 	}
 }
 
-// TestDeleteCompletesEvenIfThePlacementCannotBeReleased.
-//
-// This fixture has no configured provider, so releasing the placement fails —
-// which is the interesting case, not an artefact. Failing the REQUEST would
-// leave the queue row AND the placement, with the *arr retrying the same call
-// forever against the same broken condition; the row would become undeletable.
-//
-// So the release failure is logged loudly and the delete completes. What breaks
-// the tie is that a leaked placement is now RECOVERABLE — the provider-sourced
-// stall prune finds abandoned transfers from the provider's own active list and
-// needs no local record — so the worst case degrades to "an orphan the other
-// sweep reaps" rather than "an orphan nothing can ever see".
-func TestDeleteCompletesEvenIfThePlacementCannotBeReleased(t *testing.T) {
+// A delete carrying deleteFiles=true still drops the queue row — the caller is
+// entitled to have its queue item removed. What it must NOT do is take the
+// provider copy with it; see the file header.
+func TestDeleteWithDeleteFilesStillDropsTheQueueRow(t *testing.T) {
 	m := newQBitTestManager(t)
 	q := New(m)
 	seedDeletableEntry(t, q, "gone-hash")
@@ -84,11 +85,10 @@ func TestDeleteCompletesEvenIfThePlacementCannotBeReleased(t *testing.T) {
 	}
 }
 
-// TestDeleteWithoutDeleteFilesKeepsTheProviderCopy. qBittorrent's contract:
-// without the flag, the client forgets the torrent but the data stays. For a
-// debrid client the provider copy IS the data, so it must survive — this is the
-// case where an *arr is merely reorganising its queue, not abandoning content.
-func TestDeleteWithoutDeleteFilesKeepsTheProviderCopy(t *testing.T) {
+// The same outcome without the flag. Both spellings now behave identically at
+// this endpoint, which is the point: the flag no longer selects between two
+// behaviours, it is only recorded.
+func TestDeleteWithoutDeleteFilesDropsTheQueueRow(t *testing.T) {
 	m := newQBitTestManager(t)
 	q := New(m)
 	seedDeletableEntry(t, q, "keep-hash")

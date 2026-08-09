@@ -228,61 +228,47 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No hashes provided", http.StatusBadRequest)
 		return
 	}
-	// deleteFiles is qBittorrent's "also remove the downloaded data", and the
-	// *arrs already send it when they abandon a download.
+	// 🔴 THIS ENDPOINT MUST NEVER RELEASE A PROVIDER COPY, WHATEVER deleteFiles SAYS.
 	//
-	// IGNORING IT WAS THE PROVIDER-SLOT LEAK. This endpoint passed a nil cleanup
-	// unconditionally, so the queue row went and the provider transfer kept
-	// running — forever, holding a slot nothing could reclaim, because every
-	// release path in decypharr starts from a local entry that no longer
-	// existed. Measured on a live account: 94 of 96 active RealDebrid transfers
-	// had no local record, 93 still downloading, 67 between 50% and 99%
-	// complete. The *arrs' own stalled-download handling is the likely trigger,
-	// which means the cleanup was causing the congestion.
+	// It used to. The reasoning looked sound — for a debrid client the provider
+	// copy IS the downloaded data, so honouring qBittorrent's "also remove the
+	// downloaded data" seemed like simply doing what the caller asked. It was
+	// wrong, and it destroyed the library.
 	//
-	// For a debrid client the provider copy IS the downloaded data, so honouring
-	// the flag means releasing the placement. That is not a guess about what the
-	// operator wants — it is doing what the caller explicitly asked for.
+	// AN *ARR'S ROUTINE POST-IMPORT CLEANUP SENDS deleteFiles=true. By then it has
+	// already imported the release — as a symlink pointing INTO the mount. So the
+	// "downloaded data" the caller means (its own scratch copy) and the bytes the
+	// library now depends on are THE SAME BYTES. Releasing the provider copy
+	// deletes the file the library was just built from. Measured on this deployment:
+	// 2,592 provider-copy releases in 24h, MissingFromDisk reaps climbing 56/day to
+	// 8,302/day, each one re-searched and re-grabbed. Sonarr imports, one second
+	// later its remove-completed fires, and the episode it just filed is gone.
+	//
+	// A guard existed and did not help, which is worth stating exactly:
+	// removeProviderPlacementIfUnreferenced asks "does another decypharr ROW share
+	// this debrid torrent?" It knows nothing about library symlinks. A normal
+	// imported release has one row, the owner is skipped by construction, so the
+	// scan finds nothing and the release proceeds. The row was guarded; the CONTENT
+	// the symlink resolves to never was.
+	//
+	// Upstream never did this: its handler parses hashes only and passes a nil
+	// cleanup. That is not an oversight on their part, it is the correct semantics
+	// for a client whose data lives behind a mount — and the SAB shim here already
+	// agreed with upstream, so the two shims disagreeing was itself the tell.
+	//
+	// The slot leak that motivated the original change is real but belongs
+	// elsewhere: the provider-sourced stall prune reaps abandoned transfers from
+	// the provider's OWN active list with no local record needed. That did not
+	// exist when this was written; it does now, so this path is redundant as well
+	// as destructive. Provider-copy release belongs to repair/prune and explicit
+	// operator actions — every one of which knows whether content is still needed.
+	//
+	// deleteFiles is still PARSED and LOGGED. Knowing what callers send is how the
+	// above was diagnosed, and it costs nothing to keep.
 	_ = r.ParseForm()
 	rawDeleteFiles := r.FormValue("deleteFiles")
 	deleteFiles := strings.EqualFold(strings.TrimSpace(rawDeleteFiles), "true")
 	caller := describeDeleteCaller(r)
-
-	var cleanup func(*storage.Entry) error
-	if deleteFiles {
-		cleanup = func(entry *storage.Entry) error {
-			// The PLACEMENT only. The main-store row, if one exists, is the
-			// library record and is not this endpoint's to remove: the caller
-			// asked to drop a queue item, and conflating the two would delete
-			// library content during a routine *arr queue removal.
-			if err := q.manager.RemoveTorrentPlacements(entry); err != nil {
-				// REPORTED, BUT NOT FATAL TO THE DELETE — and this is a
-				// judgement, so here is the reasoning.
-				//
-				// Failing the request leaves the queue row AND the placement,
-				// and the *arr retries the same call forever against the same
-				// broken condition. Nothing improves and the row becomes
-				// undeletable. Completing the delete leaks the placement, which
-				// is what this whole fix exists to stop.
-				//
-				// What breaks the tie is that a leaked placement is now
-				// RECOVERABLE: the provider-sourced stall prune finds abandoned
-				// transfers from the provider's own active list and needs no
-				// local record to act. So the worst case degrades to "an orphan
-				// the other sweep reaps", not "an orphan nothing can ever see"
-				// — which was the old behaviour, silently, on every delete.
-				q.logger.Error().Err(err).
-					Str("infohash", entry.InfoHash).
-					Str("provider", entry.ActiveProvider).
-					Msg("Could not release the provider placement for a deleted queue entry. The queue row is " +
-						"removed as requested; the provider copy may still be holding a slot. The " +
-						"provider-sourced stall prune reaps transfers like this from the provider's own " +
-						"list, so it is recoverable — but repeated occurrences point at a provider or " +
-						"credential problem worth fixing.")
-			}
-			return nil
-		}
-	}
 
 	for _, hash := range hashes {
 		// LOGGED ON SUCCESS, not just on failure.
@@ -298,22 +284,20 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 		// and three separate root-cause theories died for want of exactly this
 		// line. It records who was removed and whether the provider copy went
 		// with them.
-		err := q.manager.Queue().Delete(hash, cleanup)
+		// NIL CLEANUP, UNCONDITIONALLY — matching upstream. See the block above for
+		// why deleteFiles must not reach the provider from here.
+		err := q.manager.Queue().Delete(hash, nil)
 		switch {
 		case err == nil:
 			// ⚠️ THE ATTRIBUTION IS THE POINT, NOT THE OUTCOME.
 			//
-			// Measured on .53: 170 deletes arrived with delete_files=false in four
-			// hours against 108 with true. Each false one is decypharr correctly
-			// keeping the provider copy the caller asked it to keep — and each one
-			// leaves a transfer burning a slot for content the *arr has already
-			// replaced. The behaviour is right; the REQUESTS are the question.
-			//
-			// So the line records what was received and who sent it. The operator's
-			// queue-resolver script sends removeFromClient=true, which means the
-			// translation to delete_files=false happens somewhere between that and
-			// here — and narrowing "somewhere" needs the caller on the line, not
-			// just the flag.
+			// The flag no longer changes what this endpoint DOES, so it would be
+			// easy to argue for dropping it from the line. Keep it. Reading these
+			// fields is how the library destruction was diagnosed at all: the
+			// 170-false / 108-true split over four hours is what made the parameter
+			// the subject, and the caller fields are what identified an operator
+			// cron rather than an *arr as the source of the false ones. The next
+			// question about this endpoint will be answered the same way.
 			//
 			// raw_delete_files is kept ALONGSIDE the parsed bool deliberately: an
 			// absent parameter and an explicit "false" are indistinguishable once
@@ -329,12 +313,8 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 			if category := r.FormValue("category"); category != "" {
 				ev = ev.Str("category", category)
 			}
-			if deleteFiles {
-				ev.Msg("Queue entry deleted via the qBittorrent API; delete_files=true released the provider copy")
-			} else {
-				ev.Msg("Queue entry deleted via the qBittorrent API. delete_files=false keeps the provider copy, " +
-					"which continues to occupy a slot")
-			}
+			ev.Msg("Queue entry deleted via the qBittorrent API. The provider copy is KEPT regardless of " +
+				"delete_files — releasing it here would delete content the library has already imported")
 		case errors.Is(err, storage.ErrEntryNotFound):
 			// An entry that is already absent is a satisfied delete, not a
 			// failure. This previously matched on the message text containing
