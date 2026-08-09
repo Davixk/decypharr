@@ -251,10 +251,27 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 	// scan finds nothing and the release proceeds. The row was guarded; the CONTENT
 	// the symlink resolves to never was.
 	//
-	// Upstream never did this: its handler parses hashes only and passes a nil
-	// cleanup. That is not an oversight on their part, it is the correct semantics
-	// for a client whose data lives behind a mount — and the SAB shim here already
-	// agreed with upstream, so the two shims disagreeing was itself the tell.
+	// WHAT qBittorrent'S FLAG ACTUALLY MAPS TO HERE. In a real torrent client,
+	// "remove the files" deletes the DOWNLOAD FOLDER, which is safe after an
+	// import because the *arr already has its own copy. decypharr's equivalent of
+	// that folder is downloads/<cat>/<name>, holding SYMLINKS into the mount
+	// (downloader.go, os.Symlink(fullPath, fileSymlinkPath)). Removing those is
+	// the honest analogue — and Queue.Delete already does it unconditionally.
+	//
+	// The library is NOT downstream of those symlinks: the *arr's own entry
+	// resolves to the mount directly, which is why losing the provider copy made
+	// library entries dangle immediately. Library and downloads are SIBLING links
+	// to the same target. Deleting the downloads one is harmless; deleting the
+	// target kills both.
+	//
+	// Upstream never released the provider copy, and the SAB shim here already
+	// agreed with upstream — the two shims disagreeing was itself the tell.
+	//
+	// KNOWN DEVIATION, deliberately left: the downloads folder is removed whether
+	// delete_files is true or false, so a caller sending false does not get the
+	// "keep the data" half of qBittorrent's contract. Harmless after an import
+	// (the library does not depend on it) and it matches upstream, so it stays
+	// until there is evidence it costs something.
 	//
 	// The slot leak that motivated the original change is real but belongs
 	// elsewhere: the provider-sourced stall prune reaps abandoned transfers from
@@ -284,8 +301,12 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 		// and three separate root-cause theories died for want of exactly this
 		// line. It records who was removed and whether the provider copy went
 		// with them.
-		// NIL CLEANUP, UNCONDITIONALLY — matching upstream. See the block above for
-		// why deleteFiles must not reach the provider from here.
+		// No EXTRA cleanup — which is not the same as deleting nothing, and the
+		// distinction is easy to lose. Queue.Delete always runs deleteEntryFiles
+		// through wrapCleanupWithFileDelete, so the local downloads/<cat>/<name>
+		// symlink folder is removed here exactly as it always was. The `cleanup`
+		// argument is additional work layered on top, and it is the provider-side
+		// release that must not happen. See the block above.
 		err := q.manager.Queue().Delete(hash, nil)
 		switch {
 		case err == nil:
