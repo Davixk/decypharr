@@ -206,7 +206,8 @@ func run(opts options, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "error: open storage: %v\n", err)
 		return exitBadState
 	}
-	// Close is mandatory: it flushes the hybrid store's sync loop to disk.
+	// Close is mandatory: it flushes the store's sync loop to disk and releases
+	// the exclusive lock appendstore holds on each database file.
 	defer func() {
 		if cerr := store.Close(); cerr != nil {
 			fmt.Fprintf(stderr, "error: closing storage: %v\n", cerr)

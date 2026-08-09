@@ -16,7 +16,6 @@ require (
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/javi11/sevenzip v1.6.2-0.20251026160715-ca961b7f1239
 	github.com/klauspost/compress v1.18.0
-	github.com/puzpuzpuz/xsync/v3 v3.5.1
 	github.com/puzpuzpuz/xsync/v4 v4.1.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/rs/zerolog v1.33.0
