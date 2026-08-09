@@ -20,6 +20,7 @@ require (
 	github.com/puzpuzpuz/xsync/v4 v4.1.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/rs/zerolog v1.33.0
+	github.com/sirrobot01/appendstore v0.6.0
 	github.com/sourcegraph/conc v0.3.0
 	github.com/stanNthe5/stringbuf v0.0.3
 	github.com/winfsp/cgofuse v1.6.0
@@ -66,3 +67,11 @@ require (
 	golang.org/x/arch v0.0.0-20210923205945-b76863e36670 // indirect
 	golang.org/x/text v0.29.0 // indirect
 )
+
+// appendstore is consumed from our fork, which carries the non-blocking
+// compaction (with the tombstone a delete taken mid-rewrite needs), the
+// sorted-key cache race fix, and the index consistency guard. The upstream
+// module path stays on the left so import paths never change, and the fork
+// keeps that same path in its own go.mod, which is what a versioned replace
+// checks.
+replace github.com/sirrobot01/appendstore => github.com/Davixk/appendstore v0.6.1-fork.2

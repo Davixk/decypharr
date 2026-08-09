@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sirrobot01/appendstore"
 	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -573,12 +573,12 @@ func TestLegacyRowsAreVersionedBeforeSnapshotsEscape(t *testing.T) {
 	if file := item.Files["legacy.mkv"]; file == nil || file.InfoHash != legacy.InfoHash {
 		t.Fatalf("legacy metadata migration did not rebuild folder index: %+v", item.Files)
 	}
-	for storeName, hybridStore := range map[string]*hybrid.Store{"main": store.entries, "queue": store.queue} {
-		meta, err := hybridStore.GetMeta(legacy.InfoHash)
+	for storeName, store := range map[string]*appendstore.Store{"main": store.entries, "queue": store.queue} {
+		meta, err := store.GetMetadata(legacy.InfoHash)
 		if err != nil {
-			t.Fatalf("GetMeta %s: %v", storeName, err)
+			t.Fatalf("GetMetadata %s: %v", storeName, err)
 		}
-		if meta.Protocol != string(legacy.Protocol) || meta.Name != legacy.GetFolder() {
+		if meta.Attribute(attributeProtocol) != string(legacy.Protocol) || meta.Attribute(attributeName) != legacy.GetFolder() {
 			t.Fatalf("%s legacy metadata not rebuilt: %+v", storeName, meta)
 		}
 	}
@@ -1087,15 +1087,17 @@ func TestCopyFromPreservesMetadataForAlreadyVersionedRows(t *testing.T) {
 		t.Fatalf("copyFrom: %v", err)
 	}
 
-	assertMetadata := func(storeName string, each func(func(string, *hybrid.IndexEntry) error) error) {
+	assertMetadata := func(storeName string, each func(func(string, *appendstore.Metadata) error) error) {
 		t.Helper()
 		found := false
-		if err := each(func(key string, meta *hybrid.IndexEntry) error {
+		if err := each(func(key string, meta *appendstore.Metadata) error {
 			if key != entry.InfoHash {
 				return nil
 			}
 			found = true
-			if meta.Name != entry.GetFolder() || meta.Protocol != string(entry.Protocol) || meta.Provider != entry.ActiveProvider || meta.TotalSize != entry.Size || !meta.Bad {
+			if meta.Attribute(attributeName) != entry.GetFolder() || meta.Attribute(attributeProtocol) != string(entry.Protocol) ||
+				meta.Attribute(attributeProvider) != entry.ActiveProvider || metadataInt64(meta, attributeTotalSize) != entry.Size ||
+				!metadataBool(meta, attributeBad) {
 				t.Errorf("%s metadata not preserved: %+v", storeName, meta)
 			}
 			return nil
@@ -1106,8 +1108,8 @@ func TestCopyFromPreservesMetadataForAlreadyVersionedRows(t *testing.T) {
 			t.Fatalf("%s metadata missing copied row", storeName)
 		}
 	}
-	assertMetadata("main", destination.entries.ForEachMeta)
-	assertMetadata("queue", destination.queue.ForEachMeta)
+	assertMetadata("main", destination.entries.ForEachMetadata)
+	assertMetadata("queue", destination.queue.ForEachMetadata)
 }
 
 func newAtomicMutationTestStorage(t *testing.T) (*Storage, *Entry) {

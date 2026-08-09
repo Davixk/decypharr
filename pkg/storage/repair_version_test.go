@@ -6,8 +6,8 @@ import (
 	"time"
 
 	json "github.com/bytedance/sonic"
+	"github.com/sirrobot01/appendstore"
 	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 )
 
 // The regression these tests pin, stated once:
@@ -198,7 +198,7 @@ func TestProbeVersionSurvivesStorageRoundTrip(t *testing.T) {
 		`"last_ok_at":"` + now.Format(time.RFC3339Nano) + `",` +
 		`"next_check_due_at":"` + now.Add(recheck).Format(time.RFC3339Nano) + `",` +
 		`"updated_at":"` + now.Format(time.RFC3339Nano) + `"}`
-	if err := store.repairState.Put("Ancient.Release", []byte(oldFormat), &hybrid.EntryMeta{Status: string(HealthHealthy)}); err != nil {
+	if err := store.repairState.Put("Ancient.Release", []byte(oldFormat), &appendstore.PutOptions{Attributes: map[string]string{attributeStatus: string(HealthHealthy)}}); err != nil {
 		t.Fatalf("seed old-format record: %v", err)
 	}
 
@@ -224,7 +224,7 @@ func TestProbeVersionSurvivesStorageRoundTrip(t *testing.T) {
 		strconv.Itoa(RepairProbeVersion) + `,"some_future_field":{"a":1},` +
 		`"last_checked_at":"` + now.Format(time.RFC3339Nano) + `",` +
 		`"next_check_due_at":"` + now.Add(recheck).Format(time.RFC3339Nano) + `"}`
-	if err := store.repairState.Put("Future.Release", []byte(forward), &hybrid.EntryMeta{Status: string(HealthHealthy)}); err != nil {
+	if err := store.repairState.Put("Future.Release", []byte(forward), &appendstore.PutOptions{Attributes: map[string]string{attributeStatus: string(HealthHealthy)}}); err != nil {
 		t.Fatalf("seed forward-compat record: %v", err)
 	}
 
