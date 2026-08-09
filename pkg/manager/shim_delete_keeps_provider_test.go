@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -84,5 +85,61 @@ func TestPlacementCleanupDoesReachTheProvider(t *testing.T) {
 	if len(deleted) != 1 || deleted[0] != "placement-drop-the-bytes" {
 		t.Fatalf("placement cleanup did not release the provider copy, got %v. This test exists to prove the "+
 			"fixture can see a provider delete at all — if it cannot, the nil-cleanup test proves nothing.", deleted)
+	}
+}
+
+// WHAT delete_files ACTUALLY SELECTS: the local download folder.
+//
+// qBittorrent's contract is "forget the torrent, and optionally delete the
+// downloaded data". decypharr's equivalent of that data is the symlink folder in
+// downloads — so true removes it and false keeps it. These two tests are a pair;
+// each is the other's control, because either one alone would pass against a
+// Delete that ignored the flag in the convenient direction.
+func seedWithDownloadFolder(t *testing.T, m *Manager, hash string) string {
+	t.Helper()
+	root := t.TempDir()
+	entry := &storage.Entry{
+		Protocol: config.ProtocolTorrent,
+		InfoHash: hash,
+		Name:     hash,
+		SavePath: root,
+		AddedOn:  time.Unix(1_700_000_000, 0).UTC(),
+		Files:    map[string]*storage.File{},
+	}
+	if err := m.queue.Add(entry); err != nil {
+		t.Fatalf("Add %s: %v", hash, err)
+	}
+	dir := entry.DownloadPath()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", dir, err)
+	}
+	return dir
+}
+
+func TestDeleteRemovesTheDownloadFolder(t *testing.T) {
+	m, _ := newPlacementTestManager(t)
+	dir := seedWithDownloadFolder(t, m, "drop-the-links")
+
+	if err := m.queue.Delete("drop-the-links", nil); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("delete_files=true left the download folder %s behind (stat err=%v)", dir, err)
+	}
+}
+
+func TestDeleteKeepingLocalFilesLeavesTheDownloadFolder(t *testing.T) {
+	m, _ := newPlacementTestManager(t)
+	dir := seedWithDownloadFolder(t, m, "keep-the-links")
+
+	if err := m.queue.DeleteKeepingLocalFiles("keep-the-links", nil); err != nil {
+		t.Fatalf("DeleteKeepingLocalFiles: %v", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("delete_files=false removed the download folder %s — the caller asked to KEEP its data "+
+			"and may still be importing from it (stat err=%v)", dir, err)
+	}
+	if _, err := m.queue.GetTorrent("keep-the-links"); err == nil {
+		t.Fatal("the queue row survived — keeping the files must not keep the row")
 	}
 }

@@ -256,7 +256,36 @@ func (q *Queue) wrapCleanupWithFileDelete(cleanup func(t *storage.Entry) error) 
 	}
 }
 
+// Delete removes a queue row AND its local download folder. This is the
+// behaviour every internal caller wants, and it is what upstream does.
 func (q *Queue) Delete(infohash string, cleanup func(t *storage.Entry) error) error {
+	return q.deleteWithLocalFiles(infohash, cleanup, true)
+}
+
+// DeleteKeepingLocalFiles removes the queue row but LEAVES downloads/<cat>/<name>
+// in place.
+//
+// This exists for exactly one caller: a qBittorrent client that sent
+// deleteFiles=false. That is not a decypharr concept — it is qBittorrent's
+// contract, and it says "forget the torrent, keep the downloaded data". The
+// honest local analogue of "the downloaded data" here is the symlink folder,
+// because that is what a real torrent client would have put on disk and what an
+// *arr would have imported from.
+//
+// Deleting it regardless of the flag is what we used to do (and what upstream
+// still does). It is harmless AFTER an import — the library resolves to the
+// mount directly, not through these links — but it is not what the caller asked
+// for, and a caller that says "keep my data" while an import is still in flight
+// is entitled to have it kept.
+//
+// Leaving the folder behind is safe on a later re-add: the symlink directory is
+// created with MkdirAll and each link tolerates os.IsExist, so a stale folder is
+// reused rather than colliding.
+func (q *Queue) DeleteKeepingLocalFiles(infohash string, cleanup func(t *storage.Entry) error) error {
+	return q.deleteWithLocalFiles(infohash, cleanup, false)
+}
+
+func (q *Queue) deleteWithLocalFiles(infohash string, cleanup func(t *storage.Entry) error, removeFiles bool) error {
 	snapshot, err := q.storage.GetQueued(infohash)
 	if err != nil {
 		return err
@@ -281,6 +310,12 @@ func (q *Queue) Delete(infohash string, cleanup func(t *storage.Entry) error) er
 	unlock()
 	locked = false
 	q.cancelAndWaitAction(infohash, entry)
+	if !removeFiles {
+		if cleanup == nil {
+			return nil
+		}
+		return cleanup(entry)
+	}
 	return q.wrapCleanupWithFileDelete(cleanup)(entry)
 }
 

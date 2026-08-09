@@ -267,11 +267,14 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 	// Upstream never released the provider copy, and the SAB shim here already
 	// agreed with upstream — the two shims disagreeing was itself the tell.
 	//
-	// KNOWN DEVIATION, deliberately left: the downloads folder is removed whether
-	// delete_files is true or false, so a caller sending false does not get the
-	// "keep the data" half of qBittorrent's contract. Harmless after an import
-	// (the library does not depend on it) and it matches upstream, so it stays
-	// until there is evidence it costs something.
+	// So the flag is honoured where it belongs — against the LOCAL download
+	// folder — and refused where it does not. An *arr abandoning a download sends
+	// true and the symlinks go; one merely reorganising its queue sends false and
+	// they stay. Neither touches the provider.
+	//
+	// This is a deliberate divergence from upstream, which removes the folder
+	// either way. Upstream is not wrong so much as never asked the question: it
+	// does not read the flag at all.
 	//
 	// The slot leak that motivated the original change is real but belongs
 	// elsewhere: the provider-sourced stall prune reaps abandoned transfers from
@@ -301,13 +304,21 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 		// and three separate root-cause theories died for want of exactly this
 		// line. It records who was removed and whether the provider copy went
 		// with them.
-		// No EXTRA cleanup — which is not the same as deleting nothing, and the
-		// distinction is easy to lose. Queue.Delete always runs deleteEntryFiles
-		// through wrapCleanupWithFileDelete, so the local downloads/<cat>/<name>
-		// symlink folder is removed here exactly as it always was. The `cleanup`
-		// argument is additional work layered on top, and it is the provider-side
-		// release that must not happen. See the block above.
-		err := q.manager.Queue().Delete(hash, nil)
+		// THE FLAG NOW SELECTS WHAT IT ACTUALLY MEANS: the LOCAL download folder.
+		//
+		// Never a provider argument (see the block above), but a real one for the
+		// symlink folder, which is this client's honest equivalent of "the
+		// downloaded data". true removes it, false keeps it — qBittorrent's
+		// contract, mapped onto the one artefact decypharr actually owns.
+		//
+		// Neither branch passes an extra cleanup: provider release belongs to
+		// repair, prune and explicit operator actions.
+		var err error
+		if deleteFiles {
+			err = q.manager.Queue().Delete(hash, nil)
+		} else {
+			err = q.manager.Queue().DeleteKeepingLocalFiles(hash, nil)
+		}
 		switch {
 		case err == nil:
 			// ⚠️ THE ATTRIBUTION IS THE POINT, NOT THE OUTCOME.
@@ -334,8 +345,14 @@ func (q *QBit) handleTorrentsDelete(w http.ResponseWriter, r *http.Request) {
 			if category := r.FormValue("category"); category != "" {
 				ev = ev.Str("category", category)
 			}
-			ev.Msg("Queue entry deleted via the qBittorrent API. The provider copy is KEPT regardless of " +
-				"delete_files — releasing it here would delete content the library has already imported")
+			if deleteFiles {
+				ev.Msg("Queue entry deleted via the qBittorrent API; delete_files=true removed the local " +
+					"download folder. The provider copy is KEPT — releasing it would delete content the " +
+					"library has already imported")
+			} else {
+				ev.Msg("Queue entry deleted via the qBittorrent API; delete_files=false kept the local " +
+					"download folder. The provider copy is KEPT either way")
+			}
 		case errors.Is(err, storage.ErrEntryNotFound):
 			// An entry that is already absent is a satisfied delete, not a
 			// failure. This previously matched on the message text containing
