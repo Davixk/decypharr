@@ -23,10 +23,14 @@ func TestReadCeilingsAreSeededAndHot(t *testing.T) {
 	if current.MetadataReadTimeout != DefaultMetadataReadTimeout {
 		t.Fatalf("metadata_read_timeout default = %q, want %q", current.MetadataReadTimeout, DefaultMetadataReadTimeout)
 	}
+	if current.DebridStatusTimeout != DefaultDebridStatusTimeout {
+		t.Fatalf("debrid_status_timeout default = %q, want %q", current.DebridStatusTimeout, DefaultDebridStatusTimeout)
+	}
 
 	for name, mutate := range map[string]func(*Config){
 		"debrid_link_timeout":   func(c *Config) { c.DebridLinkTimeout = "5s" },
 		"metadata_read_timeout": func(c *Config) { c.MetadataReadTimeout = "3s" },
+		"debrid_status_timeout": func(c *Config) { c.DebridStatusTimeout = "30s" },
 	} {
 		updated := *current
 		mutate(&updated)

@@ -514,6 +514,28 @@ type Config struct {
 	// the ceiling and restores the historical unbounded, context-blind wait.
 	DebridLinkTimeout string `json:"debrid_link_timeout,omitempty"`
 
+	// DebridStatusTimeout bounds how long a provider STATUS POLL may run after a
+	// magnet has been submitted, before the caller gives up on that provider.
+	//
+	// THE WEDGE IT PREVENTS. RealDebrid.CheckStatus re-polls while the provider
+	// reports "waiting_files_selection": select the files, sleep, ask again. That
+	// loop had no context, no deadline and no iteration cap, so a provider that
+	// never advanced past that state held the caller forever. It is reached from
+	// re-insertion (Fixer.MoveTorrent), from the queue's completion wait, and
+	// from the grab path — and until the same release moved the provider calls
+	// out from under Manager.copyEntryMu, one such poll also blocked every WebDAV
+	// DELETE/COPY/MOVE in the process.
+	//
+	// A ceiling firing here yields a TRANSIENT, retryable 503
+	// (customerror.NewBackendTimeoutError) and never a content verdict: a
+	// provider that will not answer says nothing whatsoever about whether the
+	// content is good, so the repair cascade explicitly declines to mark the
+	// entry Bad on it.
+	//
+	// Default "60s"; "0"/"off"/"none" disables the ceiling and restores the
+	// historical unbounded poll, so the knob stays a genuine escape hatch.
+	DebridStatusTimeout string `json:"debrid_status_timeout,omitempty"`
+
 	// MetadataReadTimeout bounds how long a WebDAV metadata request — PROPFIND
 	// listings and HEAD — may wait on a backend before answering 503.
 	//
@@ -776,6 +798,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.DebridLinkTimeout == "" {
 		c.DebridLinkTimeout = DefaultDebridLinkTimeout
+	}
+	if c.DebridStatusTimeout == "" {
+		c.DebridStatusTimeout = DefaultDebridStatusTimeout
 	}
 	if c.MetadataReadTimeout == "" {
 		c.MetadataReadTimeout = DefaultMetadataReadTimeout
@@ -1041,13 +1066,15 @@ func clearHotFields(c *Config) {
 	c.SkipAutoMove = false
 	c.Repair = RepairConfig{}
 
-	// Both read-ceiling knobs are resolved live, per request, on the path that
-	// enforces them (Manager.debridLinkTimeout, Handler.metadataReadTimeout).
-	// Nothing caches them in a service struct, so they apply without a restart.
-	// That matters HERE in particular: these are the knobs an operator reaches
-	// for while a backend is actively flapping, and telling them to restart
-	// mid-incident would take the mount down to fix the mount.
+	// Every read-ceiling knob is resolved live, per call, on the path that
+	// enforces it (Manager.debridLinkTimeout, Handler.metadataReadTimeout,
+	// RealDebrid.statusPollCeiling). Nothing caches them in a service struct, so
+	// they apply without a restart. That matters HERE in particular: these are
+	// the knobs an operator reaches for while a backend is actively flapping, and
+	// telling them to restart mid-incident would take the mount down to fix the
+	// mount.
 	c.DebridLinkTimeout = ""
+	c.DebridStatusTimeout = ""
 	c.MetadataReadTimeout = ""
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,

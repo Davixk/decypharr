@@ -223,6 +223,49 @@ func NewBackendTimeoutError(err error) *Error {
 	}).Retryable()
 }
 
+// IsBackendTimeout reports whether err carries — anywhere in its chain,
+// including inside an errors.Join tree — one of decypharr's OWN ceilings
+// firing.
+//
+// It is the mirror image of IsContentPermanentlyGone and exists for the same
+// reason: one predicate, so the sides that must not disagree cannot drift. A
+// ceiling firing means WE stopped waiting. It is not a statement about the
+// content, the provider's answer, or the entry's health, so no caller may
+// convert it into a durable verdict — specifically, the repair cascade must not
+// set Entry.Bad on it (that flag short-circuits every subsequent read, so a
+// single provider flap would otherwise blank a library until something cleared
+// it by hand).
+//
+// The chain walk matters: the re-insertion path joins the status error with its
+// compensating provider cleanup, so the timeout is never the top-level error by
+// the time a caller sees it.
+func IsBackendTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	var e *Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	if e.Code == "backend_timeout" {
+		return true
+	}
+	// errors.As stops at the FIRST *Error it finds, which in a join tree may be
+	// the cleanup error rather than the timeout. Keep walking by hand so the
+	// order of errors.Join's arguments cannot decide the answer.
+	switch node := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, branch := range node.Unwrap() {
+			if IsBackendTimeout(branch) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return IsBackendTimeout(node.Unwrap())
+	}
+	return false
+}
+
 // NewContentGoneError is the debrid analog of NewArticleNotFoundError: the
 // download link resolved but the upstream reports the content is definitively
 // gone (HTTP 404/410). It carries a permanent 410 so the WebDAV layer maps it

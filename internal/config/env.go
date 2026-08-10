@@ -78,6 +78,9 @@ func (c *Config) applyEnvOverrides() {
 	if val := getEnv("DEBRID_LINK_TIMEOUT"); val != "" {
 		c.DebridLinkTimeout = val
 	}
+	if val := getEnv("DEBRID_STATUS_TIMEOUT"); val != "" {
+		c.DebridStatusTimeout = val
+	}
 	if val := getEnv("METADATA_READ_TIMEOUT"); val != "" {
 		c.MetadataReadTimeout = val
 	}

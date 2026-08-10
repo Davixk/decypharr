@@ -43,6 +43,23 @@ var (
 	// *arrs or rclone's own multi-minute timeouts fire.
 	DefaultDebridLinkTimeout = "20s"
 
+	// DefaultDebridStatusTimeout is the ceiling on a provider STATUS POLL — the
+	// loop a freshly submitted magnet sits in while the provider is asked, over
+	// and over, whether it has finished accepting it.
+	//
+	// 60s because the only branch that actually re-polls is RealDebrid's
+	// "waiting_files_selection": decypharr sends the file selection, then polls
+	// for the provider to act on it. A healthy account clears that in one or two
+	// passes (~2-4s). At the 2s poll interval, 60s is thirty passes — an order of
+	// magnitude more patience than the healthy case needs, so a provider that is
+	// merely slow is never cut off, while one that is stuck stops burning a
+	// repair worker within the minute.
+	//
+	// It is also deliberately small relative to the 5m in-flight repair budget:
+	// FixTorrent cascades through every configured debrid in turn, so a ceiling
+	// large enough to blow that budget would only move the wedge one level up.
+	DefaultDebridStatusTimeout = "60s"
+
 	// DefaultMetadataReadTimeout is the ceiling on a listing/HEAD wait. It is
 	// deliberately SHORTER than the link ceiling: a listing needs no provider
 	// round-trip at all for torrent entries, and for Usenet entries it is a

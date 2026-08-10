@@ -30,6 +30,16 @@ import (
 
 const (
 	profileCacheDuration = 1 * time.Hour
+
+	// statusPollInterval is the gap between two /torrents/info polls while a
+	// freshly submitted magnet is still being accepted. Unchanged from the
+	// original loop — only the number of times it may repeat is now bounded.
+	statusPollInterval = 2 * time.Second
+
+	// defaultStatusPollCeiling is the fallback used when debrid_status_timeout is
+	// empty (an upgraded config, or a client built directly in a test). It
+	// matches the "60s" seeded by config.setDefaults.
+	defaultStatusPollCeiling = 60 * time.Second
 )
 
 type RealDebrid struct {
@@ -627,9 +637,61 @@ func (r *RealDebrid) UpdateTorrent(t *types.Torrent) error {
 	}
 }
 
+// statusPollCeiling resolves how long CheckStatus may keep re-polling, read
+// LIVE per call so the knob applies without restarting the mount — this is a
+// knob an operator reaches for mid-incident. A parse error falls back to the
+// default and is logged, because a typo silently restoring an unbounded poll is
+// the exact failure the ceiling exists to prevent.
+func (r *RealDebrid) statusPollCeiling() time.Duration {
+	raw := ""
+	if cfg := config.Get(); cfg != nil {
+		raw = cfg.DebridStatusTimeout
+	}
+	ceiling, err := utils.ParseReadCeiling(raw, defaultStatusPollCeiling)
+	if err != nil {
+		r.logger.Warn().Err(err).Str("debrid_status_timeout", raw).
+			Msg("Invalid debrid_status_timeout; using default")
+		return defaultStatusPollCeiling
+	}
+	return ceiling
+}
+
+// CheckStatus polls RealDebrid until a freshly submitted magnet reaches a state
+// the caller can act on.
+//
+// THE POLL IS BOUNDED. Only one branch below re-polls at all:
+// "waiting_files_selection", where decypharr posts the file selection and then
+// asks again for the provider to act on it. Every other branch returns on its
+// first pass. That loop used to have no context, no deadline and no iteration
+// cap, so an account stuck in waiting_files_selection held its caller forever —
+// and callers of this function include the re-insertion path, which until this
+// release ran under Manager.copyEntryMu and so wedged every WebDAV
+// DELETE/COPY/MOVE in the process along with it.
+//
+// A DEADLINE RATHER THAN A CONTEXT, deliberately. doGet/doPostForm build their
+// requests with http.NewRequest and carry no context, so a context here would
+// compile and bound nothing (the same reasoning as webdav.awaitBounded). A wall
+// clock check between passes is the mechanism that actually stops the loop.
+//
+// ON EXPIRY THE ERROR IS TRANSIENT, NEVER A VERDICT.
+// customerror.NewBackendTimeoutError is a retryable 503 that
+// IsContentPermanentlyGone rejects, so a provider that will not answer can never
+// be laundered into "this content is bad". The partially-populated torrent is
+// still returned so the caller can compensate the placement it just created.
+//
+// A ceiling of <= 0 ("0"/"off"/"none") restores the historical unbounded loop
+// verbatim, matching every other read-ceiling knob's "off" semantics so the
+// escape hatch is real.
 func (r *RealDebrid) CheckStatus(t *types.Torrent) (*types.Torrent, error) {
+	ceiling := r.statusPollCeiling()
+	var deadline time.Time
+	if ceiling > 0 {
+		deadline = time.Now().Add(ceiling)
+	}
+	polls := 0
 	for {
-		time.Sleep(2 * time.Second)
+		time.Sleep(statusPollInterval)
+		polls++
 
 		var data torrentInfo
 
@@ -681,6 +743,20 @@ func (r *RealDebrid) CheckStatus(t *types.Torrent) (*types.Torrent, error) {
 					return nil, customerror.TooManyActiveDownloadsError
 				}
 				return t, fmt.Errorf("realdebrid API error: Status: %d", selectResp.StatusCode)
+			}
+			// The ceiling is checked HERE, after a full pass, so every call is
+			// guaranteed at least one real attempt no matter how small the knob is
+			// set. Only this branch can loop, so this is the only place it belongs.
+			if !deadline.IsZero() && !time.Now().Before(deadline) {
+				r.logger.Warn().
+					Str("torrent_id", t.Id).
+					Dur("ceiling", ceiling).
+					Int("polls", polls).
+					Msg("Provider stayed in waiting_files_selection past its ceiling; giving up as transient")
+				return t, customerror.NewBackendTimeoutError(fmt.Errorf(
+					"realdebrid torrent %s stayed in waiting_files_selection for %s (%d polls)",
+					t.Id, ceiling, polls,
+				))
 			}
 			continue
 		} else if debridStatus == "downloaded" {
