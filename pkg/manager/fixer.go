@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -124,11 +125,18 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 
 	var lastErr error
 	totalAttempts := 0
-	// inconclusive records that at least one provider was abandoned on
-	// decypharr's OWN ceiling instead of answering. It is the difference between
-	// "every debrid says this is broken" and "we stopped waiting", and only the
-	// first of those may become a durable verdict below.
+	// inconclusive records that at least one provider failed WITHOUT stating
+	// anything about the content — either it never answered (our own ceiling
+	// fired) or it answered with a failure of its machinery. It is the
+	// difference between "every debrid says this content is gone" and "the
+	// attempts did not work", and only the first of those may become a durable
+	// verdict below.
+	//
+	// ceilingFired distinguishes the two causes for the error this reports back.
+	// Calling an answered 503 a backend timeout would misname the one thing an
+	// operator reads to tell a slow provider apart from a refusing one.
 	inconclusive := false
+	ceilingFired := false
 
 	for _, debridName := range attemptOrder {
 		// Check if entry has been marked as failed to re-insert
@@ -185,21 +193,65 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 
 		lastErr = err
 		if customerror.IsBackendTimeout(err) {
-			// OUR ceiling fired; this provider never reached a verdict. The marker
-			// below is effectively permanent — it is keyed "infohash:debrid" and
-			// ResetFailureState only deletes the bare "infohash" key — so storing
-			// it here would exclude a perfectly healthy debrid from ever repairing
-			// this entry again for the lifetime of the process, on the strength of
-			// one slow minute. Record the attempt as inconclusive and move on.
+			// OUR ceiling fired; this provider never reached a verdict. Storing
+			// the marker below would exclude a perfectly healthy debrid from
+			// repairing this entry again — until something clears it, and the
+			// only thing that clears it is a re-insertion that succeeds, which
+			// the marker itself prevents from being attempted. Record the attempt
+			// as inconclusive and move on.
 			inconclusive = true
+			ceilingFired = true
 			f.manager.logger.Warn().Err(err).
 				Str("debrid", debridName).
 				Str("infohash", entry.InfoHash).
 				Msg("Re-insertion abandoned on its own ceiling; provider gave no verdict")
 			continue
 		}
-		// Add failed state for this debrid
-		f.failedToReinsert.Store(fmt.Sprintf("%s:%s", entry.InfoHash, debridName), struct{}{})
+		if !customerror.IsContentPermanentlyGone(err) {
+			// THE PROVIDER ANSWERED, BUT NOT WITH A VERDICT ABOUT THE CONTENT.
+			//
+			// This is the ANSWERED-TRANSIENT case, and it is the one that used to
+			// fall through. A submit refused on a quota, a status poll that came
+			// back "not complete", a 503 out of a provider mid-outage — all of
+			// them landed here and were recorded as this debrid's permanent
+			// failure for this entry, and once every debrid had one recorded the
+			// entry itself was condemned (Bad) and persisted. An hour-long
+			// provider outage therefore left durable damage across the whole
+			// library, indistinguishable afterwards from content that really had
+			// died.
+			//
+			// The asymmetry decides it: wrongly condemning good content costs a
+			// re-download plus an indexer search, wrongly keeping dead content
+			// costs one more failed read. So only an UNAMBIGUOUS content verdict
+			// — the provider stating the bytes are gone or legally removed —
+			// earns the marker or the Bad flag. Everything else is a failed
+			// attempt and nothing more; the next sweep or the next read retries
+			// from the same state.
+			inconclusive = true
+			f.manager.logger.Warn().Err(err).
+				Str("debrid", debridName).
+				Str("infohash", entry.InfoHash).
+				Msg("Re-insertion failed without a content verdict; treating as transient and leaving the entry unmarked")
+			continue
+		}
+		// The provider stated the content itself is gone. THAT is durable, and
+		// only that: the marker means "this debrid has confirmed the content is
+		// dead", not "an attempt against this debrid failed once".
+		f.failedToReinsert.Store(failureMarkerKey(entry.InfoHash, debridName), struct{}{})
+	}
+
+	if totalAttempts == 0 {
+		// Nothing was even tried — every candidate was already marked, or the
+		// attempt order was empty (skipCurrent with no other provider
+		// configured). Zero attempts is not "every debrid says this is broken",
+		// and the block below must not read it as such.
+		result := &FixResult{
+			Success:       false,
+			Error:         fmt.Errorf("no debrid was available to re-insert %s", entry.InfoHash),
+			AttemptsCount: 0,
+		}
+		req.result <- result
+		return result, result.Error
 	}
 
 	if inconclusive {
@@ -208,36 +260,56 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 		// Entry.Bad short-circuits every subsequent read of this entry before any
 		// provider call (link.badEntryError), and nothing clears it except a
 		// re-insertion that succeeds. Setting it because a provider was too slow
-		// to answer would convert a backend flap into a library that serves
-		// errors until somebody notices — the precise failure mode this codebase
-		// has already been burned by, and the reason NewBackendTimeoutError is
-		// retryable and explicitly not permanent.
+		// to answer, or because it answered "not right now", would convert a
+		// backend flap into a library that serves errors until somebody notices —
+		// the precise failure mode this codebase has already been burned by, and
+		// the reason NewBackendTimeoutError is retryable and explicitly not
+		// permanent.
 		//
 		// So: fail this attempt, say why, and leave the entry's health untouched.
 		// The next sweep or the next read retries from the same state.
+		//
+		// The error TYPE names the cause honestly. Our ceiling firing and a
+		// provider refusing are both retryable and both non-permanent, but they
+		// are not the same event, and an operator reading a log during an
+		// incident is entitled to know which one happened.
+		var resultErr error
+		if ceilingFired {
+			resultErr = customerror.NewBackendTimeoutError(
+				fmt.Errorf("re-insertion of %s was inconclusive: %w", entry.InfoHash, lastErr))
+		} else {
+			resultErr = fmt.Errorf("%w: re-insertion of %s reached no verdict: %w",
+				customerror.HosterUnavailableError, entry.InfoHash, lastErr)
+		}
 		f.manager.logger.Warn().
 			Err(lastErr).
 			Str("infohash", entry.InfoHash).
 			Int("attempts", totalAttempts).
-			Msg("Re-insertion inconclusive: a provider timed out rather than answering; entry left unmarked")
+			Bool("ceiling_fired", ceilingFired).
+			Msg("Re-insertion inconclusive: no provider reached a verdict about the content; entry left unmarked")
 
 		result := &FixResult{
 			Success:       false,
-			Error:         customerror.NewBackendTimeoutError(fmt.Errorf("re-insertion of %s was inconclusive: %w", entry.InfoHash, lastErr)),
+			Error:         resultErr,
 			AttemptsCount: totalAttempts,
 		}
 		req.result <- result
 		return result, result.Error
 	}
 
-	// All debrids failed - mark as completely failed
+	// EVERY DEBRID THAT WAS TRIED RETURNED A CONTENT VERDICT.
+	//
+	// Reaching here now means something much stronger than it used to: not "the
+	// attempts failed" but "every provider asked stated the bytes are gone or
+	// legally removed". Nothing else gets this far — an answered transient and
+	// our own ceiling both set `inconclusive` above and returned already. That
+	// is what makes the durable Bad flag below a correct verdict rather than a
+	// record of a bad afternoon.
 	f.manager.logger.Error().
 		Err(lastErr).
 		Str("infohash", entry.InfoHash).
 		Int("attempts", totalAttempts).
-		Msg("All re-insertion attempts failed")
-
-	f.failedToReinsert.Store(entry.InfoHash, struct{}{})
+		Msg("Every debrid confirmed the content is gone; condemning the entry")
 
 	// Mark only the Bad field on the matching lifecycle. A repair snapshot may
 	// have drifted while remote calls were in flight; writing the whole value
@@ -250,7 +322,7 @@ func (f *Fixer) FixTorrent(ctx context.Context, entry *storage.Entry, skipCurren
 
 	result := &FixResult{
 		Success:       false,
-		Error:         fmt.Errorf("all re-insertion attempts failed: %w", lastErr),
+		Error:         fmt.Errorf("every debrid confirmed the content is gone: %w", lastErr),
 		AttemptsCount: totalAttempts,
 	}
 	req.result <- result
@@ -538,13 +610,49 @@ func (f *Fixer) buildAttemptOrder(torrent *storage.Entry, skipCurrent bool) []st
 	return order
 }
 
+// failureMarkerKey is the ONE place the marker key shape is spelled out.
+//
+// It exists because the shape used to be open-coded at three sites and one of
+// them got it wrong: markers were written and read as "infohash:debrid" while
+// ResetFailureState deleted the bare "infohash". Reading and writing agreed, so
+// the marker worked; only the clearing silently missed, and a bare-key deletion
+// cannot fail loudly. A single constructor makes that class of bug impossible
+// to reintroduce.
+func failureMarkerKey(infohash, debrid string) string {
+	return fmt.Sprintf("%s:%s", infohash, debrid)
+}
+
 // IsFailedToReinsert checks if a torrent has been marked as failed to re-insert
 func (f *Fixer) IsFailedToReinsert(infohash, debrid string) bool {
-	_, failed := f.failedToReinsert.Load(fmt.Sprintf("%s:%s", infohash, debrid))
+	_, failed := f.failedToReinsert.Load(failureMarkerKey(infohash, debrid))
 	return failed
 }
 
-// ResetFailureState manually resets the failure state for a torrent
+// ResetFailureState clears every per-debrid failure marker recorded for
+// infohash.
+//
+// THE KEY SHAPES HAD TO MATCH AND DID NOT. Markers are stored under
+// "infohash:debrid" and read back under the same key, but this function deleted
+// the bare "infohash" — a key nothing writes and nothing reads. Every per-debrid
+// marker was therefore permanent for the lifetime of the process: a debrid that
+// failed once was excluded from repairing that entry forever, and the one event
+// that is supposed to wipe the slate (a re-insertion that SUCCEEDED, which is
+// the only caller of this function) wiped nothing. The exclusion could not even
+// clear itself, because clearing required a success on a debrid the marker had
+// already removed from the attempt order.
+//
+// The prefix scan covers every debrid without needing the caller to know which
+// ones were tried, and the exact-match arm cleans up any bare key left in the
+// map by an older build.
 func (f *Fixer) ResetFailureState(infohash string) {
-	f.failedToReinsert.Delete(infohash)
+	if infohash == "" {
+		return
+	}
+	prefix := infohash + ":"
+	f.failedToReinsert.Range(func(key string, _ struct{}) bool {
+		if key == infohash || strings.HasPrefix(key, prefix) {
+			f.failedToReinsert.Delete(key)
+		}
+		return true
+	})
 }
