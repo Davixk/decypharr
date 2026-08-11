@@ -920,8 +920,28 @@ func (r *RealDebrid) fetchDownloadLink(account *account.Account, id string, file
 	}
 	if resp.StatusCode != http.StatusOK {
 		switch errResp.ErrorCode {
-		case 19, 24, 35:
+		// 19 (hoster temporarily unavailable) and 24 (file unavailable) are the
+		// hoster having a bad day. They clear on their own, they say nothing
+		// about whether the content still exists, and no number of failed
+		// re-insertion cycles during an outage may turn them into a durable
+		// verdict — see Fixer.FixTorrent and link.Service.handleBadLink, which
+		// both refuse to condemn on anything that is not a content verdict.
+		case 19, 24:
 			return emptyLink, customerror.HosterUnavailableError
+		// 35 is `infringing_file`, served as HTTP 451: the release has been taken
+		// down for legal reasons and is never coming back on this provider.
+		//
+		// IT USED TO SHARE THE LINE ABOVE. Sharing it meant a takedown and an
+		// outage were the same value to every caller, so a takedown could only
+		// ever be discovered the way an outage was — by exhausting re-insertion
+		// and condemning the entry — and once condemned it stayed listed and
+		// re-refused reads forever, because nothing downstream could tell the
+		// two apart. Splitting the case is what lets one become permanent and
+		// the other stay harmless.
+		case 35:
+			return emptyLink, customerror.NewContentTakedownError(
+				fmt.Errorf("realdebrid: infringing_file (code 35) for %s", file.Name),
+			)
 		case 23, 34, 36:
 			return emptyLink, customerror.TrafficExceededError
 		default:

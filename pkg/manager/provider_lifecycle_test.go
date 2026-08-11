@@ -24,6 +24,7 @@ type lifecycleDebridClient struct {
 	check      func(*debridTypes.Torrent) (*debridTypes.Torrent, error)
 	update     func(*debridTypes.Torrent) error
 	get        func(string) (*debridTypes.Torrent, error)
+	getLink    func(string, *debridTypes.File) (debridTypes.DownloadLink, error)
 	getAll     func() ([]*debridTypes.Torrent, error)
 	onDelete   func(string) error
 	deleteMu   sync.Mutex
@@ -87,7 +88,10 @@ func (c *lifecycleDebridClient) GetTorrents() ([]*debridTypes.Torrent, error) {
 	return nil, nil
 }
 
-func (c *lifecycleDebridClient) GetDownloadLink(string, *debridTypes.File) (debridTypes.DownloadLink, error) {
+func (c *lifecycleDebridClient) GetDownloadLink(id string, file *debridTypes.File) (debridTypes.DownloadLink, error) {
+	if c.getLink != nil {
+		return c.getLink(id, file)
+	}
 	return debridTypes.DownloadLink{}, nil
 }
 func (c *lifecycleDebridClient) IsAvailable([]string) map[string]bool { return nil }

@@ -79,7 +79,7 @@ func newCeilingHarness(t *testing.T, ceiling time.Duration) *ceilingHarness {
 
 	clients := xsync.NewMap[string, debrid.Client]()
 	clients.Store("provider", client)
-	harness.svc = New(clients, nil, nil, nil, validator.Client(), 0,
+	harness.svc = New(clients, nil, nil, nil, nil, nil, validator.Client(), 0,
 		func() time.Duration { return time.Duration(harness.ceiling.Load()) }, zerolog.Nop())
 
 	// LIFO: the release runs first so the detached resolution is never left

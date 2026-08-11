@@ -67,4 +67,19 @@ var (
 	// "slow but progressing" state to protect here — a listing either answers
 	// or it is stuck.
 	DefaultMetadataReadTimeout = "15s"
+
+	// DefaultDebridTakedownThreshold is how many confirmed takedown refusals one
+	// file needs before it counts as legally dead.
+	//
+	// 1, because the signal is unambiguous. RealDebrid code 35 / HTTP 451 is not
+	// a failed request, a rate limit or an outage — it is the provider stating
+	// that the release has been removed for legal reasons, and no retry, no wait
+	// and no other account changes that answer. Demanding a second refusal would
+	// only buy one more guaranteed-failing read before reaching the identical
+	// conclusion.
+	//
+	// The asymmetry that governs every other threshold here points the same way
+	// rather than against it: the expensive mistake is condemning content that is
+	// FINE, and content that is fine does not produce a takedown refusal.
+	DefaultDebridTakedownThreshold = 1
 )

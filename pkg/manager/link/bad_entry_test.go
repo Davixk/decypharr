@@ -40,6 +40,11 @@ func (c *countingClient) GetTorrent(string) (*debridTypes.Torrent, error) {
 
 func newLinkService(t *testing.T, client *countingClient, repairer EntryRepairer, saver EntrySaver) *Service {
 	t.Helper()
+	return newLinkServiceWith(t, client, repairer, nil, saver, nil)
+}
+
+func newLinkServiceWith(t *testing.T, client *countingClient, repairer EntryRepairer, reacquirer EntryReacquirer, saver EntrySaver, pruner EntryPruner) *Service {
+	t.Helper()
 	config.SetConfigPath(t.TempDir())
 	clients := xsync.NewMap[string, debrid.Client]()
 	clients.Store("provider", client)
@@ -47,7 +52,7 @@ func newLinkService(t *testing.T, client *countingClient, repairer EntryRepairer
 	// they keep asserting the SAME semantics they always did — but they now
 	// assert them through the bounded/detached resolution path that production
 	// uses, not the disabled escape hatch.
-	return New(clients, nil, repairer, saver, http.DefaultClient, 0, func() time.Duration { return 30 * time.Second }, zerolog.Nop())
+	return New(clients, nil, repairer, reacquirer, saver, pruner, http.DefaultClient, 0, func() time.Duration { return 30 * time.Second }, zerolog.Nop())
 }
 
 // TestBadEntryReadReturnsPermanentGoneWithoutProviderCalls covers FIX X and
@@ -135,8 +140,13 @@ func TestEmptyLinkErrorStillTriggersReinsertion(t *testing.T) {
 	if got := repairs.Load(); got != MaxReinsertionAttempt {
 		t.Fatalf("empty-link error drove %d re-insertions, want %d", got, MaxReinsertionAttempt)
 	}
-	if !entry.Bad {
-		t.Fatal("entry was not marked bad after exhausting re-insertion attempts")
+	// The recovery still runs; exhausting it no longer CONDEMNS. An empty link
+	// is a transient class — the provider failed to hand one over, which says
+	// nothing about whether the content exists — and Bad is durable, one-way and
+	// short-circuits every future read. This assertion used to demand the
+	// opposite; that demand is the defect, not the fix.
+	if entry.Bad {
+		t.Fatal("a transient empty-link failure permanently condemned the entry")
 	}
 }
 

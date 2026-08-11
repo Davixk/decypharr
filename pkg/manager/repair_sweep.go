@@ -963,17 +963,40 @@ func (r *Repair) probeTorrentFileByUnrestrict(ctx context.Context, entry *storag
 			return r.readPayloadFromURL(probeCtx, entry, file, name, downloadLink.DownloadLink)
 		})
 	}
+	// A confirmed legal takedown is a statement about the CONTENT, so it is the
+	// one refusal here that may condemn a file. It used to fall through to
+	// `unrestrict_link_error` (never actionable) because it arrived indistinguishable
+	// from a hoster flap; splitting it out is what lets a sweep find dead content
+	// the read path may never have touched.
+	if customerror.IsContentTakedown(err) {
+		res.broken = true
+		res.reason = "debrid_takedown"
+		return res
+	}
 	if errors.Is(err, debridTypes.ErrAvailabilityIndeterminate) {
 		res.reason = "provider_probe_indeterminate"
 		return res
 	}
-	if err == nil || errors.Is(err, debridTypes.EmptyDownloadLinkError) || errors.Is(err, customerror.HosterUnavailableError) {
+	if errors.Is(err, customerror.HosterUnavailableError) {
+		// NOT A CONTENT VERDICT ON THIS PATH, and the distinction is the whole
+		// reason MaxDeletionsPerRun exists ("a debrid outage returning
+		// HosterUnavailable for everything could otherwise mark the whole due set
+		// broken and mass-delete").
+		//
+		// HosterUnavailableError is double-booked: from CheckFile it means the
+		// provider answered 404/410 for the link, which IS a content verdict and
+		// is still treated as one in probeTorrentFile. From the unrestrict
+		// endpoint, which is what this function calls, it means RealDebrid error
+		// 19 or 24 — the hoster is having a bad day. Condemning on that made a
+		// provider outage destructive-eligible for an entire library, capped only
+		// by a per-run budget. Indeterminate is the honest verdict: never healthy,
+		// never broken, re-checked soon.
+		res.reason = "provider_probe_indeterminate"
+		return res
+	}
+	if err == nil || errors.Is(err, debridTypes.EmptyDownloadLinkError) {
 		res.broken = true
-		if errors.Is(err, customerror.HosterUnavailableError) {
-			res.reason = "hoster_unavailable"
-		} else {
-			res.reason = "empty_download_link"
-		}
+		res.reason = "empty_download_link"
 		return res
 	}
 	res.reason = "unrestrict_link_error"

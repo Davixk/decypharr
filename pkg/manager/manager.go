@@ -367,7 +367,9 @@ func (m *Manager) initLinkService() {
 		m.clients,
 		m.refreshTorrent,
 		m.ReinsertEntry,
+		m.ReacquireEntryElsewhere,
 		m.persistLinkEntryBad,
+		m.pruneTakenDownEntry,
 		m.streamClient,
 		m.config.Retries,
 		// Passed as a function, not a value: the ceiling is resolved per call so

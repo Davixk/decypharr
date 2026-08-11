@@ -936,6 +936,47 @@ func (m *Manager) ReinsertEntry(ctx context.Context, entry *storage.Entry) error
 	return nil
 }
 
+// ReacquireEntryElsewhere re-inserts an entry on every configured debrid EXCEPT
+// the one it is currently active on.
+//
+// It is ReinsertEntry with skipCurrent set, and that distinction is the point.
+// Its caller is the confirmed-takedown path: the active provider has stated the
+// release was legally removed, so submitting the same magnet back to it cannot
+// work and merely repeats the refusal on every read. A takedown IS
+// provider-scoped, though, so the other debrids are worth exactly one ask before
+// anything gets condemned.
+//
+// With no other debrid configured there is nothing to try, and FixTorrent
+// reports that as a zero-attempt failure rather than mistaking an empty attempt
+// order for "every provider says this is dead".
+func (m *Manager) ReacquireEntryElsewhere(ctx context.Context, entry *storage.Entry) error {
+	if m.fixer == nil {
+		return fmt.Errorf("fixer not initialized")
+	}
+	res, err := m.fixer.FixTorrent(ctx, entry, true)
+	if err != nil {
+		return err
+	}
+	if !res.Success {
+		return fmt.Errorf("failed to re-acquire torrent on another debrid")
+	}
+	return nil
+}
+
+// pruneTakenDownEntry deletes a confirmed-dead entry decypharr-side.
+//
+// It is deliberately the SAME call the repair sweep's PRUNE component makes
+// (DeleteEntry with placement removal), not a second deletion path with its own
+// semantics: one behaviour, one place for it to go wrong, and the provider slot
+// is released either way. Nothing arr-facing happens here or below here — the
+// dangling library symlink is the entire notification mechanism.
+func (m *Manager) pruneTakenDownEntry(entry *storage.Entry) error {
+	if entry == nil {
+		return fmt.Errorf("entry is nil")
+	}
+	return m.DeleteEntry(entry.InfoHash, true)
+}
+
 // linkOf returns the resolvable link/id for a torrent file in its active
 // provider placement, or "" when no link is available.
 func linkOf(entry *storage.Entry, name string) string {

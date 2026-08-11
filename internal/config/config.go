@@ -552,6 +552,28 @@ type Config struct {
 	// has already stalled its own queue. "0"/"off"/"none" disables it.
 	MetadataReadTimeout string `json:"metadata_read_timeout,omitempty"`
 
+	// DebridTakedownThreshold is how many CONFIRMED takedown refusals a single
+	// file must collect before it counts as legally dead.
+	//
+	// A takedown is not a failure of the machinery; it is the provider stating
+	// that the release has been removed for legal reasons (RealDebrid code 35,
+	// served as HTTP 451). No known transient condition produces it and no retry
+	// clears it, so ONE refusal is decisive and that is the default. The knob
+	// exists because "how much evidence is enough" is a judgement call, and a
+	// judgement call belongs in config: an operator who suspects a provider is
+	// mislabelling can demand corroboration by raising it.
+	//
+	// Raising it buys nothing on its own — it delays the verdict by exactly that
+	// many failed reads, and every one of those reads still refuses.
+	//
+	// 0/unset means the default. A NEGATIVE value disables the takedown verdict
+	// entirely: refusals still reach the reader with their real cause, but no
+	// entry is ever condemned or pruned because of one. That is an escape hatch,
+	// not a default — never acting is precisely the behaviour that left one
+	// production library serving ~695 refusals a day for content that had been
+	// legally dead for weeks.
+	DebridTakedownThreshold int `json:"debrid_takedown_threshold,omitempty"`
+
 	Repair RepairConfig `json:"repair,omitzero"`
 
 	// QueueCleanup is the global arr queue-cleanup policy (see CleanupQueue).
@@ -804,6 +826,13 @@ func (c *Config) setDefaults() {
 	}
 	if c.MetadataReadTimeout == "" {
 		c.MetadataReadTimeout = DefaultMetadataReadTimeout
+	}
+	if c.DebridTakedownThreshold == 0 {
+		// Only the ZERO value is "unset". A negative value is a deliberate
+		// disable and must survive setDefaults, or the escape hatch documented
+		// on the field would be silently overwritten with the default it exists
+		// to avoid.
+		c.DebridTakedownThreshold = DefaultDebridTakedownThreshold
 	}
 
 	for i, debrid := range c.Debrids {
@@ -1076,6 +1105,13 @@ func clearHotFields(c *Config) {
 	c.DebridLinkTimeout = ""
 	c.DebridStatusTimeout = ""
 	c.MetadataReadTimeout = ""
+
+	// The takedown threshold is read live, per refusal, by the link service
+	// (config.Get() at the decision point — nothing caches it), so it applies
+	// without a restart. Same reasoning as the ceilings above: this is a knob an
+	// operator reaches for while a provider's classification is under suspicion,
+	// and that is the worst possible moment to make them bounce the mount.
+	c.DebridTakedownThreshold = 0
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,
 	// so changes apply on the next cleanup cycle without a restart.

@@ -39,6 +39,8 @@ func TestPlacementRefreshPreservesQueueWorkflowFields(t *testing.T) {
 		},
 		nil,
 		nil,
+		nil,
+		nil,
 		http.DefaultClient,
 		0,
 		nil, // these drive getPlacementFile directly; no ceiling is involved
@@ -73,6 +75,8 @@ func TestPlacementRefreshErrorDoesNotMutateCaller(t *testing.T) {
 		func(*storage.Entry) (*storage.Entry, error) {
 			return nil, fmt.Errorf("%w for main entry %s", storage.ErrStaleEntryGeneration, hash)
 		},
+		nil,
+		nil,
 		nil,
 		nil,
 		http.DefaultClient,

@@ -171,6 +171,9 @@ func NewArticleNotFoundError(err error) *Error {
 //   - usenet_segment_missing — sampled segments definitively absent on every
 //     configured provider.
 //   - debrid_content_gone    — the hoster answered 404/410 for the content.
+//   - debrid_content_takedown — the hoster answered a LEGAL removal (RealDebrid
+//     code 35 / HTTP 451). Different cause from debrid_content_gone, identical
+//     consequence for every consumer here: the bytes are not coming back.
 //   - any other PERMANENT error carrying HTTP 410 Gone.
 //
 // Everything else is excluded on purpose: authentication (401), permission,
@@ -188,7 +191,7 @@ func IsContentPermanentlyGone(err error) bool {
 		return false
 	}
 	switch e.Code {
-	case "usenet_article_missing", "usenet_segment_missing", "debrid_content_gone":
+	case "usenet_article_missing", "usenet_segment_missing", "debrid_content_gone", "debrid_content_takedown":
 		return true
 	}
 	return e.permanent && e.statusCode == http.StatusGone
@@ -280,4 +283,75 @@ func NewContentGoneError(err error) *Error {
 		statusCode: http.StatusGone,
 		Code:       "debrid_content_gone",
 	}).Permanent()
+}
+
+// NewContentTakedownError names a provider refusing content BECAUSE IT HAS BEEN
+// LEGALLY REMOVED — RealDebrid error code 35 (`infringing_file`, served as
+// HTTP 451) and any future equivalent.
+//
+// WHY THIS IS NOT HosterUnavailableError. RealDebrid's codes 19 (hoster
+// temporarily unavailable), 24 (file unavailable) and 35 (infringing file) were
+// all mapped onto the single HosterUnavailableError, so "the hoster is having a
+// bad day" and "this release is legally dead" arrived at every caller as the
+// same value. That lumping is wrong in BOTH directions and both directions were
+// measured on one production library: a provider flap could drive an entry all
+// the way to a permanent Bad verdict, while 5 of 5 sampled entries that HAD
+// been condemned were in fact code 35 — genuine takedowns that then stayed
+// invisible, re-refusing reads roughly 695 times a day because nothing
+// downstream could tell they were dead rather than merely unlucky.
+//
+// Every attribute here is chosen so the two classes can never re-merge:
+//
+//   - 451 Unavailable For Legal Reasons, which is literally what the provider
+//     answered. An operator reading a log or an HTTP status learns the cause
+//     without going back to the provider's error table.
+//   - Permanent(), so IsRetriableError refuses it and no retry loop can mask a
+//     takedown as a flap. This is the exact opposite of NewBackendTimeoutError,
+//     which is Retryable() precisely because it says nothing about the content.
+//   - A member of IsContentPermanentlyGone, so the SERVE path and the REPAIR
+//     probe reach the same verdict about it. See that function for why those two
+//     are not allowed to drift.
+func NewContentTakedownError(err error) *Error {
+	if err == nil {
+		err = errors.New("debrid content removed for legal reasons")
+	}
+	return (&Error{
+		err:        err,
+		statusCode: http.StatusUnavailableForLegalReasons,
+		Code:       "debrid_content_takedown",
+	}).Permanent()
+}
+
+// IsContentTakedown reports whether err carries — anywhere in its chain,
+// including inside an errors.Join tree — a provider's confirmed LEGAL removal
+// of the content.
+//
+// It is narrower than IsContentPermanentlyGone on purpose. Callers that must
+// only ever act on an UNAMBIGUOUS takedown (the re-insertion cascade, which
+// re-submits the same magnet to the provider that just refused it, and the
+// condemn-and-prune decision that follows) ask this; callers that only need
+// "these bytes are not coming back" ask IsContentPermanentlyGone.
+//
+// The chain walk matters for the same reason it does in IsBackendTimeout: the
+// re-insertion path joins a provider error with its compensating cleanup error,
+// so errors.As can land on the cleanup branch and answer for the wrong one.
+func IsContentTakedown(err error) bool {
+	if err == nil {
+		return false
+	}
+	var e *Error
+	if errors.As(err, &e) && e.Code == "debrid_content_takedown" {
+		return true
+	}
+	switch node := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, branch := range node.Unwrap() {
+			if IsContentTakedown(branch) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return IsContentTakedown(node.Unwrap())
+	}
+	return false
 }

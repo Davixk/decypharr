@@ -10,6 +10,7 @@ import (
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
+	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/utils"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
@@ -44,6 +45,29 @@ type EntryRefresher func(expected *storage.Entry) (*storage.Entry, error)
 type EntryRepairer func(ctx context.Context, entry *storage.Entry) error
 type EntrySaver func(entry *storage.Entry) error
 
+// EntryReacquirer re-inserts an entry on providers OTHER than the one it is
+// currently active on.
+//
+// It exists for exactly one caller: a confirmed legal takedown. Re-submitting
+// the same magnet to the provider that just answered "this release has been
+// removed for legal reasons" cannot possibly succeed, and doing it on every read
+// is how a takedown turns into a permanent re-insertion storm against the
+// provider. The other configured debrids, though, may well still serve the
+// content — a takedown is provider-scoped — and asking them once is the
+// difference between correctly parking dead content and destroying content that
+// was fine somewhere else.
+type EntryReacquirer func(ctx context.Context, entry *storage.Entry) error
+
+// EntryPruner removes an entry decypharr-side. It is the SAME operation the
+// repair sweep's PRUNE component performs, wired here so a confirmed takedown
+// reaches it without waiting for a sweep to come round.
+//
+// It makes no arr calls, by construction. decypharr is the download client: it
+// stops listing the content, the library symlink dangles, and the arr discovers
+// that for itself on its next disk scan. That is the whole mechanism, and
+// reaching into an arr API to hurry it along is not part of it.
+type EntryPruner func(entry *storage.Entry) error
+
 // Service handles download link fetching and validation.
 // It uses the account-level cache for storing links and only tracks validation state.
 // ResolveCeiling reports how long a caller may be held waiting for a download
@@ -58,7 +82,10 @@ type Service struct {
 	clients        *xsync.Map[string, debrid.Client]
 	entryRefresher EntryRefresher
 	repairer       EntryRepairer
+	reacquirer     EntryReacquirer
 	entrySaver     EntrySaver
+	pruner         EntryPruner
+	takedowns      takedownLedger
 	httpClient     *http.Client
 	retries        int
 	resolveCeiling ResolveCeiling
@@ -70,7 +97,9 @@ func New(
 	clients *xsync.Map[string, debrid.Client],
 	entryRefresher EntryRefresher,
 	entryReinsert EntryRepairer,
+	entryReacquire EntryReacquirer,
 	entrySaver EntrySaver,
+	entryPruner EntryPruner,
 	httpClient *http.Client,
 	retries int,
 	resolveCeiling ResolveCeiling,
@@ -81,7 +110,9 @@ func New(
 		clients:        clients,
 		entryRefresher: entryRefresher,
 		repairer:       entryReinsert,
+		reacquirer:     entryReacquire,
 		entrySaver:     entrySaver,
+		pruner:         entryPruner,
 		httpClient:     httpClient,
 		retries:        retries,
 		resolveCeiling: resolveCeiling,
@@ -309,6 +340,11 @@ func badEntryError(entry *storage.Entry) error {
 // used to surface as an empty link and could permanently condemn an entry
 // (Bad = true) after three attempts. They are typed errors now and are left
 // alone — a transient throttle must never permanently kill an entry.
+//
+// Also deliberately NOT included, and checked before this function is even
+// called: a confirmed legal takedown. It arrives with the same shape as a
+// hoster-unavailable refusal but means the opposite thing, and re-inserting on
+// the provider that issued it is guaranteed futile. See handleTakedown.
 func reinsertReason(err error) string {
 	switch {
 	case errors.Is(err, customerror.HosterUnavailableError):
@@ -321,6 +357,17 @@ func reinsertReason(err error) string {
 }
 
 func (s *Service) handleBadLink(ctx context.Context, err error, entry *storage.Entry, filename string, dl types.DownloadLink, attempt int) (types.DownloadLink, error) {
+	// A CONFIRMED LEGAL TAKEDOWN IS NOT A RE-INSERTION TRIGGER.
+	//
+	// It used to be, because it arrived as HosterUnavailableError like every
+	// transient refusal did. That is the whole 695-refusals-a-day loop: submit
+	// the magnet again to the provider that has legally removed the release, get
+	// a placement, resolve a link, get refused again, repeat — three times per
+	// read, for every read, forever. It is checked before reinsertReason so the
+	// old lumped route cannot reclaim it.
+	if customerror.IsContentTakedown(err) {
+		return s.handleTakedown(ctx, err, entry, filename, attempt)
+	}
 	reason := reinsertReason(err)
 	if reason == "" {
 		// Just return the error
@@ -330,9 +377,30 @@ func (s *Service) handleBadLink(ctx context.Context, err error, entry *storage.E
 		return emptyDownloadLink, badErr
 	}
 	if attempt >= MaxReinsertionAttempt {
-		s.markEntryBad(entry, filename, attempt, reason)
-		return emptyDownloadLink, fmt.Errorf("entry %s file %s still unresolvable (%s) after %d re-insertion attempts",
-			entry.GetFolder(), filename, reason, attempt)
+		// EXHAUSTED, NOT CONDEMNED.
+		//
+		// This branch used to set the durable Bad flag, which short-circuits
+		// every future read of the entry and is cleared by nothing except a
+		// re-insertion that succeeds. The trigger reaching it, though, is by
+		// definition a TRANSIENT class — hoster unavailable (RealDebrid 19/24) or
+		// an empty link — so a provider having a bad hour was enough to condemn
+		// an entry permanently, and the more re-insertion cycles the outage
+		// broke, the more certain the condemnation looked.
+		//
+		// Nothing durable happens here now. The reader gets the provider's own
+		// answer (503, retryable) instead of a generic 500 that rclone would
+		// retry blindly, the entry's health is untouched, and the next read
+		// starts from the same state. An outage of any length therefore costs
+		// failed reads and nothing else.
+		s.logger.Warn().
+			Str("infohash", entry.InfoHash).
+			Str("name", entry.Name).
+			Str("filename", filename).
+			Int("attempts", attempt).
+			Str("reason", reason).
+			Msg("Re-insertion exhausted on a transient provider failure; entry left unmarked")
+		return emptyDownloadLink, fmt.Errorf("%w: entry %s file %s still unresolvable (%s) after %d re-insertion attempts",
+			customerror.HosterUnavailableError, entry.GetFolder(), filename, reason, attempt)
 	}
 	if repairErr := s.repairer(ctx, entry); repairErr != nil {
 		return emptyDownloadLink, repairErr
@@ -349,9 +417,159 @@ func (s *Service) handleBadLink(ctx context.Context, err error, entry *storage.E
 	return s.fetchAndValidate(ctx, entry, filename, attempt+1)
 }
 
+// handleTakedown is the confirmed-legal-takedown path: the provider has stated
+// that this release was removed for legal reasons (RealDebrid code 35 / HTTP
+// 451), which is a verdict about the CONTENT and not about the machinery.
+//
+// It answers the three questions the old lumped code never had to ask.
+//
+// HOW MUCH EVIDENCE. One refusal per file, by default
+// (Config.DebridTakedownThreshold). There is no retry, no wait and no other
+// account that turns a 451 into bytes, so a second refusal would only mean one
+// more guaranteed-failing read on the way to the same conclusion. A negative
+// threshold disables the verdict outright for operators who distrust a
+// provider's classification.
+//
+// WHOSE FAULT IT IS. A takedown is PROVIDER-SCOPED. Before condemning anything,
+// the other configured debrids are asked once — skipping the provider that
+// issued the refusal, which is guaranteed futile. If one of them can serve the
+// content, the entry is simply re-acquired there and nothing is condemned at
+// all. That is the asymmetry being respected: wrongly condemning good content
+// costs a re-download plus an indexer search, and content alive on another
+// debrid is good content.
+//
+// HOW MUCH TO CONDEMN. The whole entry, only once EVERY live file in it has
+// been confirmed taken down. A partially dead entry keeps serving its surviving
+// files — the same rule the repair sweep's PRUNE already applies, for the same
+// reason: a thirteen-file pack must not be deleted because one file died.
+func (s *Service) handleTakedown(ctx context.Context, err error, entry *storage.Entry, filename string, attempt int) (types.DownloadLink, error) {
+	threshold := takedownThreshold()
+	if threshold < 0 {
+		// Disabled by configuration. The reader still gets the real cause; we
+		// simply never convert it into a verdict.
+		return emptyDownloadLink, err
+	}
+
+	key := takedownLedgerKey(entry)
+	fileDead, deadFiles := s.takedowns.record(key, filename, threshold)
+	live := liveFileCount(entry)
+	s.logger.Warn().
+		Str("infohash", entry.InfoHash).
+		Str("name", entry.Name).
+		Str("filename", filename).
+		Int("threshold", threshold).
+		Int("dead_files", deadFiles).
+		Int("live_files", live).
+		Msg("Provider reports this content was removed for legal reasons")
+
+	if !fileDead {
+		// Below threshold: refuse this read with its real cause and wait for
+		// corroboration. Nothing durable happens on the way there.
+		return emptyDownloadLink, err
+	}
+
+	// Ask the OTHER debrids once. attempt bounds this the same way it bounds the
+	// transient re-insertion loop, so a takedown on every configured provider
+	// cannot turn into an unbounded cascade.
+	if s.reacquirer != nil && attempt < MaxReinsertionAttempt {
+		if reacquireErr := s.reacquirer(ctx, entry); reacquireErr != nil {
+			s.logger.Debug().Err(reacquireErr).
+				Str("infohash", entry.InfoHash).
+				Msg("No other debrid could re-acquire content taken down on the active provider")
+		} else if !entry.Bad {
+			// Somebody else has it. The refusal was about one provider, not about
+			// the content, so the evidence gathered against it is void.
+			s.takedowns.forget(key)
+			s.logger.Info().
+				Str("infohash", entry.InfoHash).
+				Str("name", entry.Name).
+				Str("provider", entry.ActiveProvider).
+				Msg("Content taken down on one debrid was re-acquired on another; not condemning")
+			return s.fetchAndValidate(ctx, entry, filename, attempt+1)
+		}
+	}
+
+	if live > 0 && deadFiles < live {
+		// Partially dead. The surviving files still serve, so their symlinks
+		// stay valid and the arr keeps the release. Say so — a correct refusal
+		// to act is otherwise indistinguishable from a broken one.
+		s.logger.Info().
+			Str("infohash", entry.InfoHash).
+			Str("name", entry.Name).
+			Int("dead_files", deadFiles).
+			Int("live_files", live).
+			Msg("Entry is partially taken down; leaving it in place so its surviving files keep serving")
+		return emptyDownloadLink, err
+	}
+
+	s.condemnTakenDownEntry(entry, filename, deadFiles)
+	return emptyDownloadLink, err
+}
+
+// condemnTakenDownEntry records the verdict and then stops the content being
+// served AND being listed.
+//
+// THE MARK AND THE PRUNE ARE TWO DIFFERENT THINGS. Bad stops it being SERVED:
+// every subsequent read short-circuits to a permanent 410 before any provider
+// call. That alone is not enough, and not being enough is the defect: a
+// bad-marked entry stays in the mount listing, so its library symlink still
+// resolves, so the arr never notices anything is wrong and never re-searches.
+// The content is dead and the library goes on believing it has it.
+//
+// PRUNE is what closes that. It is the identical operation the repair sweep's
+// PRUNE component performs on dead content, gated by the identical knob
+// (repair.prune), and it makes ZERO arr calls: it deletes the entry
+// decypharr-side, the symlink dangles, and the arr reaps it on its own next disk
+// scan and searches for a replacement by its own rules. decypharr is the
+// download client; it marks and parks, and the arr learns by looking.
+//
+// With repair.prune off, the entry is condemned but left in place — visible in
+// the __bad__ folder, still refusing reads. That is the honest degradation: the
+// destructive step stays behind the operator's existing destructive consent
+// rather than inventing a new one that defaults to deleting things.
+func (s *Service) condemnTakenDownEntry(entry *storage.Entry, filename string, deadFiles int) {
+	s.markEntryBad(entry, filename, deadFiles, "content_takedown")
+	s.takedowns.forget(takedownLedgerKey(entry))
+
+	if !config.Get().Repair.Prune {
+		s.logger.Warn().
+			Str("infohash", entry.InfoHash).
+			Str("name", entry.Name).
+			Msg("Content is confirmed taken down but repair.prune is off, so it stays in the mount listing and its " +
+				"library symlink keeps resolving; enable PRUNE to have the entry removed and the arr re-search it")
+		return
+	}
+	if s.pruner == nil {
+		s.logger.Warn().
+			Str("infohash", entry.InfoHash).
+			Msg("Content is confirmed taken down but no pruner is wired; entry left in place")
+		return
+	}
+	if pruneErr := s.pruner(entry); pruneErr != nil {
+		s.logger.Warn().Err(pruneErr).
+			Str("component", "PRUNE").
+			Str("infohash", entry.InfoHash).
+			Str("name", entry.Name).
+			Msg("PRUNE: failed to delete taken-down entry decypharr-side")
+		return
+	}
+	s.logger.Info().
+		Str("component", "PRUNE").
+		Str("infohash", entry.InfoHash).
+		Str("name", entry.Name).
+		Msg("PRUNE: deleted taken-down entry decypharr-side (no arr call is made, so the library symlink is left " +
+			"dangling; whether it is reaped depends on the arr's own dangling-symlink handling)")
+}
+
 // markEntryBad sets entry.Bad and persists it so subsequent GetLink calls
 // for the same entry short-circuit instead of triggering another re-insertion
 // cycle. Logged once per call.
+//
+// ONLY AN UNAMBIGUOUS CONTENT VERDICT REACHES HERE. It used to be reachable from
+// the exhausted-re-insertion branch as well, which is how transient provider
+// failures acquired a permanent, self-sustaining Bad flag — see handleBadLink
+// for what that cost. The flag is durable and effectively one-way, so the bar
+// for setting it is a provider stating the content itself is gone.
 func (s *Service) markEntryBad(entry *storage.Entry, filename string, attempt int, reason string) {
 	entry.Bad = true
 	if s.entrySaver != nil {
