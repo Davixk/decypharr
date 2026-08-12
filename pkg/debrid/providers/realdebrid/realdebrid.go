@@ -490,8 +490,16 @@ func (r *RealDebrid) addTorrent(t *types.Torrent) (*types.Torrent, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		if resp.StatusCode == 509 {
+		switch resp.StatusCode {
+		case 509:
 			return nil, customerror.TooManyActiveDownloadsError
+		case http.StatusTooManyRequests:
+			// Belt and braces. The shared client retries 429 and types the
+			// give-up itself, so this branch is only reachable when retries are
+			// disabled or the policy changes — but an untyped 429 here would be
+			// answered with a 400 to the *arr, and that failure mode is too
+			// expensive to leave depending on a setting in another package.
+			return nil, customerror.RateLimitedError
 		}
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -521,6 +529,11 @@ func (r *RealDebrid) addMagnet(t *types.Torrent) (*types.Torrent, error) {
 
 	case 509:
 		return nil, customerror.TooManyActiveDownloadsError
+
+	case http.StatusTooManyRequests:
+		// See addTorrent: the shared client normally types this before it gets
+		// here, and an untyped 429 costs the grab.
+		return nil, customerror.RateLimitedError
 
 	default:
 		return nil, fmt.Errorf("realdebrid API error: Status: %d", resp.StatusCode)

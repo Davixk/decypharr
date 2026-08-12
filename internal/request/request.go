@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/rs/zerolog"
 	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/sirrobot01/decypharr/internal/customerror"
 	"github.com/sirrobot01/decypharr/internal/logger"
 	"github.com/sirrobot01/decypharr/internal/netbind"
 	"go.uber.org/ratelimit"
@@ -333,8 +334,31 @@ func New(options ...ClientOption) *Client {
 		if detail == "" {
 			detail = "(empty body)"
 		}
-		return nil, fmt.Errorf("%s %s gave up after %d attempt(s): status %d: %s",
+		giveUp := fmt.Errorf("%s %s gave up after %d attempt(s): status %d: %s",
 			resp.Request.Method, resp.Request.URL, attempts, resp.StatusCode, detail)
+
+		// AND TYPE THE ONE STATUS A CALLER MUST BE ABLE TO ACT ON.
+		//
+		// 429 is in retryableStatus, so a rate-limited request is retried to
+		// exhaustion and only ever reaches its caller through this handler —
+		// which means the provider-side switch statements that map status codes
+		// to typed errors NEVER SEE IT. Every one of them lands on its default
+		// branch and produces an untyped string.
+		//
+		// That is exactly how a rate limit became a refused grab: the add path
+		// classifies a failure by TYPE to decide whether to hold the entry or
+		// fail it back to the *arr, the type was absent, and "I could not
+		// classify this" means refuse. So a self-inflicted 429 — the most
+		// transient condition in the system, clearing in seconds — was answered
+		// with a permanent-looking 400 and the release was lost.
+		//
+		// Typed HERE rather than per provider because this is the only place
+		// that still knows the status. Doing it in five provider packages would
+		// mean five switches that are all unreachable for this case.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, fmt.Errorf("%w: %w", customerror.RateLimitedError, giveUp)
+		}
+		return nil, giveUp
 	}
 
 	client.client = retryClient

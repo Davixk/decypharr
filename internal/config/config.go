@@ -312,6 +312,33 @@ type RepairConfig struct {
 	// negative value (e.g. -1) means unlimited.
 	MaxDeletionsPerRun int `json:"max_deletions_per_run,omitempty"`
 
+	// MaxLivePrunesPerHour is the same protection for the prunes that DO NOT
+	// happen inside a run.
+	//
+	// MaxDeletionsPerRun cannot cover them, and that gap grew as the
+	// event-driven verdicts landed. A confirmed debrid takedown and a confirmed
+	// usenet dead article both prune the instant a READ proves the content is
+	// gone, precisely so the library stops lying between sweeps — which means
+	// they are not inside a sweep and there is no run to cap.
+	//
+	// The hazard is the same one MaxDeletionsPerRun exists for, and for usenet
+	// it is sharper. An article-not-found verdict is "not found on EVERY
+	// configured provider", which reads as strong corroboration and is not: with
+	// one provider configured it is one server's word. A provider changing its
+	// retention or losing an index shelf answers 430 for a great many articles at
+	// once, and every read of every affected file would condemn and prune its
+	// entry, at read rate, with no run boundary to stop at.
+	//
+	// So this is a RATE LIMIT ON AN IRREVERSIBLE ACTION, not a policy. Entries
+	// over the budget are still marked bad and still stop serving; only the
+	// deletion is deferred, and the nightly sweep picks them up under its own
+	// cap. Nothing is lost, and a runaway becomes a loud log line and a bounded
+	// number of deletions instead of a library.
+	//
+	// 0/unset defaults to 50 an hour, which is far above any observed rate of
+	// genuine decay and far below a runaway. A negative value means unlimited.
+	MaxLivePrunesPerHour int `json:"max_live_prunes_per_hour,omitempty"`
+
 	// StopSchedule, when set, stops an in-progress repair sweep at this time/interval
 	// (same formats as Schedule: clock time, cron expression, or duration).
 	// A repair sweep still running when StopSchedule fires is cancelled before it
@@ -327,6 +354,7 @@ func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.MaxDeletionsPerRun == 0 &&
+		r.MaxLivePrunesPerHour == 0 &&
 		r.Repair == nil && !r.Prune && r.ArrDelete == nil && r.Regrab == nil &&
 		!r.ArrSearch && !r.ArrBlocklist
 }

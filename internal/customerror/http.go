@@ -32,6 +32,27 @@ var TooManyActiveDownloadsError = (&Error{
 	Code:       "too_many_active_downloads",
 }).Retryable() // slot exhaustion is transient — retry after backoff
 
+// RateLimitedError is a provider refusing because we are asking too FAST.
+//
+// It is a third capacity condition, distinct from both of the ones below, and
+// giving it its own identity is the point: it is not about how many items the
+// account holds (ProviderAddQuotaExhausted) and not about how many are in
+// flight (TooManyActiveDownloads). It clears on a timescale of seconds, and it
+// is the ONE capacity refusal decypharr causes itself.
+//
+// WHY IT NEEDED A TYPE. The only recogniser was isRateLimitSignal, a substring
+// scan for "429"/"503"/"slow down". That was fine for feeding the pacer's
+// backoff, where a false positive costs one slower minute, and unusable for
+// deciding whether to accept a grab: "503" also matches HosterUnavailableError,
+// which is double-booked as both a hoster outage AND every provider's
+// definitive 404/410 CheckFile verdict. Holding a grab on THAT string would
+// park permanently-gone content forever. A type cannot be confused that way.
+var RateLimitedError = (&Error{
+	statusCode: 429,
+	err:        errors.New("provider rate limit reached"),
+	Code:       "rate_limited",
+}).Retryable()
+
 // ProviderAddQuotaExhaustedError is a provider refusing NEW items because an
 // add or storage allowance is spent — NOT because its concurrency slots are
 // full. The two look alike and clear on completely different timescales, which

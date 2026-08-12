@@ -254,7 +254,35 @@ type Usenet struct {
 	// this before starting goroutines and leave it immutable while they run.
 	lifecycleTestHook func(operation, nzoID string)
 
+	// deadContent is notified when an article failure is recorded durably.
+	// Set once at wiring time by the manager and read-only afterwards.
+	deadContent DeadContentHandler
+
 	fs *xsync.Map[string, *fsEntry]
+}
+
+// DeadContentHandler is told that a file has been confirmed permanently gone,
+// with the census of how much of its NZB is now dead.
+//
+// WHY A HANDLER AND NOT THE WORK ITSELF. This package knows an article is
+// missing on every configured provider; it does not know what an "entry" is, it
+// does not read repair.prune, and it must not learn — pkg/usenet is below the
+// manager, and the alternative to a callback is an import cycle or a copy of the
+// prune policy living in two places.
+//
+// The split follows the same line the debrid takedown path draws: the evidence
+// is gathered where it is observed, the VERDICT is taken where the policy lives.
+//
+// Called with no locks held, deliberately. The handler prunes an entry, which
+// re-enters this package to tear down cached readers; holding the NZB lifecycle
+// lock across that would deadlock against the very teardown it asks for.
+type DeadContentHandler func(nzoID, filename string, dead, total int, cause error)
+
+// SetDeadContentHandler wires the verdict path. Safe to leave unset: without it
+// a dead article is still recorded durably and still stops serving — only the
+// prune, and therefore the *arr's chance to notice, is lost.
+func (u *Usenet) SetDeadContentHandler(handler DeadContentHandler) {
+	u.deadContent = handler
 }
 
 // fsKey builds a cache key for fs map entries efficiently.
@@ -1555,15 +1583,48 @@ func (u *Usenet) recordPermanentArticleFailure(nzoID, filename string, articleEr
 }
 
 func (u *Usenet) recordPermanentArticleFailureForGeneration(nzoID, generation, filename string, articleErr error) error {
+	census, err := u.recordPermanentArticleFailureLocked(nzoID, generation, filename, articleErr)
+	if err != nil {
+		return err
+	}
+
+	cause := permanentArticleCause(filename, articleErr)
+
+	// NOTIFIED AFTER THE LIFECYCLE LOCK IS RELEASED, AND THAT IS NOT A DETAIL.
+	// The handler prunes the entry, which re-enters this package to tear down
+	// cached readers and FS entries for the same nzoID — under the lock that
+	// would deadlock against the teardown it just asked for.
+	//
+	// It is also why the durable write happens first and unconditionally: the
+	// verdict is a consequence of the record, never a substitute for it. If the
+	// handler is unset, or refuses, or the process dies here, the article is
+	// still permanently marked and still refuses every later read. The only
+	// thing lost is the *arr finding out promptly, and the nightly sweep is the
+	// backstop for that.
+	if u.deadContent != nil {
+		u.deadContent(nzoID, filename, census.dead, census.total, cause)
+	}
+	return customerror.NewArticleNotFoundError(cause)
+}
+
+func permanentArticleCause(filename string, articleErr error) error {
+	return fmt.Errorf("articles missing on provider for %q: %w", filename, articleErr)
+}
+
+// recordPermanentArticleFailureLocked does the durable half under the NZB
+// lifecycle lock. Split out so the lock is demonstrably released before the
+// handler runs, rather than by a defer whose ordering has to be read carefully.
+func (u *Usenet) recordPermanentArticleFailureLocked(nzoID, generation, filename string, articleErr error) (fileDeathCensus, error) {
 	unlockLifecycle := u.lockNZBLifecycle(nzoID)
 	defer unlockLifecycle()
 
-	cause := fmt.Errorf("articles missing on provider for %q: %w", filename, articleErr)
-	if persistErr := u.nzbStorage.markFilePermanentlyFailedWithLifecycleHeld(nzoID, generation, filename, cause.Error()); persistErr != nil {
+	cause := permanentArticleCause(filename, articleErr)
+	census, persistErr := u.nzbStorage.markFilePermanentlyFailedWithLifecycleHeld(nzoID, generation, filename, cause.Error())
+	if persistErr != nil {
 		// Do not acknowledge/cache a permanent 410 until it is durable. A
 		// transient metadata write failure must be retried after this request
 		// instead of disappearing on process restart.
-		return fmt.Errorf("persist permanent usenet failure for %q: %w (article error: %v)", filename, persistErr, cause)
+		return fileDeathCensus{}, fmt.Errorf("persist permanent usenet failure for %q: %w (article error: %v)", filename, persistErr, cause)
 	}
 
 	u.runLifecycleTestHook("failure-publish", nzoID)
@@ -1577,7 +1638,7 @@ func (u *Usenet) recordPermanentArticleFailureForGeneration(nzoID, generation, f
 	if u.preparedSizes != nil {
 		u.preparedSizes.Delete(key)
 	}
-	return customerror.NewArticleNotFoundError(cause)
+	return census, nil
 }
 
 // safeCopyBuffer copies from src to dst using buf, with context checking and

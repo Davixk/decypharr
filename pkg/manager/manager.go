@@ -64,6 +64,10 @@ type Manager struct {
 	// Replaces a flat constant that was identical for providers whose published
 	// limits differ by more than 2x.
 	addPace *addPacer
+	// livePrunes rate-limits the DELETIONS that happen on a read rather than
+	// inside a repair run — confirmed debrid takedowns and confirmed usenet dead
+	// articles. repairDeletionBudget cannot reach those: there is no run.
+	livePrunes      *livePruneBudget
 	arr             *arr.Storage
 	logger       zerolog.Logger
 	ready        chan struct{}
@@ -230,6 +234,7 @@ func New() *Manager {
 		reconcileList:          newReconcileListing(),
 		declines:               newDeclineLedger(),
 		addPace:                newAddPacer(),
+		livePrunes:             newLivePruneBudget(),
 		capacityHold:           newCapacityHoldQueue(),
 		logger:                 _logger,
 		migrationJobs:          xsync.NewMap[string, *storage.SwitcherJob](),
@@ -342,6 +347,10 @@ func (m *Manager) initUsenet() {
 		return
 	}
 	m.usenet = usenetClient
+	// A confirmed dead article is a content verdict, and content verdicts are
+	// acted on here rather than in pkg/usenet: that package proves the articles
+	// are gone, this one knows what an entry is and what repair.prune means.
+	m.usenet.SetDeadContentHandler(m.onUsenetDeadContent)
 	// Fit concurrent heavy Process/availability passes to the provider pool so
 	// they cannot oversubscribe it and time out en masse (the substrate-wedge
 	// mechanism behind the livelock). Sized from the pool, NOT from
@@ -369,7 +378,10 @@ func (m *Manager) initLinkService() {
 		m.ReinsertEntry,
 		m.ReacquireEntryElsewhere,
 		m.persistLinkEntryBad,
-		m.pruneTakenDownEntry,
+		// Behind the live-prune budget, same as the usenet dead-article path.
+		// Both are irreversible deletions driven by one provider's word on a
+		// single read, with no run boundary to cap them.
+		m.pruneDeadEntryLive,
 		m.streamClient,
 		m.config.Retries,
 		// Passed as a function, not a value: the ceiling is resolved per call so
@@ -518,11 +530,23 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		// we are about which release to try next, and it costs us no held
 		// state and no invented interval.
 		//
-		// Failing is free, which is the measurement that settles it. On a live
-		// Sonarr, 8,243 blocklisted entries contain exactly FOUR torrents,
-		// against many thousands of add rejections across 12+ days — a failed
-		// ADD is treated as a download-client problem, not a release problem.
-		// Nothing is blocklisted, no candidate list is burned.
+		// A failed add is NOT blocklisted, which settles the "does this burn the
+		// release" half. On a live Sonarr, 8,243 blocklisted entries contain
+		// exactly FOUR torrents, against many thousands of add rejections across
+		// 12+ days — a failed ADD is treated as a download-client problem, not a
+		// release problem.
+		//
+		// And per the operator's ruling, refusing costs nothing beyond that: the
+		// arr takes the next-best release from the SAME search results, where
+		// failing AFTER a successful grab costs a whole new search. That
+		// asymmetry is the entire economics of this file.
+		//
+		// ⚠️ It does not make refusing the right answer for a TEMPORARY
+		// inability, and that is a different point. A rate limit or a spent
+		// allowance says nothing about the release, so refusing spends a
+		// candidate to dodge a condition that clears on its own — 595 of them in
+		// one 30-minute window, with the same titles returning on a ~2-3 hour
+		// re-grab carousel. Only an all-providers-permanent verdict refuses.
 		//
 		// The quota case is the clearest: it was observed refusing every add
 		// for 54.6 continuous hours because the provider's stored-item cap was
@@ -532,7 +556,19 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		// same: a held entry re-attempted here has to reach the identical
 		// verdict, or an entry accepted at grab time would be failed on its
 		// first retry.
-		if refusal := m.classifyAddRefusal(err); refusal.hold {
+		refusal := m.classifyAddRefusal(err)
+		if refusal.standingCondition != "" {
+			// LOUD and operator-addressed, and logged BEFORE the branch because
+			// a standing condition now co-exists with a hold. It is the one
+			// capacity condition that no amount of waiting resolves on its own,
+			// so it must not read like the transient ones and must not go quiet
+			// just because the entry is being held rather than refused.
+			m.logger.Error().
+				Str("job_id", job.ID).
+				Str("provider", refusal.provider).
+				Msg(refusal.standingCondition)
+		}
+		if refusal.hold {
 			if job.Entry != nil {
 				job.Entry.Status = debridTypes.TorrentStatusQueued
 				if updateErr := m.queue.Update(job.Entry); updateErr != nil {
@@ -545,14 +581,6 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 				Msgf("Still holding until a provider slot frees: %s", refusal.detail)
 			m.holdForCapacity(job)
 			return
-		} else if refusal.standingCondition != "" {
-			// LOUD and operator-addressed. This is the one capacity condition
-			// no amount of waiting resolves, so it must not read like the
-			// transient ones above.
-			m.logger.Error().
-				Str("job_id", job.ID).
-				Str("provider", refusal.provider).
-				Msg(refusal.standingCondition)
 		}
 		if errors.Is(err, parser.ErrProbeInfrastructure) {
 			// The availability probe failed on the NNTP substrate, not on the

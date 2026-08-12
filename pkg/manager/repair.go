@@ -977,6 +977,41 @@ func (m *Manager) pruneTakenDownEntry(entry *storage.Entry) error {
 	return m.DeleteEntry(entry.InfoHash, true)
 }
 
+// pruneDeadEntryLive is pruneTakenDownEntry behind the live-prune budget.
+//
+// The budget belongs on THIS path and not inside pruneTakenDownEntry, because
+// pruneTakenDownEntry is also the sweep's shape and the sweep already has
+// repairDeletionBudget — stacking two caps on one deletion would make a skipped
+// prune ambiguous between them.
+//
+// ⚠️ RESERVE, THEN DELETE, NEVER THE REVERSE. Reserving is what commits the
+// slot, so it happens immediately before the irreversible step. A reservation
+// taken and not spent is a deletion some other dead entry could have had this
+// hour.
+func (m *Manager) pruneDeadEntryLive(entry *storage.Entry) error {
+	if entry == nil {
+		return fmt.Errorf("entry is nil")
+	}
+	if ok, used, limit := m.livePrunes.reserve(time.Now()); !ok {
+		// 🔴 The entry stays condemned and stays refusing reads; only the
+		// deletion is deferred to the nightly sweep. Logged at error level with
+		// the numbers, because a cap that trips silently reads exactly like a
+		// system that found nothing wrong.
+		m.logger.Error().
+			Str("component", "PRUNE").
+			Str("infohash", entry.InfoHash).
+			Str("name", entry.Name).
+			Int("live_prunes_last_hour", used).
+			Int("limit", limit).
+			Msg("PRUNE SKIPPED — the live-prune budget is exhausted. The entry is condemned and has stopped serving, " +
+				"but it is NOT deleted and its symlink still resolves. Check whether a provider is issuing " +
+				"dead-content verdicts en masse before raising repair.max_live_prunes_per_hour; the nightly repair " +
+				"sweep will collect whatever is genuinely dead under its own cap.")
+		return nil
+	}
+	return m.pruneTakenDownEntry(entry)
+}
+
 // linkOf returns the resolvable link/id for a torrent file in its active
 // provider placement, or "" when no link is available.
 func linkOf(entry *storage.Entry, name string) string {

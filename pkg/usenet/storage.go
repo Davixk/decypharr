@@ -376,30 +376,59 @@ func (s *NZBStorage) AssertGeneration(id, expected string) error {
 func (s *NZBStorage) markFilePermanentlyFailed(id, filename, reason string) error {
 	unlock := s.lockNZBLifecycle(id)
 	defer unlock()
-	return s.markFilePermanentlyFailedWithLifecycleHeld(id, "", filename, reason)
+	_, err := s.markFilePermanentlyFailedWithLifecycleHeld(id, "", filename, reason)
+	return err
 }
 
 func (s *NZBStorage) markFilePermanentlyFailedForGeneration(id, generation, filename, reason string) error {
 	unlock := s.lockNZBLifecycle(id)
 	defer unlock()
-	return s.markFilePermanentlyFailedWithLifecycleHeld(id, generation, filename, reason)
+	_, err := s.markFilePermanentlyFailedWithLifecycleHeld(id, generation, filename, reason)
+	return err
 }
 
-func (s *NZBStorage) markFilePermanentlyFailedWithLifecycleHeld(id, generation, filename, reason string) error {
+// fileDeathCensus is how much of an NZB is confirmed dead, counted from the
+// DURABLE per-file flags at the moment the mark was written.
+//
+// It has to be taken here, under the same lock as the write, for two reasons.
+//
+// The first is correctness: the caller cannot recompute it afterwards without
+// racing a concurrent 430 for a sibling file, and two files dying at once is the
+// normal case for a pack whose whole posting expired.
+//
+// The second is that IsBad CANNOT stand in for it. markFilePermanentlyFailed
+// sets IsBad on the FIRST dead file, so an entry with one dead episode and
+// twelve live ones is IsBad exactly like one with nothing left. Condemning on
+// IsBad would delete a thirteen-file pack because one episode died — the mistake
+// the debrid takedown path went to some length to avoid, waiting there.
+type fileDeathCensus struct {
+	dead  int
+	total int
+}
+
+// allDead reports whether nothing in this NZB survives. total == 0 is NOT all
+// dead: an NZB with no file records is a metadata problem, and answering "yes,
+// delete it" to a question we cannot see the subject of is how an empty read
+// becomes a deletion.
+func (c fileDeathCensus) allDead() bool { return c.total > 0 && c.dead >= c.total }
+
+func (s *NZBStorage) markFilePermanentlyFailedWithLifecycleHeld(id, generation, filename, reason string) (fileDeathCensus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	var census fileDeathCensus
+
 	data, err := os.ReadFile(s.metaFilePath(id))
 	if err != nil {
-		return fmt.Errorf("failed to read NZB metadata: %w", err)
+		return census, fmt.Errorf("failed to read NZB metadata: %w", err)
 	}
 	nzb, err := decodeNZB(data)
 	if err != nil {
-		return err
+		return census, err
 	}
 	if generation != "" {
 		if _, err := adoptOrRequireNZBGeneration(nzb, generation); err != nil {
-			return err
+			return census, err
 		}
 	}
 
@@ -412,12 +441,27 @@ func (s *NZBStorage) markFilePermanentlyFailedWithLifecycleHeld(id, generation, 
 		}
 	}
 	if !found {
-		return fmt.Errorf("file %s not found in NZB %s", filename, id)
+		return census, fmt.Errorf("file %s not found in NZB %s", filename, id)
 	}
 	nzb.IsBad = true
 	nzb.Status = NZBStatusFailed
 	nzb.FailMessage = reason
-	return s.writeNZBLocked(nzb)
+
+	// Counted AFTER the mark and BEFORE the write, so it describes exactly the
+	// state about to become durable.
+	census.total = len(nzb.Files)
+	for i := range nzb.Files {
+		if nzb.Files[i].IsDeleted {
+			census.dead++
+		}
+	}
+
+	if writeErr := s.writeNZBLocked(nzb); writeErr != nil {
+		// The census describes a state that never landed. Returning it anyway
+		// would let a caller condemn an entry on evidence that was rolled back.
+		return fileDeathCensus{}, writeErr
+	}
+	return census, nil
 }
 
 // reconcileFileSize atomically persists the segment-derived stream size.

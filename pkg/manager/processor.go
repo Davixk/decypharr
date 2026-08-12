@@ -48,39 +48,53 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 		return m.queue.Update(torrent)
 	}()
 	if err != nil {
-		// WHY a capacity failure may be held rather than failed.
+		// WHY a capacity failure is held rather than failed.
 		//
 		// A CONTENT refusal is refused: this release is unservable, another
 		// candidate may not be, and the arr is still holding its result set so
-		// taking the next one costs nothing.
+		// taking the next one costs nothing. That is the whole economics —
+		// failing a grab costs one candidate, failing AFTER a successful grab
+		// costs a whole new search across every indexer.
 		//
-		// A TRANSIENT CAPACITY refusal is different in kind — it says nothing
-		// about this release, only that the provider is busy or its daily
+		// A TEMPORARY INABILITY is different in kind. It says nothing about this
+		// release, only that the provider is busy, rate limiting, or its
 		// allowance is spent. decypharr's own queue is not bounded by the
 		// provider's, so the entry is accepted and held until capacity exists.
-		// The hold has no deadline: stall pruning continuously reclaims
-		// provider slots, so this is a queue with a working drain, and failing
-		// a held entry on a timer would fail work that was going to succeed —
-		// at the cost of a full arr search each, since an async failure
-		// discards the arr's candidate list where a sync refusal does not.
+		// The hold has no deadline: stall pruning continuously reclaims provider
+		// slots, so this is a queue with a working drain, and failing a held
+		// entry on a timer would fail work that was going to succeed.
 		//
-		// A STANDING capacity refusal (a stored-item cap that is full) is
-		// refused like content, because nothing decypharr does frees it. That
-		// is the case fork.34 held forever, producing the 15.2-hour spin.
-		if refusal := m.classifyAddRefusal(err); refusal.hold {
-			return m.holdTorrentForCapacity(importReq, torrent, refusal, err)
-		} else if refusal.standingCondition != "" {
+		// The at-cap stored-item case is HELD too, by operator ruling — a full
+		// account is not a verdict about the release. See classifyQuotaRefusal
+		// for what that costs if the drain ever stops.
+		refusal := m.classifyAddRefusal(err)
+		// LOGGED BEFORE THE BRANCH, because a standing condition now co-exists
+		// with a HOLD. It used to be reachable only on the refuse path, so
+		// moving the at-cap case to hold would have silently deleted the one log
+		// line that tells an operator why a queue is growing and never draining.
+		if refusal.standingCondition != "" {
 			m.logger.Error().
 				Str("provider", refusal.provider).
 				Str("hash", torrent.InfoHash).
 				Msg(refusal.standingCondition)
 		}
-		if deleted, deleteErr := m.queue.DeleteCurrent(torrent, nil); deleteErr != nil {
-			return errors.Join(fmt.Errorf("failed to submit torrent to debrid: %w", err), fmt.Errorf("delete failed reservation: %w", deleteErr))
-		} else if !deleted {
-			return fmt.Errorf("failed to submit torrent to debrid after reservation was removed: %w", err)
+		if refusal.hold {
+			return m.holdTorrentForCapacity(importReq, torrent, refusal, err)
 		}
-		return fmt.Errorf("failed to submit torrent to debrid: %w", err)
+		// THE REFUSAL REASON IS THE RESPONSE BODY, so it has to lead with
+		// something a human reads in an arr's log rather than with the innermost
+		// wrapping. The qBittorrent shim answers this error's text verbatim as
+		// the 400 body, and "most as silent 400s the arr can't distinguish from
+		// anything else" is the exact complaint being answered — twelve
+		// consecutive manual grabs on one title, every one indistinguishable
+		// from every other kind of failure.
+		reason := refusalReason(err)
+		if deleted, deleteErr := m.queue.DeleteCurrent(torrent, nil); deleteErr != nil {
+			return errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("delete failed reservation: %w", deleteErr), err)
+		} else if !deleted {
+			return fmt.Errorf("%s (the queue reservation was already gone): %w", reason, err)
+		}
+		return fmt.Errorf("%s: %w", reason, err)
 	}
 
 	job := NewJob(JobTypeTorrent, importReq)
@@ -289,6 +303,38 @@ func isTooManyActiveDownloads(err error) bool {
 // so the two cannot share a retry cadence.
 func isProviderAddQuotaExhausted(err error) bool {
 	return errors.Is(err, customerror.ProviderAddQuotaExhaustedError)
+}
+
+// isRateClassRefusal reports the third capacity condition: the provider is
+// refusing because of the REQUEST RATE or a traffic allowance, not because it
+// has no room.
+//
+// ⚠️ TYPED ONLY — NEVER isRateLimitSignal, which is right next door and looks
+// interchangeable. That one is an unanchored substring scan of err.Error() for
+// "429"/"503"/"slow down". It is the correct tool for feeding the pacer's
+// backoff, where a false positive costs one slower minute, and an unsafe one for
+// deciding whether to ACCEPT A GRAB, where a false positive parks an entry as
+// queuedDL against a condition that will never clear.
+//
+// The failure is not hypothetical and it is not exotic: "429" and "503" are
+// three digits that appear inside infohashes, release names, byte counts and
+// segment offsets. `torrent 429f0ab… is not cached` is a permanent content
+// refusal that this scan calls a rate limit. And the shared client's give-up
+// string spells the status in words — `status 503` — so every provider outage
+// that exhausts retries matches it too.
+//
+// Sentinel identity cannot be spoofed by a filename:
+//
+//	RateLimitedError     HTTP 429 from any provider, typed at the one place that
+//	                     still knows the status (internal/request's give-up
+//	                     handler) — 429 is retried to exhaustion, so it never
+//	                     reaches a provider's own status switch.
+//	TrafficExceededError RealDebrid codes 23 / 34 / 36 — traffic exhausted, too
+//	                     many requests, fair-usage limit. Every one is an
+//	                     allowance that returns on the provider's own boundary.
+func isRateClassRefusal(err error) bool {
+	return errors.Is(err, customerror.RateLimitedError) ||
+		errors.Is(err, customerror.TrafficExceededError)
 }
 
 func (m *Manager) processQueuedEntries() {

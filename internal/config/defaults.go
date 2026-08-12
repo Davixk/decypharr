@@ -82,4 +82,20 @@ var (
 	// rather than against it: the expensive mistake is condemning content that is
 	// FINE, and content that is fine does not produce a takedown refusal.
 	DefaultDebridTakedownThreshold = 1
+
+	// DefaultMaxLivePrunesPerHour bounds the prunes that happen on a READ rather
+	// than inside a repair run — a confirmed debrid takedown, a confirmed usenet
+	// dead article.
+	//
+	// 50/hour, chosen from the two rates it has to sit between. Genuine decay on
+	// the deployment this was measured against is a handful of entries a day: the
+	// sampled takedown set was 5 entries producing ~695 refusals a day, and the
+	// dead-article case arrives one viewer complaint at a time. A runaway is
+	// bounded by READ rate instead — a provider losing an index shelf would
+	// condemn as fast as files are opened, thousands an hour.
+	//
+	// Anything in that gap works; 50 is an order of magnitude above the signal
+	// and two below the noise. It is a circuit breaker, not a tuning parameter,
+	// and when it trips the log names it rather than going quiet.
+	DefaultMaxLivePrunesPerHour = 50
 )

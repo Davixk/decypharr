@@ -110,72 +110,94 @@ func TestClassifyQuotaUnderCapIsHeld(t *testing.T) {
 	}
 }
 
-// TestClassifyQuotaAtCapIsRefusedLoudly: the stored-item cap is full. Nothing
-// decypharr finishes or waits for frees it, so holding is the 15.2-hour spin.
-func TestClassifyQuotaAtCapIsRefusedLoudly(t *testing.T) {
+// 🔴 REVERSED BY OPERATOR RULING, AND THE TEST IS REWRITTEN RATHER THAN DELETED.
+//
+// This asserted that a full stored-item cap must be REFUSED, because nothing
+// decypharr finishes or waits for frees it — the condition behind fork.34's
+// 15.2-hour spin, observed refusing every add for 54.6 continuous hours.
+//
+// The ruling that replaced it: a grab is refused only when EVERY provider gives
+// a PERMANENT refusal, and permanent means a verdict about the CONTENT. A full
+// account is not a statement about this release, so it is a temporary inability
+// and the grab is held.
+//
+// The loud standing condition survives unchanged and now matters MORE, not less:
+// with the entry held rather than refused, that log line is the only thing that
+// tells an operator why a queue is growing and never draining.
+func TestClassifyQuotaAtCapIsHeldButStillLoud(t *testing.T) {
 	m := newRefusalFixture(t, "ad",
 		config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(5000)},
 		&fillClient{count: 5000})
 
 	r := m.classifyAddRefusal(quotaErr("ad"))
-	if r.hold {
-		t.Fatal("a full stored-item cap must be refused, not held; nothing we wait for frees it")
+	if !r.hold {
+		t.Fatal("a full stored-item cap was refused. Per the operator's ruling a full account is not a verdict " +
+			"about the release, so the grab is held and retried rather than costing the arr a candidate")
 	}
 	if r.standingCondition == "" {
-		t.Fatal("a full stored-item cap must raise an operator-visible standing condition")
+		t.Fatal("a full stored-item cap must STILL raise an operator-visible standing condition. Now that the " +
+			"entry is held instead of refused, this log line is the only signal that the hold queue has no drain")
 	}
 	if !strings.Contains(r.standingCondition, "5000") {
 		t.Fatalf("standing condition must state the arithmetic; got %q", r.standingCondition)
 	}
 }
 
-// TestAtCapComparisonIsExact is the correction to a margin that used to live
-// here. A 99% fudge was added because the account refuses at 4,998 of 5,000, so
-// `fill >= cap` never fired — but padding an operator-set knob is a threshold
-// invented to compensate for a threshold already supplied, and worse it HIDES
-// which of two conditions is true.
+// The fill no longer decides the verdict, so what is left to pin is that it
+// still decides the MESSAGE — and those need opposite operator action:
 //
-// Under the configured cap and still refused is the DAILY allowance, which is
-// transient and must be held. A margin would have permanently refused a
-// condition that clears every day. If AllDebrid's real ceiling here is lower
-// than 5,000, the knob is the answer.
-func TestAtCapComparisonIsExact(t *testing.T) {
+//	under the cap and refused  -> the daily allowance, resets by itself, do nothing
+//	at the cap and refused     -> the account is full, only deletions free it
+//
+// A margin used to live here and was removed for hiding exactly that
+// distinction; keeping the comparison exact is what keeps the two messages
+// truthful now that neither changes the outcome.
+func TestAtCapComparisonStillDecidesTheMessage(t *testing.T) {
 	cfg := config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(5000)}
 
 	// The measured 4,998 case: UNDER the configured cap, so this is the daily
-	// allowance and it must be HELD, not refused.
+	// allowance — held, and NOT reported as a standing condition.
 	underCap := newRefusalFixture(t, "ad", cfg, &fillClient{count: 4998})
-	if r := underCap.classifyAddRefusal(quotaErr("ad")); !r.hold {
-		t.Fatalf("4998/5000 is UNDER the configured cap; that is the daily allowance and must be held, got %+v", r)
+	r := underCap.classifyAddRefusal(quotaErr("ad"))
+	if !r.hold {
+		t.Fatalf("4998/5000 must be held, got %+v", r)
+	}
+	if r.standingCondition != "" {
+		t.Fatalf("the daily allowance is not a standing condition and must not be reported as one: %q", r.standingCondition)
 	}
 
-	// Exactly at the cap refuses.
+	// Exactly at the cap: held too, but loudly.
 	atCap := newRefusalFixture(t, "ad", cfg, &fillClient{count: 5000})
-	if r := atCap.classifyAddRefusal(quotaErr("ad")); r.hold {
-		t.Fatal("5000/5000 is at the cap and must be refused")
+	if r := atCap.classifyAddRefusal(quotaErr("ad")); !r.hold || r.standingCondition == "" {
+		t.Fatalf("5000/5000 must be held AND raise a standing condition, got %+v", r)
 	}
 
 	// And an operator who knows the real ceiling is 4,998 sets the knob, which
-	// then works exactly.
+	// then classifies exactly.
 	tightened := config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(4998)}
 	tight := newRefusalFixture(t, "ad", tightened, &fillClient{count: 4998})
-	if r := tight.classifyAddRefusal(quotaErr("ad")); r.hold {
-		t.Fatal("with the cap set to the real ceiling, 4998/4998 must be refused")
+	if r := tight.classifyAddRefusal(quotaErr("ad")); !r.hold || r.standingCondition == "" {
+		t.Fatalf("with the cap set to the real ceiling, 4998/4998 must be held and loud, got %+v", r)
 	}
 }
 
-// TestClassifyQuotaUnknownFillIsRefused: a count we could not take is not a
-// count. Guessing here chooses between waiting forever on a full account and
-// refusing work that would have succeeded; refusing is the cheap, visible,
-// recoverable direction.
-func TestClassifyQuotaUnknownFillIsRefused(t *testing.T) {
+// An enumeration that failed is not evidence of anything, and under the new
+// ruling it does not need to be: the verdict is HOLD either way, because an add
+// allowance is never a verdict about the release no matter how full the account
+// turns out to be. A count we could not take now costs a vaguer log line and
+// nothing else.
+func TestClassifyQuotaUnknownFillIsStillHeld(t *testing.T) {
 	m := newRefusalFixture(t, "ad",
 		config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(5000)},
 		&fillClient{err: errors.New("enumeration exploded")})
 
 	r := m.classifyAddRefusal(quotaErr("ad"))
-	if r.hold {
-		t.Fatal("classified a hold from an UNKNOWN fill; absence of a count is not evidence of room")
+	if !r.hold {
+		t.Fatal("a failed fill enumeration refused the grab. The fill no longer decides the verdict — it only " +
+			"decides which message is printed — so a failed count must not cost the arr a candidate")
+	}
+	if r.standingCondition != "" {
+		t.Fatalf("an unknown fill must not assert a standing condition it cannot see: %q", r.standingCondition)
 	}
 }
 
