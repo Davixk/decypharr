@@ -135,7 +135,7 @@ func (m *Manager) classifyAddRefusal(err error) addRefusal {
 	// with a 400 was indefensible: the grab was lost because of our own request
 	// pattern, and the condition it was lost to had cleared by the time the *arr
 	// finished logging it. Measured: 595 refusals in a single 30-minute window,
-	// with the same releases reappearing on a ~2-3 hour re-grab carousel.
+	// with the same releases reappearing on a ~2-3 hour re-grab loop.
 	//
 	// No fill check, deliberately. A rate limit says nothing about how full the
 	// account is — resolving it against a stored-item cap would be answering a

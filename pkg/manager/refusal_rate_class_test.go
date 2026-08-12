@@ -22,7 +22,7 @@ import (
 // transient refusal in the system, and the one decypharr causes itself — fell
 // through to "refuse" and became a 400 on torrents/add. Measured: 595 refusals
 // in one 30-minute window, with the same releases returning on a ~2-3 hour
-// re-grab carousel because Radarr drops a refused grab instead of taking its
+// re-grab loop because Radarr drops a refused grab instead of taking its
 // next candidate.
 func TestRateLimitedAddIsHeldNotRefused(t *testing.T) {
 	client := &fillClient{count: 4999}

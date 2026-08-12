@@ -546,7 +546,7 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		// allowance says nothing about the release, so refusing spends a
 		// candidate to dodge a condition that clears on its own — 595 of them in
 		// one 30-minute window, with the same titles returning on a ~2-3 hour
-		// re-grab carousel. Only an all-providers-permanent verdict refuses.
+		// re-grab loop. Only an all-providers-permanent verdict refuses.
 		//
 		// The quota case is the clearest: it was observed refusing every add
 		// for 54.6 continuous hours because the provider's stored-item cap was
