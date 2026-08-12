@@ -516,7 +516,7 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		return r.recordStructurallyEmptyEntry(h, c.item)
 	}
 
-	results := r.probeFiles(ctx, c.item, names, opts)
+	results := r.probeFiles(ctx, c.item, names, opts, previous)
 	var attempt repairAttempt
 	if repair {
 		// REPAIR component: re-acquire dead items across providers. On success
@@ -662,7 +662,7 @@ func (r *Repair) downgradeUnverifiableHealth(name string) {
 
 // probeFiles fans per-file probes inside a single entry, capped at
 // repairFilesPerEntry concurrent workers.
-func (r *Repair) probeFiles(ctx context.Context, item *storage.EntryItem, names []string, opts RepairRunOptions) []fileResult {
+func (r *Repair) probeFiles(ctx context.Context, item *storage.EntryItem, names []string, opts RepairRunOptions, prior storage.HealthStatus) []fileResult {
 	results := make([]fileResult, len(names))
 	payloadProbe := selectPayloadProbeFiles(item, names)
 	g, gctx := errgroup.WithContext(ctx)
@@ -673,7 +673,7 @@ func (r *Repair) probeFiles(ctx context.Context, item *storage.EntryItem, names 
 				results[i] = fileResult{name: name, reason: "context_cancelled"}
 				return nil
 			}
-			results[i] = r.probeFile(gctx, item, name, opts, payloadProbe[name])
+			results[i] = r.probeFile(gctx, item, name, opts, payloadProbe[name], prior)
 			return nil
 		})
 	}
@@ -771,7 +771,7 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 // probeFile checks one file. NZB probes use usenet.CheckFile. Torrent probes
 // use the provider CheckFile endpoint unless this run requests unrestrict-link
 // probing.
-func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name string, opts RepairRunOptions, payloadProbe bool) fileResult {
+func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name string, opts RepairRunOptions, payloadProbe bool, prior storage.HealthStatus) fileResult {
 	file := item.Files[name]
 	res := fileResult{name: name}
 
@@ -805,7 +805,7 @@ func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name st
 	if entry.IsNZB() {
 		return r.probeNZBFile(ctx, entry, name, res, payloadProbe)
 	}
-	return r.probeTorrentFile(ctx, entry, file, name, res, opts, payloadProbe)
+	return r.probeTorrentFile(ctx, entry, file, name, res, opts, payloadProbe, prior)
 }
 
 func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name string, res fileResult, payloadProbe bool) fileResult {
@@ -874,7 +874,82 @@ func (r *Repair) probeNZBFile(ctx context.Context, entry *storage.Entry, name st
 	})
 }
 
-func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions, payloadProbe bool) fileResult {
+// THE DEFAULT PROBE IS STRUCTURALLY BLIND TO TAKEDOWNS, AND THAT IS MEASURED.
+//
+// `/unrestrict/check` — what CheckFile calls, and the default for every sweep —
+// answers a DIFFERENT QUESTION than the one being asked. It is a hoster-support
+// check: "can this account download from this host", not "does this link still
+// resolve". Measured against a known taken-down link and a known-live one, the
+// two responses are structurally identical: both return a full `filename`, a
+// full `filesize`, and `supported:1`. There is no field to read, so no amount of
+// retrying or status-reading makes the cheap probe see a 451.
+//
+// Only the real unrestrict does, and running it for the whole library would mint
+// a download link per file per sweep.
+//
+// So it is spent where the doubt already is. A suspect entry is one the system
+// has ALREADY recorded trouble against; asking those the conclusive question
+// costs a probe per already-doubted entry rather than per file in the library,
+// and asks the cheap question everywhere else.
+//
+// Entries with no prior trouble keep the cheap probe and a takedown on one stays
+// invisible to the sweep until a read trips it. That is accepted, and it is not
+// a hole: the read path IS the primary detector — it condemns and prunes on the
+// first confirmed 451 — and this is a second net under it, not a replacement.
+func entryIsProbeSuspect(entry *storage.Entry, prior storage.HealthStatus) bool {
+	if entry == nil {
+		return false
+	}
+	// Condemned, cause unknown. This is the population the takedown work
+	// deliberately would not act on: a legacy Bad cannot be told apart from a
+	// fresh takedown, and "probably" was not a verdict worth encoding. A real
+	// unrestrict is what turns it into evidence.
+	if entry.Bad {
+		return true
+	}
+	// A durable record that a previous run could not verify this entry. Broken
+	// is the strong case; unknown is included because the cheap probe answering
+	// "indeterminate" repeatedly is precisely the loop that never resolves.
+	//
+	// Deliberately NOT the in-memory per-debrid failure markers: those are
+	// process-lifetime only, so after a restart the nightly sweep would see an
+	// empty ledger and quietly stop escalating. A signal that silently
+	// evaporates is worse than none.
+	return prior == storage.HealthBroken || prior == storage.HealthUnknown
+}
+
+// canEscalateProbe reports whether the conclusive probe is even POSSIBLE for
+// this file — it needs a provider placement with something to unrestrict.
+//
+// 🛑 WITHOUT THIS, THE ESCALATION DOWNGRADES VERDICTS INSTEAD OF SHARPENING
+// THEM, and only a full sweep run caught it. An entry with no placement is
+// unservable, and the cheap path says so: no link means `missing_provider_link`,
+// which is BROKEN and therefore actionable. Routed to the unrestrict path the
+// same entry answers `placement_not_found`, which is a NON-VERDICT — so a
+// durably dead entry silently became `unknown`, stopped being prune-eligible,
+// and would have sat in the library forever. Eight sweep tests failed on it,
+// every deletion-cap test among them.
+//
+// An upgrade that cannot run must fall back to the old behaviour, never to a
+// worse one. This keeps the change strictly additive: entries that CAN be
+// escalated get a better answer, every other entry gets exactly the answer it
+// got before.
+func canEscalateProbe(entry *storage.Entry, name string) bool {
+	placement := entry.GetActiveProvider()
+	if placement == nil {
+		return false
+	}
+	placementFile := placement.Files[name]
+	if placementFile == nil {
+		return false
+	}
+	return placementFile.Link != "" || placementFile.Id != ""
+}
+
+func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, opts RepairRunOptions, payloadProbe bool, prior storage.HealthStatus) fileResult {
+	client := r.manager.ProviderClient(entry.ActiveProvider)
+	suspect := entryIsProbeSuspect(entry, prior) && canEscalateProbe(entry, name)
+
 	// decypharr's own read path refuses a bad-marked entry outright ("can't
 	// repair X since it's been marked as bad") before it even asks the
 	// provider, so EVERY read of it fails. Bad is durable and only set after
@@ -885,14 +960,31 @@ func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, fil
 	if entry.Bad {
 		res.broken = true
 		res.reason = "entry_marked_bad"
+		// 🛑 EVIDENCE ONLY. The escalation may refine WHY this entry is broken;
+		// it may never decide it is healthy.
+		//
+		// That is not caution, it is the defect the guard above exists for. Bad
+		// is durable, so the read path refuses the entry no matter what the
+		// provider says about the link — letting a resolving unrestrict flip
+		// this to healthy would record a 100%-unreadable entry as fine, which is
+		// the exact bug this function was written to fix.
+		//
+		// What it buys: a confirmed 451 upgrades the reason to debrid_takedown,
+		// which is an actionable content verdict rather than "this was condemned
+		// at some point for some reason".
+		if client != nil && r.suspectConfirmsTakedown(ctx, entry, file, name, client) {
+			res.reason = "debrid_takedown"
+		}
 		return res
 	}
-	client := r.manager.ProviderClient(entry.ActiveProvider)
 	if client == nil {
 		res.reason = "provider_client_not_found"
 		return res
 	}
-	if opts.UnrestrictLink {
+	if opts.UnrestrictLink || suspect {
+		// A non-Bad suspect MAY come back healthy, and that is correct: nothing
+		// blocks its read path, so a previously-broken entry whose link resolves
+		// again has genuinely recovered.
 		return r.probeTorrentFileByUnrestrict(ctx, entry, file, name, res, client, payloadProbe)
 	}
 	if !client.SupportsCheck() {
@@ -932,6 +1024,46 @@ func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, fil
 	return r.verifyPayload(ctx, res, "provider", func(probeCtx context.Context) (int64, error) {
 		return r.readTorrentPayload(probeCtx, entry, file, name, client)
 	})
+}
+
+// suspectConfirmsTakedown asks the provider the one question the cheap probe
+// cannot answer, for an entry already marked Bad.
+//
+// It returns true ONLY for an unambiguous legal takedown. Every other outcome —
+// a resolving link, an outage, an indeterminate answer, a transport failure —
+// returns false and leaves the caller's existing verdict exactly as it was.
+// There is no path here that makes anything less broken than it already was.
+//
+// ⚠️ IT CALLS THE PROVIDER CLIENT DIRECTLY, ON PURPOSE. Going through the link
+// service would short-circuit on entry.Bad before reaching the provider, which
+// is precisely the wall that keeps a condemned entry's cause unknowable. The
+// cost is one unrestrict per already-condemned file, and nothing here mints a
+// link for an entry the system had no complaint about.
+func (r *Repair) suspectConfirmsTakedown(ctx context.Context, entry *storage.Entry, file *storage.File, name string, client debrid.Client) bool {
+	placement := entry.GetActiveProvider()
+	if placement == nil {
+		return false
+	}
+	placementFile := placement.Files[name]
+	if placementFile == nil || (placementFile.Link == "" && placementFile.Id == "") {
+		return false
+	}
+	_, err := client.GetDownloadLink(placement.ID, torrentProbeFile(placementFile, file))
+	if err == nil {
+		return false
+	}
+	if !customerror.IsContentTakedown(err) {
+		return false
+	}
+	r.logger.Warn().
+		Str("component", "CHECK").
+		Str("infohash", entry.InfoHash).
+		Str("name", entry.Name).
+		Str("filename", name).
+		Msg("Escalated probe: this entry was already condemned and the provider now states the content was " +
+			"removed for legal reasons. The default availability check cannot see that — it answers a " +
+			"hoster-support question and reports a taken-down link as supported.")
+	return true
 }
 
 func (r *Repair) probeTorrentFileByUnrestrict(ctx context.Context, entry *storage.Entry, file *storage.File, name string, res fileResult, client debrid.Client, payloadProbe bool) fileResult {

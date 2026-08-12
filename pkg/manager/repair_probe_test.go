@@ -100,7 +100,7 @@ func TestProbeTorrentFileBadEntryIsBroken(t *testing.T) {
 	entry := probeTorrentEntry("badhash", "Bad.Entry")
 	entry.Bad = true
 	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
-		fileResult{name: "file.mkv"}, RepairRunOptions{}, true)
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, true, storage.HealthHealthy)
 
 	if !res.broken || res.healthy {
 		t.Fatalf("bad-marked entry probed %+v, want broken", res)
@@ -108,8 +108,177 @@ func TestProbeTorrentFileBadEntryIsBroken(t *testing.T) {
 	if res.reason != "entry_marked_bad" {
 		t.Fatalf("reason = %q, want entry_marked_bad", res.reason)
 	}
-	if got := client.checkCalls.Load() + client.linkCalls.Load(); got != 0 {
-		t.Fatalf("bad-marked entry cost %d provider calls, want 0", got)
+	// The AVAILABILITY check is still never spent on a bad-marked entry: it
+	// cannot change the verdict, and it answers a hoster-support question that
+	// says nothing about the content.
+	if got := client.checkCalls.Load(); got != 0 {
+		t.Fatalf("bad-marked entry cost %d availability checks, want 0", got)
+	}
+	// ONE unrestrict, though — a deliberate change from the zero-provider-calls
+	// rule this test used to assert. A condemned entry whose cause is unknown is
+	// exactly the population the takedown work would not act on, and the default
+	// probe is structurally incapable of telling a legal takedown from anything
+	// else. The escalation is what makes the cause knowable; it costs one link
+	// per already-condemned file, bounded by the broken set rather than by the
+	// library.
+	if got := client.linkCalls.Load(); got != 1 {
+		t.Fatalf("bad-marked entry cost %d unrestrict calls, want exactly 1 (the escalation probe)", got)
+	}
+}
+
+// 🛑 THE ESCALATION MAY REFINE THE REASON. IT MAY NEVER CLEAR broken.
+//
+// Bad is durable, so decypharr's own read path refuses the entry regardless of
+// what the provider says about the link. If a resolving unrestrict were allowed
+// to flip this to healthy, the sweep would record a 100%-unreadable entry as
+// fine — precisely the bug the bad-entry guard was written to fix, reintroduced
+// through the back door of a better probe.
+func TestEscalatedProbeNeverResurrectsABadEntry(t *testing.T) {
+	// linkURL set and no error: the unrestrict SUCCEEDS.
+	client := &probeClient{linkURL: "http://127.0.0.1:1/resolves"}
+	_, r := newProbeFixture(t, client)
+
+	entry := probeTorrentEntry("resurrect", "Resolves.But.Bad")
+	entry.Bad = true
+	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, true, storage.HealthBroken)
+
+	if res.healthy {
+		t.Fatal("a resolving unrestrict marked a bad-marked entry HEALTHY. The read path still refuses it, so " +
+			"the sweep would be recording a 100%-unreadable entry as fine")
+	}
+	if !res.broken || res.reason != "entry_marked_bad" {
+		t.Fatalf("probed %+v, want broken/entry_marked_bad — a link that resolves is not evidence of anything "+
+			"about a durably condemned entry", res)
+	}
+}
+
+// AND WHAT THE ESCALATION IS FOR: turning "condemned, cause unknown" into a
+// confirmed content verdict the takedown pipeline can act on. A legacy Bad and a
+// fresh takedown were indistinguishable, which is why nothing acted on legacy
+// Bad; a real 451 is what makes the difference.
+func TestEscalatedProbeUpgradesAConfirmedTakedown(t *testing.T) {
+	client := &probeClient{linkErr: customerror.NewContentTakedownError(
+		errors.New("realdebrid: infringing_file (code 35)"))}
+	_, r := newProbeFixture(t, client)
+
+	entry := probeTorrentEntry("takendown", "Taken.Down")
+	entry.Bad = true
+	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, true, storage.HealthHealthy)
+
+	if !res.broken || res.healthy {
+		t.Fatalf("a confirmed takedown probed %+v, want broken", res)
+	}
+	if res.reason != "debrid_takedown" {
+		t.Fatalf("reason = %q, want debrid_takedown — without the upgrade this stays an unactionable "+
+			"entry_marked_bad and the entry is never recognised as legally dead", res.reason)
+	}
+}
+
+// A HOSTER OUTAGE MUST NOT BE UPGRADED. The control for the test above: an
+// escalation that treated any error as a takedown would convert a provider's bad
+// afternoon into a permanent content verdict on every condemned entry at once.
+func TestEscalatedProbeDoesNotUpgradeAnOutage(t *testing.T) {
+	client := &probeClient{linkErr: customerror.HosterUnavailableError}
+	_, r := newProbeFixture(t, client)
+
+	entry := probeTorrentEntry("flapping", "Hoster.Flap")
+	entry.Bad = true
+	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, true, storage.HealthHealthy)
+
+	if res.reason != "entry_marked_bad" {
+		t.Fatalf("reason = %q, want entry_marked_bad — a hoster outage is not a statement about the content", res.reason)
+	}
+}
+
+// A HEALTHY ENTRY WITH NO HISTORY KEEPS THE CHEAP PROBE. Without this the
+// escalation is not selective at all: it would mint a download link for every
+// file in the library on every sweep, which is exactly the cost that made
+// always-on unrestrict_link opt-in in the first place.
+func TestNonSuspectEntryKeepsTheCheapProbe(t *testing.T) {
+	client := &probeClient{}
+	_, r := newProbeFixture(t, client)
+
+	entry := probeTorrentEntry("ordinary", "Ordinary.Entry")
+	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, false, storage.HealthHealthy)
+
+	if !res.healthy {
+		t.Fatalf("an ordinary entry probed %+v, want healthy", res)
+	}
+	if got := client.checkCalls.Load(); got != 1 {
+		t.Fatalf("ordinary entry made %d availability checks, want 1", got)
+	}
+	if got := client.linkCalls.Load(); got != 0 {
+		t.Fatalf("an entry with no recorded trouble minted %d download links. Escalating for everything is "+
+			"the cost this design exists to avoid", got)
+	}
+}
+
+// 🛑 AN UPGRADE THAT CANNOT RUN FALLS BACK — IT MUST NOT DOWNGRADE.
+//
+// This is the regression the first cut shipped, caught by a full sweep run
+// rather than by reasoning. An entry with no usable placement is unservable, and
+// the cheap path says exactly that: `missing_provider_link`, which is BROKEN and
+// therefore prune-eligible. Routed to the unrestrict path it answers
+// `placement_not_found` — a NON-VERDICT — so a durably dead entry became
+// `unknown`, stopped being actionable, and would have sat in the library
+// forever. Eight sweep tests failed on it, every deletion-cap test among them.
+func TestEscalationFallsBackWhenItCannotRun(t *testing.T) {
+	client := &probeClient{}
+	_, r := newProbeFixture(t, client)
+
+	entry := probeTorrentEntry("noplacement", "No.Placement")
+	// Suspect by prior status, provider client present — but the placement holds
+	// nothing to unrestrict. This is the shape the sweep fixtures have and the
+	// one the first cut turned into a non-verdict.
+	if placement := entry.GetActiveProvider(); placement != nil {
+		placement.Files = map[string]*storage.ProviderFile{}
+	}
+
+	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, false, storage.HealthBroken)
+
+	if !res.broken {
+		t.Fatalf("an entry with no placement probed %+v, want broken. The escalation cannot run here, so it must "+
+			"fall back to the cheap path's verdict — anything else turns a durably dead entry into a "+
+			"non-actionable `unknown` that never gets pruned", res)
+	}
+	if res.reason == "placement_not_found" {
+		t.Fatal("the escalation ran anyway and produced a non-verdict; canEscalateProbe did not gate it")
+	}
+}
+
+// A PREVIOUSLY-BROKEN ENTRY THAT IS NOT Bad DOES get the conclusive probe, and it
+// MAY come back healthy — nothing blocks its read path, so a link that resolves
+// again means it genuinely recovered.
+func TestPreviouslyBrokenEntryEscalatesAndMayRecover(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(make([]byte, 1<<20))
+	}))
+	defer server.Close()
+
+	client := &probeClient{linkURL: server.URL}
+	m, r := newProbeFixture(t, client)
+	m.streamClient = server.Client()
+
+	entry := probeTorrentEntry("recovered", "Recovered.Entry")
+	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, true, storage.HealthBroken)
+
+	if !res.healthy {
+		t.Fatalf("a previously-broken entry whose link now resolves probed %+v, want healthy", res)
+	}
+	// ⚠️ THE DISCRIMINATOR IS THE *CHECK* COUNT, NOT THE LINK COUNT, and a
+	// negative control is what showed it. The payload probe mints a download
+	// link on BOTH paths, so `linkCalls > 0` is true whether or not the
+	// escalation fired — an assertion on it passed with the escalation removed
+	// and proved nothing. CheckFile is the one call only the cheap path makes.
+	if got := client.checkCalls.Load(); got != 0 {
+		t.Fatalf("a previously-broken entry made %d availability checks; it took the cheap path, which cannot "+
+			"see a takedown, so the escalation did not fire", got)
 	}
 }
 
@@ -121,7 +290,7 @@ func TestProbeTorrentFileIndeterminateIsUnknown(t *testing.T) {
 
 	entry := probeTorrentEntry("indethash", "Indeterminate.Entry")
 	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
-		fileResult{name: "file.mkv"}, RepairRunOptions{}, true)
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, true, storage.HealthHealthy)
 
 	if res.healthy {
 		t.Fatal("an indeterminate provider answer probed HEALTHY")
@@ -200,7 +369,7 @@ func TestProbeTorrentFileRequiresRealBytes(t *testing.T) {
 
 			entry := probeTorrentEntry("byteshash", "Bytes.Entry")
 			res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
-				fileResult{name: "file.mkv"}, RepairRunOptions{}, true)
+				fileResult{name: "file.mkv"}, RepairRunOptions{}, true, storage.HealthHealthy)
 
 			if res.healthy != tc.wantHealthy {
 				t.Fatalf("healthy = %v, want %v (reason %q)", res.healthy, tc.wantHealthy, res.reason)
@@ -223,7 +392,7 @@ func TestProbeTorrentFileSkipsPayloadCheckWhenNotSelected(t *testing.T) {
 
 	entry := probeTorrentEntry("skiphash", "Skip.Entry")
 	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
-		fileResult{name: "file.mkv"}, RepairRunOptions{}, false)
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, false, storage.HealthHealthy)
 
 	if !res.healthy {
 		t.Fatalf("unselected file probed %+v, want the historical healthy verdict", res)
@@ -297,11 +466,11 @@ func TestUnresolvableFilesClassifyBroken(t *testing.T) {
 		},
 	}
 
-	noHash := r.probeFile(context.Background(), item, "no-hash.mkv", RepairRunOptions{}, false)
+	noHash := r.probeFile(context.Background(), item, "no-hash.mkv", RepairRunOptions{}, false, storage.HealthHealthy)
 	if !noHash.broken || noHash.reason != "missing_infohash" {
 		t.Fatalf("file without an infohash probed %+v, want broken/missing_infohash", noHash)
 	}
-	noEntry := r.probeFile(context.Background(), item, "no-entry.mkv", RepairRunOptions{}, false)
+	noEntry := r.probeFile(context.Background(), item, "no-entry.mkv", RepairRunOptions{}, false, storage.HealthHealthy)
 	if !noEntry.broken || noEntry.reason != "entry_not_found" {
 		t.Fatalf("file whose entry row is gone probed %+v, want broken/entry_not_found", noEntry)
 	}
