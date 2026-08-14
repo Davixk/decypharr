@@ -786,7 +786,17 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		// than at admission keeps the decision next to the error that caused
 		// it, and still costs nothing — no request goes out.
 		if cooling, why := m.declines.cooling(providerName, debridTorrent.InfoHash, time.Now()); cooling {
-			coolErr := fmt.Errorf("cooling off after an earlier decline: %s", why)
+			// 🔴 %w, NEVER %s. This line read `%s` of the reason TEXT, which
+			// destroyed every sentinel in the original error and made the
+			// cool-off skip unclassifiable to classifyAddRefusal — so a
+			// temporary quota exhaustion re-emerged from the hold as a
+			// chain-exhausted permanent failure and parked the row as `error`.
+			// 13 of 14 new parked rows in two hours were that shape.
+			//
+			// The classification matches by sentinel identity precisely so a
+			// wrapper cannot lie about the class. It only holds if every wrapper
+			// on the way actually carries the sentinel.
+			coolErr := fmt.Errorf("cooling off after an earlier decline: %w", why)
 			errs = append(errs, providerStageError(providerName, "submit", coolErr))
 			// SAY SO. This branch skipped a provider in total silence, which made
 			// a grab that resolved entirely inside its own second look like the
@@ -840,7 +850,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 					Msg("Provider signalled a rate limit; halving the add rate for this provider")
 			}
 			cooldown := m.declines.record(providerName, debridTorrent.InfoHash,
-				classifyDecline(err), err.Error(), time.Now())
+				classifyDecline(err), err, time.Now())
 			attemptErr := providerStageError(providerName, "submit", err)
 			if dbt != nil && dbt.Id != "" {
 				attemptErr = errors.Join(attemptErr, cleanupDebridAttempt(db, providerName, dbt.Id))

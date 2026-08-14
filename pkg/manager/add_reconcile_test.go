@@ -254,7 +254,7 @@ func TestTransientDeclineBacksOffAndRecovers(t *testing.T) {
 	l := newDeclineLedger()
 	now := time.Now()
 
-	first := l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	first := l.record("rd", reconcileHash, declineTransient, errors.New("timeout"), now)
 	if first != declineBackoffBase {
 		t.Fatalf("first cooldown = %s, want %s", first, declineBackoffBase)
 	}
@@ -262,16 +262,16 @@ func TestTransientDeclineBacksOffAndRecovers(t *testing.T) {
 		t.Fatal("a just-declined hash must be parked")
 	}
 
-	second := l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	second := l.record("rd", reconcileHash, declineTransient, errors.New("timeout"), now)
 	if second <= first {
 		t.Fatalf("second cooldown = %s, want longer than %s", second, first)
 	}
 
 	// Bounded, so a provider that recovers is retried within a known time.
 	for range 20 {
-		l.record("rd", reconcileHash, declineTransient, "timeout", now)
+		l.record("rd", reconcileHash, declineTransient, errors.New("timeout"), now)
 	}
-	capped := l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	capped := l.record("rd", reconcileHash, declineTransient, errors.New("timeout"), now)
 	if capped != declineBackoffMax {
 		t.Fatalf("cooldown = %s, want it capped at %s", capped, declineBackoffMax)
 	}
@@ -287,7 +287,7 @@ func TestTransientDeclineBacksOffAndRecovers(t *testing.T) {
 func TestSuccessClearsTheCooldown(t *testing.T) {
 	l := newDeclineLedger()
 	now := time.Now()
-	l.record("rd", reconcileHash, declineTransient, "timeout", now)
+	l.record("rd", reconcileHash, declineTransient, errors.New("timeout"), now)
 	l.clear("rd", reconcileHash)
 
 	if cooling, _ := l.cooling("rd", reconcileHash, now); cooling {
@@ -298,7 +298,7 @@ func TestSuccessClearsTheCooldown(t *testing.T) {
 func TestCooldownIsScopedPerProvider(t *testing.T) {
 	l := newDeclineLedger()
 	now := time.Now()
-	l.record("rd", reconcileHash, declinePermanent, "451", now)
+	l.record("rd", reconcileHash, declinePermanent, errors.New("451"), now)
 
 	if cooling, _ := l.cooling("ad", reconcileHash, now); cooling {
 		t.Fatal("one provider refusing a release says nothing about another — the fallback " +
@@ -335,7 +335,7 @@ func TestPostSubmitRefusalsCoolOff(t *testing.T) {
 		t.Fatal("a seeder-gate refusal did not park the hash; the next indexer variant seconds later " +
 			"pays for another submit + status check + scrape + delete to be told the same thing")
 	}
-	if why == "" {
+	if why == nil {
 		t.Fatal("the cooldown must carry the reason, or the decline log says nothing useful")
 	}
 }

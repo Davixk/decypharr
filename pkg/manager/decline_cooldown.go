@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -48,11 +49,34 @@ const (
 	declinePermanentCooldown = 6 * time.Hour
 )
 
+// 🔴 THE LEDGER KEEPS THE ERROR, NOT ITS TEXT, AND THAT IS THE WHOLE POINT.
+//
+// It kept `reason string` — err.Error() — and the cool-off skip then rebuilt a
+// fresh error with `fmt.Errorf("cooling off after an earlier decline: %s", why)`.
+// A %s of a string. Every sentinel in the original was destroyed at the moment
+// it was recorded, and nothing downstream could ever get it back.
+//
+// That silently defeated the entire add-refusal classification, which matches by
+// SENTINEL IDENTITY on purpose. A held entry re-admitted when a slot freed found
+// every provider cooling off, every cool-off error unclassifiable, and
+// "cannot classify" means refuse — so a temporary quota exhaustion came back as
+// a chain-exhausted permanent failure and the row parked as `error`. Measured on
+// the live deployment: 13 of 14 new parked error rows in two hours were this
+// exact shape, an AllDebrid MAGNET_TOO_MANY that the operator's ruling says must
+// HOLD, converted into a park by its own cool-off wrapper.
+//
+// The classification work insisted a text test could never be trusted to carry a
+// type. It was right, and it missed that a link EARLIER in the chain was already
+// throwing the type away.
 type declineRecord struct {
 	until    time.Time
 	failures int
 	class    declineClass
-	reason   string
+	// cause is the ORIGINAL error, preserved so the cool-off skip can wrap it
+	// with %w and every errors.Is downstream still works. reason is kept only
+	// for logs and for records restored without a cause.
+	cause  error
+	reason string
 }
 
 // declineLedger remembers which hashes are cooling off, per provider.
@@ -70,7 +94,10 @@ func declineKey(provider, infoHash string) string {
 }
 
 // record notes a decline and returns how long the hash is now parked for.
-func (l *declineLedger) record(provider, infoHash string, class declineClass, reason string, now time.Time) time.Duration {
+//
+// Takes the ERROR, not a message. See declineRecord for what storing the text
+// cost the last time.
+func (l *declineLedger) record(provider, infoHash string, class declineClass, cause error, now time.Time) time.Duration {
 	if l == nil || infoHash == "" {
 		return 0
 	}
@@ -81,7 +108,11 @@ func (l *declineLedger) record(provider, infoHash string, class declineClass, re
 	rec := l.records[key]
 	rec.failures++
 	rec.class = class
-	rec.reason = reason
+	rec.cause = cause
+	rec.reason = ""
+	if cause != nil {
+		rec.reason = cause.Error()
+	}
 
 	var cooldown time.Duration
 	if class == declinePermanent {
@@ -97,24 +128,38 @@ func (l *declineLedger) record(provider, infoHash string, class declineClass, re
 	return cooldown
 }
 
-// cooling reports whether this hash is parked, and why.
-func (l *declineLedger) cooling(provider, infoHash string, now time.Time) (bool, string) {
+// cooling reports whether this hash is parked, and returns the ORIGINAL error
+// that parked it so the caller can wrap it with %w.
+//
+// Returning the error rather than its message is what lets a cool-off skip stay
+// classifiable: the add path decides hold-vs-refuse by errors.Is against typed
+// sentinels, and a rebuilt string matches none of them.
+func (l *declineLedger) cooling(provider, infoHash string, now time.Time) (bool, error) {
 	if l == nil {
-		return false, ""
+		return false, nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	rec, ok := l.records[declineKey(provider, infoHash)]
 	if !ok {
-		return false, ""
+		return false, nil
 	}
 	if now.After(rec.until) {
 		// Expired. Keep the failure count so a repeat offender backs off
 		// further rather than restarting at the base delay — otherwise a
 		// permanently broken hash cycles at the minimum interval forever.
-		return false, ""
+		return false, nil
 	}
-	return true, rec.reason
+	if rec.cause != nil {
+		return true, rec.cause
+	}
+	// No cause recorded (an older record, or a decline with no error). Fall back
+	// to the text so the log still says something; it will not classify, which
+	// is the honest outcome when the type genuinely was not captured.
+	if rec.reason != "" {
+		return true, errors.New(rec.reason)
+	}
+	return true, errors.New("an earlier decline")
 }
 
 // clear forgets a hash entirely, used when an add finally succeeds.
@@ -172,7 +217,7 @@ func (m *Manager) parkPostSubmitRefusal(provider, infoHash string, err error) {
 	if err == nil || infoHash == "" {
 		return
 	}
-	cooldown := m.declines.record(provider, infoHash, declineTransient, err.Error(), time.Now())
+	cooldown := m.declines.record(provider, infoHash, declineTransient, err, time.Now())
 	m.logger.Debug().
 		Str("provider", provider).
 		Str("hash", infoHash).
