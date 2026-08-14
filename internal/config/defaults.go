@@ -83,19 +83,43 @@ var (
 	// FINE, and content that is fine does not produce a takedown refusal.
 	DefaultDebridTakedownThreshold = 1
 
-	// DefaultMaxLivePrunesPerHour bounds the prunes that happen on a READ rather
-	// than inside a repair run — a confirmed debrid takedown, a confirmed usenet
-	// dead article.
+	// DefaultLivePrunePercent and DefaultLivePruneFloor bound the prunes that
+	// happen on a READ rather than inside a repair run — a confirmed debrid
+	// takedown, a confirmed usenet dead article.
 	//
-	// 50/hour, chosen from the two rates it has to sit between. Genuine decay on
-	// the deployment this was measured against is a handful of entries a day: the
-	// sampled takedown set was 5 entries producing ~695 refusals a day, and the
-	// dead-article case arrives one viewer complaint at a time. A runaway is
-	// bounded by READ rate instead — a provider losing an index shelf would
-	// condemn as fast as files are opened, thousands an hour.
+	// 🔻 A BARE 50/HOUR WAS TRIED HERE AND OVERRULED. Its derivation sized the
+	// rail against genuine decay (~5 confirmed takedowns a day on the deployment
+	// it was measured on) and never against what it MUST LET THROUGH. A real
+	// takedown wave — a distributor clearing a catalogue, a batch of postings
+	// expiring together — legitimately puts hundreds of entries into the read
+	// path within an hour. 50 would have throttled every one of them, visibly,
+	// while the library went on serving content that was already gone. This is a
+	// circuit breaker for a source that is WRONG, not a speed limit on being
+	// right.
 	//
-	// Anything in that gap works; 50 is an order of magnitude above the signal
-	// and two below the noise. It is a circuit breaker, not a tuning parameter,
-	// and when it trips the log names it rather than going quiet.
-	DefaultMaxLivePrunesPerHour = 50
+	// 10% of the library per rolling hour. A tenth of a media library going dead
+	// inside one hour has no legitimate cause; the only mechanism that produces
+	// it is a source wrong about everything at once, which is precisely the July
+	// incident — ~5,000 files lost to one bad listing. Below that a wave passes
+	// untouched: hundreds of entries is a fraction of a percent of any library
+	// large enough to contain hundreds of takedowns.
+	//
+	// PROPORTIONAL rather than absolute because "catastrophic" is not a constant.
+	// The same few hundred deletions are unremarkable in a large library and an
+	// emergency in a small one, and a percentage says both without tuning. No
+	// absolute number can: whichever is chosen is too tight for the big library
+	// and too loose for the small one, simultaneously.
+	DefaultLivePrunePercent = 10
+
+	// DefaultLivePruneFloor keeps the percentage from pinning a small or
+	// freshly-seeded library near zero — at 10%, a 300-entry library would
+	// otherwise breach at 30.
+	//
+	// 250/hour. It has to clear the largest legitimate burst without ever being
+	// the binding constraint in normal operation, and it does both by a wide
+	// margin: above the operator's own "hundreds in an hour" figure for a real
+	// wave, and roughly 1,200x the observed genuine decay rate of ~5 entries a
+	// day. In a library big enough for the percentage to matter, the floor never
+	// binds at all.
+	DefaultLivePruneFloor = 250
 )

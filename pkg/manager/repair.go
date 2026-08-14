@@ -992,7 +992,7 @@ func (m *Manager) pruneDeadEntryLive(entry *storage.Entry) error {
 	if entry == nil {
 		return fmt.Errorf("entry is nil")
 	}
-	if ok, used, limit := m.livePrunes.reserve(time.Now()); !ok {
+	if ok, used, limit := m.livePrunes.reserve(time.Now(), m.librarySize()); !ok {
 		// 🔴 The entry stays condemned and stays refusing reads; only the
 		// deletion is deferred to the nightly sweep. Logged at error level with
 		// the numbers, because a cap that trips silently reads exactly like a
@@ -1003,10 +1003,13 @@ func (m *Manager) pruneDeadEntryLive(entry *storage.Entry) error {
 			Str("name", entry.Name).
 			Int("live_prunes_last_hour", used).
 			Int("limit", limit).
+			Int("library_entries", m.librarySize()).
 			Msg("PRUNE SKIPPED — the live-prune budget is exhausted. The entry is condemned and has stopped serving, " +
-				"but it is NOT deleted and its symlink still resolves. Check whether a provider is issuing " +
-				"dead-content verdicts en masse before raising repair.max_live_prunes_per_hour; the nightly repair " +
-				"sweep will collect whatever is genuinely dead under its own cap.")
+				"but it is NOT deleted and its symlink still resolves. The bound is a SHARE OF THE LIBRARY per " +
+				"rolling hour, so tripping it means roughly a tenth of everything was declared dead inside an hour — " +
+				"check whether a debrid or a news server is issuing dead-content verdicts en masse before raising " +
+				"repair.live_prune_percent. The nightly repair sweep collects whatever is genuinely dead under its " +
+				"own cap, so nothing is lost either way.")
 		return nil
 	}
 	return m.pruneTakenDownEntry(entry)

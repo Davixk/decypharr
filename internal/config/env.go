@@ -94,6 +94,11 @@ func (c *Config) applyEnvOverrides() {
 			c.Repair.MaxLivePrunesPerHour = v
 		}
 	}
+	if val := getEnv("REPAIR_LIVE_PRUNE_PERCENT"); val != "" {
+		if v, err := strconv.Atoi(val); err == nil {
+			c.Repair.LivePrunePercent = v
+		}
+	}
 	if val := getEnv("ENABLE_WEBDAV_AUTH"); val != "" {
 		c.EnableWebdavAuth = parseBool(val)
 	}

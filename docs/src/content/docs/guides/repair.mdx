@@ -81,7 +81,8 @@ You can force a recheck on any one entry from the Browse UI or the API. This wor
 | `arr_blocklist`           | Sub-action of `arr_delete`: ban the release globally and permanently. Does nothing on its own. | `false` |
 | `prune`                   | PRUNE component: delete the item decypharr-side only (never calls the Arr). Destructive. | `false`     |
 | `max_deletions_per_run`   | Caps how many entries one run may destructively act on. `0`/unset → `100`; negative → unlimited. | `100` |
-| `max_live_prunes_per_hour`| Caps the PRUNEs that happen on a **read** instead of inside a run — a confirmed debrid takedown, a confirmed usenet dead article. Over budget the entry is still condemned and still stops serving; only the deletion is deferred to the next sweep. `0`/unset → `50`; negative → unlimited. | `50` |
+| `max_live_prunes_per_hour`| Explicit absolute ceiling on the PRUNEs that happen on a **read** instead of inside a run — a confirmed debrid takedown, a confirmed usenet dead article. Overrides `live_prune_percent` when set. `0`/unset derives the bound proportionally (below); negative → unlimited. | derived |
+| `live_prune_percent`      | The proportional bound: what share of the library may be live-pruned per rolling hour, as `max(250, percent × entries)`. Sized so a genuine takedown wave of hundreds passes untouched while a mass-deletion runaway trips it. Over budget the entry is still condemned and still stops serving; only the deletion is deferred to the next sweep. `0`/unset → `10`; negative → floor only. | `10` |
 | `skip_nzb_repair`         | Skip NZB / Usenet entries during scheduled sweeps.                                      | `false` |
 | `notify_on_complete`      | Send a notification when a sweep finishes.                                               | `false`     |
 | `nntp_connection_percent` | Percentage of NNTP connections the probe is allowed to use. Avoids starving downloads.   | `20`        |

@@ -335,9 +335,32 @@ type RepairConfig struct {
 	// cap. Nothing is lost, and a runaway becomes a loud log line and a bounded
 	// number of deletions instead of a library.
 	//
-	// 0/unset defaults to 50 an hour, which is far above any observed rate of
-	// genuine decay and far below a runaway. A negative value means unlimited.
+	// 🔻 THE BOUND IS PROPORTIONAL NOW. A bare 50/hour shipped first and was
+	// overruled: it measured only against genuine decay (a handful of entries a
+	// day) and never against the thing it has to let through. A real takedown
+	// wave puts HUNDREDS of entries into the read path in an hour, legitimately,
+	// and 50 would have throttled every one of them while the library kept
+	// serving content that was already gone.
+	//
+	// 0/unset derives the ceiling as max(floor, LivePrunePercent × entries) per
+	// rolling hour, so "catastrophic" scales with the library instead of being a
+	// constant that is simultaneously too tight for a big one and too loose for
+	// a small one.
+	//
+	// A POSITIVE value is an explicit absolute ceiling and overrides the
+	// proportional term entirely — an operator who has decided on a number gets
+	// that number. A NEGATIVE value means unlimited.
 	MaxLivePrunesPerHour int `json:"max_live_prunes_per_hour,omitempty"`
+
+	// LivePrunePercent is the proportional term: what share of the library, in
+	// percent, may be live-pruned in a rolling hour.
+	//
+	// 0/unset uses the default. A negative value disables the proportional term,
+	// leaving the floor alone — which is a way to make the rail strict without
+	// setting an absolute number.
+	//
+	// Ignored entirely when MaxLivePrunesPerHour is set.
+	LivePrunePercent int `json:"live_prune_percent,omitempty"`
 
 	// StopSchedule, when set, stops an in-progress repair sweep at this time/interval
 	// (same formats as Schedule: clock time, cron expression, or duration).
@@ -354,7 +377,7 @@ func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
 		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == "" && r.MaxDeletionsPerRun == 0 &&
-		r.MaxLivePrunesPerHour == 0 &&
+		r.MaxLivePrunesPerHour == 0 && r.LivePrunePercent == 0 &&
 		r.Repair == nil && !r.Prune && r.ArrDelete == nil && r.Regrab == nil &&
 		!r.ArrSearch && !r.ArrBlocklist
 }

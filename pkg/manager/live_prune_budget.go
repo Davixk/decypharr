@@ -36,9 +36,41 @@ import (
 // always visible; pruning a library because a news server had a bad afternoon is
 // neither.
 //
-// The window is a simple rolling one rather than a token bucket. A bucket would
-// smooth the rate, and smoothing is precisely wrong here — a burst is the signal
-// this exists to catch.
+// 🔻 THE FIRST VERSION OF THIS SHIPPED A BARE 50/HOUR AND THAT WAS WRONG.
+//
+// Operator's ruling: "50 is a magic, and low, number." Both halves land. The
+// derivation was "an order of magnitude above genuine decay, two below a
+// runaway" — which measured only ONE of the two things the rail sits between,
+// and picked the number from the wrong one. Genuine decay (~5 confirmed
+// takedowns a day here) is the FLOOR of what must pass, not the scale to size
+// against. A real takedown wave — a distributor clearing a catalogue, an
+// indexer's postings expiring together — puts hundreds of entries into the read
+// path in an hour, legitimately, and 50/hour would have visibly throttled every
+// one of them while the library went on serving content that was already gone.
+//
+// THE RAIL MUST NEVER THROTTLE A LEGITIMATE OPERATION. It exists for exactly one
+// failure: mass deletion driven by a source that is WRONG — the July incident
+// here, ~5,000 files lost to one bad listing.
+//
+// So the bound is PROPORTIONAL, because that is the only form in which
+// "catastrophic" means the same thing to every library. Hundreds of deletions in
+// an hour is unremarkable in a large library and an emergency in a small one,
+// and a percentage says exactly that in both directions without anyone tuning
+// it. An absolute number cannot: whatever constant is chosen is simultaneously
+// too tight for the big library and too loose for the small one.
+//
+//	ceiling = max(floor, percent × library entries), per rolling hour
+//
+// The floor exists so a small or freshly-seeded library is not pinned near zero
+// by the percentage, and it is set far above any rate real decay produces.
+//
+// ⚠️ AND NOT A TOKEN BUCKET — a claim in this comment used to say the opposite.
+// It read "a bucket would smooth the rate, and smoothing is precisely wrong
+// here, a burst IS the signal this exists to catch". That is now known to be
+// backwards: a legitimate wave arrives as a burst, so smoothing it is the
+// visible throttle the ruling forbids. A rolling window with a generous ceiling
+// passes the whole burst instantly and still stops a sustained runaway, which is
+// what a bucket cannot do without metering the wave.
 type livePruneBudget struct {
 	mu     sync.Mutex
 	events []time.Time
@@ -48,20 +80,59 @@ func newLivePruneBudget() *livePruneBudget {
 	return &livePruneBudget{}
 }
 
-// maxLivePrunesPerHour resolves the knob live, so an operator watching a
-// runaway can tighten it without restarting the mount — the same reasoning as
-// every other threshold read at its decision point.
+// livePruneCeiling resolves the bound live, per reservation, so an operator
+// watching a runaway can tighten it without restarting the mount.
 //
-// 0/unset -> the default; negative -> unlimited.
-func maxLivePrunesPerHour() int {
-	switch v := config.Get().Repair.MaxLivePrunesPerHour; {
+// librarySize is the current entry count — an in-memory index length, so this
+// costs nothing to consult and cannot go stale between sweeps.
+//
+//	MaxLivePrunesPerHour  < 0  -> unlimited, the escape hatch
+//	                      > 0  -> an explicit absolute ceiling, overriding the
+//	                              proportional term entirely. An operator who has
+//	                              decided on a number gets that number.
+//	                        0  -> derive it: max(floor, percent × librarySize)
+//
+//	LivePrunePercent      < 0  -> proportional term off, floor only
+//	                        0  -> the default percent
+func livePruneCeiling(librarySize int) int {
+	repair := config.Get().Repair
+	switch v := repair.MaxLivePrunesPerHour; {
 	case v < 0:
 		return 0 // unlimited
-	case v == 0:
-		return config.DefaultMaxLivePrunesPerHour
-	default:
+	case v > 0:
 		return v
 	}
+
+	ceiling := config.DefaultLivePruneFloor
+	percent := repair.LivePrunePercent
+	if percent == 0 {
+		percent = config.DefaultLivePrunePercent
+	}
+	if percent > 0 && librarySize > 0 {
+		if scaled := librarySize * percent / 100; scaled > ceiling {
+			ceiling = scaled
+		}
+	}
+	return ceiling
+}
+
+// librarySize reports how many entries the bound is measured against, or 0 when
+// it cannot be read.
+//
+// A count we could not take must NOT collapse the ceiling to the floor silently
+// — that would be the same "absence of a measurement read as a small
+// measurement" mistake the fill check made. It returns 0, and livePruneCeiling
+// treats 0 as "no proportional term available", which lands on the floor with
+// the reason visible in the log rather than inferred.
+func (m *Manager) librarySize() int {
+	if m == nil || m.storage == nil {
+		return 0
+	}
+	n, err := m.storage.Count()
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // reserve takes one slot if the last hour has room. It returns the slot count
@@ -71,8 +142,8 @@ func maxLivePrunesPerHour() int {
 // Reserving is what COMMITS the deletion, so it is called immediately before
 // the prune and never speculatively: a reservation that is not spent is a
 // deletion another entry could have had.
-func (b *livePruneBudget) reserve(now time.Time) (ok bool, used, limit int) {
-	limit = maxLivePrunesPerHour()
+func (b *livePruneBudget) reserve(now time.Time, librarySize int) (ok bool, used, limit int) {
+	limit = livePruneCeiling(librarySize)
 	if b == nil {
 		// A Manager built without one (test fixtures, mostly) must not silently
 		// become UNLIMITED — that is the vacuous-guard shape that has bitten
