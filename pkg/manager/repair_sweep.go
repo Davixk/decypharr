@@ -673,7 +673,7 @@ func (r *Repair) probeFiles(ctx context.Context, item *storage.EntryItem, names 
 				results[i] = fileResult{name: name, reason: "context_cancelled"}
 				return nil
 			}
-			results[i] = r.probeFile(gctx, item, name, opts, payloadProbe[name], prior)
+			results[i] = r.probeFileWithRetry(gctx, item, name, opts, payloadProbe[name], prior)
 			return nil
 		})
 	}
@@ -771,6 +771,84 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 // probeFile checks one file. NZB probes use usenet.CheckFile. Torrent probes
 // use the provider CheckFile endpoint unless this run requests unrestrict-link
 // probing.
+// targetedProbeRetries and targetedProbeBackoff bound the retry an
+// operator-initiated check performs when a probe cannot reach a verdict.
+//
+// 🔴 WHY THIS EXISTS. A forced check answering `unknown` tells an operator
+// nothing they can act on, and the ruling behind it was that a targeted check
+// must ALWAYS resolve. It cannot, honestly: when a provider is unreachable there
+// is no true answer, and manufacturing one means calling dead content healthy or
+// live content broken at library scale. What it CAN stop doing is reporting a
+// momentary blip as though it were the provider's considered answer.
+//
+// 3 attempts, ~1s then ~3s. The job is to separate a single 429/5xx/timeout —
+// which clears in under a second — from a sustained condition, and three
+// attempts across ~4s does that while staying invisible to someone watching a
+// forced check. Longer would only be waiting: a limit that outlives 4s IS "your
+// provider is limiting you", which is precisely the actionable meaning `unknown`
+// should now carry.
+//
+// ⚠️ TARGETED ONLY, and that boundary is the entire reason the cost is
+// acceptable. A scheduled sweep probes ~47,000 files; turning every inconclusive
+// one into N attempts with backoff there is a different cost conversation and
+// was explicitly out of scope. One entry can afford seconds. A sweep cannot
+// afford them three thousand times.
+const (
+	targetedProbeRetries = 2
+	targetedProbeBackoff = time.Second
+)
+
+// probeReasonIsRetryable reports whether a non-verdict could plausibly become a
+// verdict on a second look.
+//
+// The split is between "the provider did not answer" and "there is nothing here
+// to answer about". Retrying the second kind adds seconds to every hopeless
+// entry and can never change the outcome — a missing infohash is still missing
+// on the next attempt.
+func probeReasonIsRetryable(reason string) bool {
+	switch reason {
+	case "provider_probe_indeterminate",
+		"provider_payload_indeterminate",
+		"provider_probe_error",
+		"unrestrict_link_error",
+		"usenet_probe_error",
+		"usenet_payload_indeterminate":
+		return true
+	}
+	return false
+}
+
+// probeFileWithRetry runs the probe and, for a TARGETED check only, retries a
+// non-verdict a bounded number of times.
+//
+// It never retries a verdict. Healthy and broken are answers; re-asking would
+// only manufacture a chance to disagree with one already in hand.
+func (r *Repair) probeFileWithRetry(ctx context.Context, item *storage.EntryItem, name string, opts RepairRunOptions, payloadProbe bool, prior storage.HealthStatus) fileResult {
+	res := r.probeFile(ctx, item, name, opts, payloadProbe, prior)
+	if !opts.Targeted {
+		return res
+	}
+	for attempt := range targetedProbeRetries {
+		if res.healthy || res.broken || !probeReasonIsRetryable(res.reason) {
+			return res
+		}
+		select {
+		case <-ctx.Done():
+			return res
+		case <-time.After(targetedProbeBackoff * time.Duration(1+2*attempt)):
+		}
+		r.logger.Debug().
+			Str("component", "CHECK").
+			Str("entry", item.Name).
+			Str("file", name).
+			Str("reason", res.reason).
+			Int("attempt", attempt+2).
+			Msg("Targeted check could not reach a verdict; retrying before reporting unknown")
+		res = r.probeFile(ctx, item, name, opts, payloadProbe, prior)
+	}
+	return res
+}
+
 func (r *Repair) probeFile(ctx context.Context, item *storage.EntryItem, name string, opts RepairRunOptions, payloadProbe bool, prior storage.HealthStatus) fileResult {
 	file := item.Files[name]
 	res := fileResult{name: name}
@@ -2567,7 +2645,10 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, sel *Manual
 		heal := newHealCache()
 		// REPAIR runs inline during the probe (actions.repair). If it re-acquires
 		// the item, final rolls up healthy and the destructive pass is skipped.
-		final, _ := r.probeEntry(ctx, runID, c, heal, RepairRunOptions{}, actions.repair)
+		// TARGETED: an operator asked for this entry by name, so a non-verdict is
+		// retried inside the check rather than reported as `unknown` on the first
+		// inconclusive answer. See probeFileWithRetry.
+		final, _ := r.probeEntry(ctx, runID, c, heal, RepairRunOptions{Targeted: true}, actions.repair)
 		if final == nil || final.Status != storage.HealthBroken || !actions.destructive() {
 			return
 		}
@@ -2708,7 +2789,9 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 	// like the scheduled sweep. It previously passed a nil (unlimited) budget,
 	// which bypassed the cap entirely.
 	budget := r.newDeletionBudget(run.ID)
-	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{}, actions, budget)
+	// TARGETED: a media id the operator named. Same reasoning as the single-entry
+	// recheck — bounded, because a media id resolves to one series at most.
+	err := r.probeAndHealCandidates(ctx, run, candidates, mediaNames, heal, RepairRunOptions{Targeted: true}, actions, budget)
 	recordBudgetStats(run, budget)
 	candidates = nil
 	if err != nil {

@@ -45,6 +45,14 @@ type RepairRunOptions struct {
 	Actions        *ManualActions
 	UnrestrictLink bool
 	ProtocolScope  string
+
+	// Targeted marks a check an operator asked for BY NAME — a single entry or
+	// a single media id — as opposed to the scheduled sweep.
+	//
+	// It buys one thing: a non-verdict is retried inside the check instead of
+	// being reported as `unknown` on the first inconclusive answer. See
+	// targetedProbeRetries for why that is affordable here and not in a sweep.
+	Targeted bool
 }
 
 type ClearRepairStateResult struct {
