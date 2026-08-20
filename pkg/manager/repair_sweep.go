@@ -1105,6 +1105,24 @@ func (r *Repair) probeTorrentFileByUnrestrict(ctx context.Context, entry *storag
 		res.reason = "debrid_takedown"
 		return res
 	}
+	// 🔴 ANY DEFINITIVE "CANNOT BE SERVED" IS BROKEN, not just a legal takedown.
+	//
+	// A 404/410 from the link mint fell past every test here onto
+	// `unrestrict_link_error`, which is a NON-VERDICT — so the entry rolled up
+	// `unknown`, never became prune-eligible, its arr symlink never dangled,
+	// nothing reaped it, and Plex opened a file that reads zero bytes. Measured
+	// at 3,017 entries `unknown` against 64 `broken` in one sweep, while the
+	// SERVE path answered 500/404 for the very same file with no doubt at all.
+	//
+	// Ordered before the HosterUnavailable branch on purpose. The two sentinels
+	// cannot overlap — an outage is 503 and retryable, this is 410 and permanent
+	// — and testing the definitive one first keeps that separation legible
+	// instead of relying on the reader to know it.
+	if customerror.IsContentPermanentlyGone(err) {
+		res.broken = true
+		res.reason = "provider_content_gone"
+		return res
+	}
 	if errors.Is(err, debridTypes.ErrAvailabilityIndeterminate) {
 		res.reason = "provider_probe_indeterminate"
 		return res

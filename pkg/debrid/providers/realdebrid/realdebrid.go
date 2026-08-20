@@ -932,6 +932,36 @@ func (r *RealDebrid) fetchDownloadLink(account *account.Account, id string, file
 		return emptyLink, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		// 🔴 404/410 FROM THE MINT IS A DEFINITIVE ANSWER, AND IT USED TO LEAVE
+		// AS AN UNTYPED STRING.
+		//
+		// This is the API saying it cannot resolve the resource at all — not a
+		// hoster having a bad day, not a rate limit. The SERVE path has no doubt
+		// about it: the same file answers `500 failed to get download link: 404`
+		// to a reader. The repair probe reached the identical 404 and reported
+		// `unknown`, because it arrived as a bare fmt.Errorf that no typed test
+		// could match, so verifyPayload fell to its indeterminate default.
+		//
+		// Measured: 3,017 entries in `unknown` against 64 `broken` in one sweep —
+		// 6.4% of everything probed. Unknown is non-actionable, so none of them
+		// were ever pruned, the arr symlinks never dangled, nothing reaped them,
+		// and Plex opened files that read zero bytes.
+		//
+		// Third time this exact class has bitten: the cool-off wrapper flattening
+		// its error to text, the Content-Range check whose verdict nothing read,
+		// and now a definitive status that never became a type. The rule that
+		// keeps earning itself: a classification is worth what the weakest link
+		// between the answer and the test is worth.
+		//
+		// NOT the CDN 404. resolveHTTPStreamResponse deliberately does not treat a
+		// 404 on the download URL as dead, because debrid CDNs also 404 for merely
+		// expired links that a re-mint fixes. This is the mint itself failing,
+		// which is the case that re-minting cannot fix.
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+			return emptyLink, customerror.NewContentGoneError(
+				fmt.Errorf("realdebrid: unrestrict returned HTTP %d for %s (code %d)", resp.StatusCode, file.Name, errResp.ErrorCode),
+			)
+		}
 		switch errResp.ErrorCode {
 		// 19 (hoster temporarily unavailable) and 24 (file unavailable) are the
 		// hoster having a bad day. They clear on their own, they say nothing
