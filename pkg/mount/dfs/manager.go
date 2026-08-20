@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -107,6 +108,31 @@ func (m *Manager) Refresh(dirs []string) error {
 	for _, dir := range dirs {
 		m.backend.Refresh(dir)
 	}
+	return nil
+}
+
+// ForgetPath re-reads one child node after its entry was deleted.
+//
+// The ghost this exists for was measured against an EXTERNAL rclone VFS, which
+// caches nodes in a process decypharr does not control. DFS serves from
+// decypharr's own metadata, which the entry cache already invalidates on delete,
+// so there is much less to go stale here — but routing the same signal through
+// costs one call and keeps ONE behaviour rather than two that can drift.
+//
+// The path arrives as "<group>/<entry folder>". The backend addresses children
+// by name beneath the root it refreshes, so only the last segment is meaningful
+// to it.
+func (m *Manager) ForgetPath(path string) error {
+	if m.backend == nil {
+		return fmt.Errorf("backend not initialized")
+	}
+	if path == "" {
+		return nil
+	}
+	if idx := strings.LastIndex(path, "/"); idx >= 0 {
+		path = path[idx+1:]
+	}
+	m.backend.Refresh(path)
 	return nil
 }
 

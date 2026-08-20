@@ -92,6 +92,49 @@ func (r *Client) Do(ctx context.Context, req Request, res any) error {
 	return nil
 }
 
+// Forget drops one cached node from rclone's VFS, by path.
+//
+// 🔴 WHY THE PARENT REFRESH IS NOT ENOUGH — measured, on a live 60,000-symlink
+// library. Deleting an entry refreshes the configured group directories
+// (default `__all__`), and `vfs/refresh` is NON-RECURSIVE: it re-reads the group
+// listing and stops there. The per-entry subdirectory beneath it, and the file
+// nodes inside it, are never revisited.
+//
+// So the group listing correctly loses the entry while the child node lives on,
+// still holding attributes decypharr has already stopped backing:
+//
+//	stat on the full path -> OK, 3,577,947,542 bytes   (stale child node)
+//	readdir of the parent -> empty                     (the group refresh worked)
+//	read                  -> 0 bytes, no error         (the GET behind it 404s)
+//
+// Plex renders that as "Error opening input file" and the transcoder exits. The
+// node did eventually expire — hours later, well past the mount's nominal 5m
+// dir_cache_time — but "eventually" is not a mechanism, and while it lasts
+// NOBODY can see the content is gone: decypharr has no entry left to reason
+// about, and the arr's dangling-symlink reaper sees a perfectly healthy stat.
+//
+// ⚠️ AND THE OBVIOUS FIX IS THE WRONG ONE. `vfs/refresh` accepts recursive=true,
+// which would walk every entry in the group on EVERY delete — thousands of them,
+// precisely when prune waves make deletes arrive in batches. That trades a rare
+// ghost for a predictable stampede. Forgetting the one path that actually
+// changed costs a single call and does not scale with the library at all.
+//
+// Forget only, and no refresh: the parent refresh already re-reads the listing,
+// and there is nothing to re-read at a path that no longer exists.
+func (r *Client) Forget(ctx context.Context, path, fs string) error {
+	if path == "" {
+		return nil
+	}
+	args := map[string]any{"dir": path}
+	if fs != "" {
+		args["fs"] = fs
+	}
+	if err := r.Do(ctx, Request{Command: "vfs/forget", Args: args}, nil); err != nil {
+		return fmt.Errorf("failed to forget path %s for fs %s: %w", path, fs, err)
+	}
+	return nil
+}
+
 func (r *Client) Refresh(ctx context.Context, dirs []string, fs string) error {
 	args := map[string]any{}
 	if fs != "" {

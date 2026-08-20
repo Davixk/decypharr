@@ -20,7 +20,9 @@ func (f fakeDirEntry) Type() fs.FileMode          { return 0 }
 func (f fakeDirEntry) Info() (fs.FileInfo, error) { return nil, fs.ErrInvalid }
 
 type countingMountManager struct {
-	refreshes atomic.Int32
+	refreshes     atomic.Int32
+	forgotten     atomic.Int32
+	lastForgotten atomic.Value
 }
 
 func (c *countingMountManager) Start(context.Context) error { return nil }
@@ -30,6 +32,12 @@ func (c *countingMountManager) IsReady() bool               { return true }
 func (c *countingMountManager) Type() string                { return "counting" }
 func (c *countingMountManager) Refresh([]string) error {
 	c.refreshes.Add(1)
+	return nil
+}
+
+func (c *countingMountManager) ForgetPath(path string) error {
+	c.forgotten.Add(1)
+	c.lastForgotten.Store(path)
 	return nil
 }
 

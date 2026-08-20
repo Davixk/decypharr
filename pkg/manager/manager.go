@@ -1036,6 +1036,16 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 	if m.entry != nil {
 		m.RefreshEntries(true)
 	}
+	// AND THE ENTRY'S OWN PATH. RefreshEntries re-reads the GROUP listings; the
+	// child node beneath them is never revisited, which is how a deleted entry
+	// went on answering stat with a live size for hours after decypharr had
+	// stopped backing it. See RefreshDeletedEntry.
+	//
+	// Uses the snapshot taken before the delete — the entry is gone by now, so
+	// its folder name cannot be looked up any more.
+	if expected != nil {
+		m.RefreshDeletedEntry(expected.GetFolder())
+	}
 	return nil
 }
 

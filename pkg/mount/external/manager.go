@@ -53,6 +53,12 @@ func (m *Manager) Refresh(dirs []string) error {
 	return m.client.Refresh(context.Background(), dirs, "")
 }
 
+// ForgetPath drops one cached node from the external rclone VFS. See
+// rclone.Client.Forget for why refreshing the parent group is not enough.
+func (m *Manager) ForgetPath(path string) error {
+	return m.client.Forget(context.Background(), path, "")
+}
+
 func (m *Manager) IsReady() bool {
 	return true
 }

@@ -317,6 +317,16 @@ func (m *Manager) Refresh(dirs []string) error {
 	return nil
 }
 
+// ForgetPath drops one cached node from the managed rclone VFS. See
+// rclone.Client.Forget for why refreshing the parent group is not enough.
+func (m *Manager) ForgetPath(path string) error {
+	mountInfo := m.getMountInfo()
+	if mountInfo == nil || !mountInfo.Mounted {
+		return fmt.Errorf("mount is not mounted")
+	}
+	return m.client.Forget(context.Background(), path, FSName)
+}
+
 func (m *Manager) GetLogger() zerolog.Logger {
 	return m.logger
 }
