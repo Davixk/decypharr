@@ -727,12 +727,41 @@ func (m *Manager) resolveHTTPStreamResponse(resp *http.Response, plan httpStream
 		contentRange := resp.Header.Get("Content-Range")
 		start, end, err := parseContentRange(contentRange)
 		if err != nil {
-			m.logger.Warn().Err(err).
-				Str("provider", provider).
-				Str("file", filename).
-				Str("content_range", contentRange).
-				Msg("Upstream returned an unparseable Content-Range; proceeding with the requested range")
+			// 🔴 INVALID IS NOT "DIFFERENT", AND THIS BRANCH USED TO TREAT THEM
+			// THE SAME — it warned and served from the body anyway.
+			//
+			// parseContentRange already rejects a header that cannot describe any
+			// real window: end before start, or a total no larger than end. Its
+			// verdict was then discarded, which is the whole defect: the
+			// validation existed and nothing acted on it.
+			//
+			// Measured: an upstream looping `bytes 125-…/125` — a range whose
+			// start is its own total, so it can never contain a byte. Each reply
+			// arrived promptly, so the idle deadline (progress-based, reset on
+			// every delivered byte) never fired, and the client retried forever.
+			// Eight ffprobes sat in D-state for six hours on one file and only a
+			// restart cleared them.
+			//
+			// So the bound has to be on VALIDITY, not only on flow: absence is
+			// already covered by the read timeout; nonsense arriving on schedule
+			// was not covered by anything.
+			//
+			// RETRYABLE, deliberately. This is a statement about one RESPONSE, not
+			// about the content — a header mangled by a proxy or a one-off bad
+			// edge node should cost a retry, not a verdict. The existing retry
+			// chain bounds it, so a persistent garbage-server fails in seconds
+			// instead of looping, and a transient one self-heals.
+			return 0, StreamError{
+				Err: fmt.Errorf("upstream returned an unusable Content-Range %q for %q (provider %s): %w",
+					contentRange, filename, provider, err),
+				Retryable: true,
+			}
 		} else if start != plan.upstreamStart || end != plan.upstreamEnd {
+			// COHERENT, just not what we asked for. Left as a warning on purpose:
+			// upstreams are loose about honouring Range, the window they describe
+			// is internally consistent, and the copy loop below enforces the exact
+			// logical length regardless. Rejecting these would turn a working if
+			// sloppy CDN into an outage.
 			m.logger.Warn().
 				Str("provider", provider).
 				Str("file", filename).
