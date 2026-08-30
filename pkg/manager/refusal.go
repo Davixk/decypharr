@@ -58,6 +58,11 @@ type addRefusal struct {
 	// provider and detail name the refusal that drove the verdict, for logs.
 	provider string
 	detail   string
+	// reason is the sentence an *arr shows when this refusal is answered
+	// synchronously. Set only where the generic refusalReason text would be
+	// wrong — a stored-item cap is a legitimate refusal, not the "should have
+	// been held, please report this" case.
+	reason string
 	// standingCondition is set when a provider refused because a cap that does
 	// NOT self-clear is full. It is surfaced loudly: the operator has to act.
 	standingCondition string
@@ -77,12 +82,25 @@ type addRefusal struct {
 //	ANY provider temporary   -> accept and HOLD as queuedDL, retrying internally
 //	                            until a real verdict.
 //
-// The error arrives as a join across every provider in the chain, and errors.Is
-// walks the whole tree — so a scan for any temporary condition IS the aggregate
-// rule above, with no per-provider bookkeeping required. That equivalence is
-// what makes this function short, and it only holds while every test below
-// matches by SENTINEL IDENTITY: a text or status test would answer for the
-// wrong provider's error in the same tree.
+// 🔴 THE EQUIVALENCE THAT USED TO MAKE THIS FUNCTION SHORT IS GONE, AND IT HAD
+// TO GO. The error arrives as a join across every provider in the chain, and
+// errors.Is walks the whole tree, so a single scan for "any temporary
+// condition" WAS the aggregate rule above — exactly and for free. That held
+// only while every temporary sentinel was UNCONDITIONALLY temporary.
+//
+// ProviderAddQuotaExhaustedError is not. AllDebrid returns it both for a daily
+// add allowance (transient) and for a full stored-item cap (permanent — nothing
+// but deletion frees it), and which one it means is decided by that account's
+// own fill against that account's own cap. A whole-tree scan cannot ask that
+// question: it does not know WHICH provider raised the quota error, so it would
+// resolve AllDebrid's ceiling against RealDebrid's fill, or refuse a grab that
+// RealDebrid's daily allowance will accept in an hour.
+//
+// So the tree is split into per-provider branches and each is classified
+// against its own account. The aggregate rule above is then applied across the
+// branch verdicts, unchanged. Every test still matches by SENTINEL IDENTITY: a
+// text or status test would answer for the wrong provider's error even inside a
+// correctly attributed branch.
 //
 // Anything not positively identified as a temporary inability refuses. That is
 // the conservative direction: refusing costs the arr one candidate from a
@@ -106,26 +124,65 @@ func (m *Manager) classifyAddRefusal(err error) addRefusal {
 	// CheckFile AND a transient outage from fetchDownloadLink) and carries status
 	// 503, so any test that reasons from status or text could hold gone content
 	// forever. The reasoning for the FIX was not: a leading
-	// IsContentPermanentlyGone check breaks the join semantics this function is
-	// built on. errors.Is answers true if ANY provider in the chain reported a
-	// permanent verdict, so a takedown on provider A plus a rate limit on
-	// provider B would refuse a grab that B is going to accept in thirty
-	// seconds — the exact class of mistake the "scan for the BEST outcome"
-	// rule exists to prevent.
+	// IsContentPermanentlyGone check applied to the WHOLE tree refuses a grab
+	// another provider is about to accept. Per-branch classification is what
+	// makes such a test safe, and it is now what this function does.
 	//
-	// The double-booking is instead handled where it belongs: every capacity test
-	// below matches by SENTINEL IDENTITY and never by status or text. See
-	// isRateClassRefusal for why that distinction is load-bearing rather than
-	// stylistic.
+	// The double-booking is still handled by matching on SENTINEL IDENTITY and
+	// never on status or text. See isRateClassRefusal for why that distinction
+	// is load-bearing rather than stylistic.
 
+	branches := splitRefusalBranches(err)
+	if len(branches) == 0 {
+		return addRefusal{}
+	}
+
+	agg := addRefusal{}
+	for _, branch := range branches {
+		one := m.classifyBranchRefusal(branch.provider, branch.err)
+
+		// A standing condition is reported whichever way the aggregate lands.
+		// It says "this account is full and only deletion frees it", which the
+		// operator has to act on even when some other provider's transient
+		// condition is what holds this particular grab.
+		if agg.standingCondition == "" && one.standingCondition != "" {
+			agg.standingCondition = one.standingCondition
+		}
+		if agg.reason == "" && one.reason != "" {
+			agg.reason = one.reason
+		}
+		if agg.provider == "" {
+			agg.provider = one.provider
+		}
+
+		// THE FIRST TEMPORARY INABILITY DECIDES THE AGGREGATE. The loop does not
+		// break, because the standing conditions of the remaining branches still
+		// have to be collected — a hold must not silence the one log line that
+		// explains why the account can never accept anything again.
+		if one.hold && !agg.hold {
+			agg.hold = true
+			agg.provider = one.provider
+			agg.detail = one.detail
+		}
+	}
+	return agg
+}
+
+// classifyBranchRefusal is the verdict for ONE provider's refusal.
+//
+// name is that provider, resolved from the branch rather than from the whole
+// tree — the distinction that lets a capacity refusal be judged against the cap
+// and fill of the account that actually raised it.
+func (m *Manager) classifyBranchRefusal(name string, err error) addRefusal {
 	// Concurrency exhaustion is unambiguously transient on every provider that
 	// reports it: RealDebrid's active-slot count and AllDebrid's 30 active
 	// magnets both free as work finishes. No fill check is needed or relevant —
 	// this is not about how much the account STORES.
 	if isTooManyActiveDownloads(err) {
 		return addRefusal{
-			hold:   true,
-			detail: "provider concurrency limit reached; slots free as active downloads finish",
+			hold:     true,
+			provider: name,
+			detail:   "provider concurrency limit reached; slots free as active downloads finish",
 		}
 	}
 
@@ -143,51 +200,63 @@ func (m *Manager) classifyAddRefusal(err error) addRefusal {
 	// permanent refusal on a full account.
 	if isRateClassRefusal(err) {
 		return addRefusal{
-			hold:   true,
-			detail: "provider is rate limiting or its traffic allowance is spent; this clears on its own and the add-rate pacer is already backing off",
+			hold:     true,
+			provider: name,
+			detail:   "provider is rate limiting or its traffic allowance is spent; this clears on its own and the add-rate pacer is already backing off",
 		}
 	}
 
-	// An add allowance being spent. Always held, and the fill is now read only to
-	// describe it — never to decide it.
 	if isProviderAddQuotaExhausted(err) {
-		return m.classifyQuotaRefusal(err)
+		return m.classifyQuotaRefusal(name, err)
 	}
 
-	// Content, auth, parse, transport — refuse. The arr moves on.
-	return addRefusal{}
+	// Content, auth, parse, transport — permanent for this provider.
+	return addRefusal{provider: name}
 }
 
-// classifyQuotaRefusal describes an add-allowance refusal. It always holds.
+// classifyQuotaRefusal decides whether an add-allowance refusal is transient.
 //
-// ⚠️ IT USED TO DECIDE, AND THE OPERATOR OVERRULED THAT. AllDebrid returns
-// MAGNET_TOO_MANY for both its daily add allowance and its stored-item cap, so
-// this resolved the account's fill and refused at-cap on the grounds that the
-// stored cap does not self-clear — the condition behind fork.34's 15.2-hour
-// spin, observed refusing every add for 54.6 continuous hours.
+// AllDebrid returns MAGNET_TOO_MANY for two conditions that need opposite
+// answers, and its message cannot tell them apart — the observed text says
+// "Magnets limit reached (1000 accross all tabs)" while the binding constraint
+// is 5,000. The account's own fill is the only discriminator:
 //
-// The ruling that replaced it: only a PERMANENT refusal refuses the grab, and
-// permanent means a verdict about the CONTENT — an infringing-file 451, a
-// content-level reject. A full account is not a statement about this release. It
-// rules out that provider for now and rules out nothing anywhere else, so it is
-// a temporary inability and the grab is held.
+//	fill BELOW the cap -> the DAILY add allowance is spent. Transient. HOLD.
+//	fill AT the cap    -> the STORED-item cap is full. Nothing decypharr
+//	                      finishes or waits for frees it, only deletion does.
+//	                      PERMANENT for this provider. REFUSE.
 //
-// Two things make that safe now that were not true at fork.34. Stall pruning
-// continuously deletes items on the provider, so the stored cap has a working
-// drain rather than none. And the hold is VISIBLE — the row reports queuedDL —
-// where fork.34's spin was invisible.
+// ⚠️ THIS REVERSES THE HOLD RULING, AND THE HISTORY IS THE POINT, so the third
+// version of this decision is written down rather than quietly replacing the
+// second. It refused at-cap; a ruling then made it hold, on the grounds that a
+// full account is not a verdict about the release and that stall pruning gives
+// the stored cap a working drain. The comment that shipped with that change
+// named the risk exactly:
 //
-// 🔴 THE RESIDUAL RISK, STATED RATHER THAN HIDDEN: if the drain ever stops and
-// the account stays full, held entries accumulate and the arrs wait on downloads
-// that never start. The signal is a held-queue depth that only ever grows, and
-// standingCondition below is the log line that names the cause.
+//	"if the drain ever stops and the account stays full, held entries
+//	 accumulate and the arrs wait on downloads that never start."
 //
-// The fill is still read, because "spent for today" and "the account is full"
-// need completely different operator action and the log must say which. A fill
-// that cannot be read costs a vaguer message and nothing else — never a
-// different verdict.
-func (m *Manager) classifyQuotaRefusal(err error) addRefusal {
-	name := quotaRefusalProvider(err)
+// It did. Measured over 24h on a live deployment: 11,827 admissions, held rows
+// going 495 -> 11,399, 6,391 at-cap hold lines and ZERO refusals, against an
+// account pinned at exactly 5,000/5,000. Stall pruning does not out-pace new
+// grabs, so the drain assumption that made holding safe is false.
+//
+// What settles it beyond our own inference: the operator called AllDebrid
+// directly, with decypharr out of the path, and a single magnet/upload was
+// hard-refused at 5,000 stored. The wall is AllDebrid's, not a threshold of
+// ours — so a hold here is a promise decypharr cannot keep, and the
+// fail-fast economics apply. A synchronous refusal costs the arr one candidate
+// from a list it is still holding; an acceptance that can never start costs it
+// the whole search.
+//
+// The verdict stays HELD wherever the at-cap case cannot be PROVEN: no cap
+// known, no fill readable, no provider attributable. Refusing on a guess would
+// permanently fail a daily allowance that resets by itself, which is the error
+// this whole file exists to avoid.
+func (m *Manager) classifyQuotaRefusal(name string, err error) addRefusal {
+	if name == "" {
+		name = quotaRefusalProvider(err)
+	}
 	if name == "" {
 		// Not attributable to a provider. Still held — an unattributable add
 		// allowance is not a content verdict either.
@@ -220,14 +289,24 @@ func (m *Manager) classifyQuotaRefusal(err error) addRefusal {
 	}
 
 	if fill >= capacity {
-		held.detail = fmt.Sprintf("stored-item cap reached (%d/%d)", fill, capacity)
-		held.standingCondition = fmt.Sprintf(
-			"provider %q is holding %d of its %d stored items. Grabs are being ACCEPTED AND HELD against this, "+
-				"per the operator's ruling that a full account is not a verdict about the release — but the only "+
-				"things that free it are stall pruning and deletions on the provider. If the held queue only grows, "+
-				"this is why: delete items on the provider, or raise max_magnets if the provider's real cap is higher.",
-			name, fill, capacity)
-		return held
+		// PERMANENT for this provider — the one branch of this function that
+		// does not hold. It still says nothing about the release, which is why
+		// the aggregate in classifyAddRefusal can and does overrule it the
+		// moment any other provider is merely busy.
+		return addRefusal{
+			provider: name,
+			detail:   fmt.Sprintf("stored-item cap reached (%d/%d)", fill, capacity),
+			reason: fmt.Sprintf(
+				"refused: %s is storing %d of its %d items and will not accept another until items are deleted "+
+					"there; this is a limit on the account, not a problem with this release",
+				name, fill, capacity),
+			standingCondition: fmt.Sprintf(
+				"provider %q is storing %d of its %d items and is REFUSING new grabs. Nothing decypharr does "+
+					"frees this — not waiting, not retrying — only deleting items on the provider, or raising "+
+					"max_magnets if the provider's real cap is higher. Grabs are being refused so the *arr takes "+
+					"its next candidate immediately instead of queueing behind a wall that never moves.",
+				name, fill, capacity),
+		}
 	}
 
 	held.detail = fmt.Sprintf("daily add allowance spent while stored fill is %d/%d; it resets on the provider's own boundary", fill, capacity)
@@ -353,6 +432,83 @@ func (m *Manager) providerConfig(name string) (config.Debrid, bool) {
 		return config.Debrid{}, false
 	}
 	return client.Config(), true
+}
+
+// refusalBranch is one provider's refusal, lifted out of the joined tree.
+//
+// provider is empty when nothing in that branch said who refused — a bare
+// sentinel, or a failure raised before any provider was selected. Such a branch
+// is still classified; it just cannot have a cap resolved against it.
+type refusalBranch struct {
+	provider string
+	err      error
+}
+
+// splitRefusalBranches separates a joined chain error into per-provider
+// branches.
+//
+// WHY THIS EXISTS AT ALL: the add path tries every configured provider and
+// joins their refusals, then wraps the join (joinDebridErrors adds a message
+// and singleLineError). A verdict that needs to know WHICH account refused —
+// and the stored-item cap does — cannot be reached by scanning that tree with
+// errors.Is, because errors.Is answers "somewhere in here" and never "whose".
+//
+// The walk descends single wrappers so a join nested under them is still found,
+// and carries the enclosing providerError's name DOWNWARD so attribution
+// survives that descent. A branch with no join above it is returned whole.
+func splitRefusalBranches(err error) []refusalBranch {
+	return appendRefusalBranches(nil, err, "", 0)
+}
+
+// maxRefusalBranchDepth bounds the walk. Error trees are built by this package
+// and are shallow, but a cyclic Unwrap would otherwise hang the add path — a
+// classifier is the wrong place to trust a stranger's linked list.
+const maxRefusalBranchDepth = 32
+
+func appendRefusalBranches(out []refusalBranch, err error, inherited string, depth int) []refusalBranch {
+	if err == nil || depth > maxRefusalBranchDepth {
+		return out
+	}
+	// The NEAREST enclosing providerError wins: a branch is attributed to the
+	// provider whose attempt produced it, not to an outer wrapper's.
+	if pErr, ok := err.(*providerError); ok && pErr.provider != "" {
+		inherited = pErr.provider
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, sub := range multi.Unwrap() {
+			out = appendRefusalBranches(out, sub, inherited, depth+1)
+		}
+		return out
+	}
+	if single, ok := err.(interface{ Unwrap() error }); ok {
+		// 🛑 DESCEND ONLY TOWARDS A JOIN, NEVER TO THE LEAF.
+		//
+		// Walking a wrapper chain to its innermost error would hand each branch
+		// a naked leaf, and every sentinel test in classifyBranchRefusal matches
+		// by identity through the chain — so a TrafficExceededError wrapped by
+		// anything would stop matching, and a transient condition would be
+		// classified as a permanent refusal. The branch keeps its FULL chain;
+		// this descent exists purely to reach a join hiding under one.
+		if inner := single.Unwrap(); inner != nil && hasJoinBelow(inner, depth+1) {
+			return appendRefusalBranches(out, inner, inherited, depth+1)
+		}
+	}
+	return append(out, refusalBranch{provider: inherited, err: err})
+}
+
+func hasJoinBelow(err error, depth int) bool {
+	for err != nil && depth <= maxRefusalBranchDepth {
+		if _, ok := err.(interface{ Unwrap() []error }); ok {
+			return true
+		}
+		single, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = single.Unwrap()
+		depth++
+	}
+	return false
 }
 
 // quotaRefusalProvider extracts which provider raised an ADD-QUOTA refusal.

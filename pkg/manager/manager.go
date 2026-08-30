@@ -603,7 +603,21 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		}
 		m.logger.Error().Err(err).Str("job_id", job.ID).Str("type", string(job.Type)).Msg("Active download failed")
 		if job.Entry != nil {
-			job.Entry.MarkAsError(err)
+			// THIS IS THE HEAL PATH FOR ALREADY-ACCEPTED ROWS, so the recorded
+			// error has to say why in a sentence.
+			//
+			// An entry admitted while at-cap counted as a hold is retried
+			// through here, reaches the refuse verdict, and becomes a Failed row
+			// the *arr picks up on its next poll — which is the only way to
+			// correct a grab that was accepted on a premise that turned out to
+			// be false. A bare provider error would leave that row saying
+			// "MAGNET_TOO_MANY: Magnets limit reached (1000 accross all tabs)",
+			// a message that is wrong about its own number and explains nothing.
+			failure := err
+			if refusal.reason != "" {
+				failure = fmt.Errorf("%s: %w", refusal.reason, err)
+			}
+			job.Entry.MarkAsError(failure)
 			_ = m.queue.Update(job.Entry)
 		}
 		return

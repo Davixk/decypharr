@@ -88,7 +88,16 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 		// anything else" is the exact complaint being answered — twelve
 		// consecutive manual grabs on one title, every one indistinguishable
 		// from every other kind of failure.
-		reason := refusalReason(err)
+		//
+		// A capacity refusal supplies its OWN sentence. refusalReason's generic
+		// capacity branch says "this should have been held — please report
+		// this", which was true while every capacity class held; a full
+		// stored-item cap is now a legitimate refusal, and telling an operator
+		// to report a working system as a bug is worse than saying nothing.
+		reason := refusal.reason
+		if reason == "" {
+			reason = refusalReason(err)
+		}
 		if deleted, deleteErr := m.queue.DeleteCurrent(torrent, nil); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("delete failed reservation: %w", deleteErr), err)
 		} else if !deleted {
