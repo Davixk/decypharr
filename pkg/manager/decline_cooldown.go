@@ -97,6 +97,33 @@ func declineKey(provider, infoHash string) string {
 //
 // Takes the ERROR, not a message. See declineRecord for what storing the text
 // cost the last time.
+//
+// 🔴 A LIVE PERMANENT VERDICT IS NOT DOWNGRADED BY A LATER TRANSIENT FAILURE.
+//
+// This overwrote class, cause and until unconditionally, so the order of two
+// unrelated events decided the outcome:
+//
+//	provider refuses the CONTENT (451)      -> permanent, parked 6h
+//	provider then throttles the next try    -> transient, park shortened to
+//	                                           minutes, 451 cause DISCARDED
+//
+// The second event is a fact about our request. The first is a verdict about
+// the release, and the verdict outranks it — a takedown does not become
+// provisional because we were later asked to slow down. Losing it meant the
+// hash was re-offered within minutes, refused again, and never reached a
+// conclusion: measured against 16,002 RD `451 infringing_file` declines in 24h
+// versus 1,437 rate-limit declines, that is a lot of items cycling forever on
+// an 11:1 minority event.
+//
+// Same defect class as the cool-off wrapper that flattened sentinels to text —
+// a verdict destroyed between where it was reached and where it was needed —
+// and here it was destroyed in the ledger meant to preserve it.
+//
+// The permanent record keeps its ORIGINAL expiry rather than being extended by
+// each throttle. Refreshing it would let a stream of transient failures hold a
+// permanent refusal open indefinitely, which is the same inversion in the other
+// direction. Once the 6h lapses, the next decline starts fresh at whatever
+// class it actually is.
 func (l *declineLedger) record(provider, infoHash string, class declineClass, cause error, now time.Time) time.Duration {
 	if l == nil || infoHash == "" {
 		return 0
@@ -107,6 +134,14 @@ func (l *declineLedger) record(provider, infoHash string, class declineClass, ca
 	key := declineKey(provider, infoHash)
 	rec := l.records[key]
 	rec.failures++
+
+	if rec.class == declinePermanent && class != declinePermanent && now.Before(rec.until) {
+		// Keep the verdict, its cause and its deadline; only the failure count
+		// moves, so a repeat offender still backs off further once it lapses.
+		l.records[key] = rec
+		return rec.until.Sub(now)
+	}
+
 	rec.class = class
 	rec.cause = cause
 	rec.reason = ""

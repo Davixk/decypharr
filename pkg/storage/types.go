@@ -687,7 +687,25 @@ func (ct *CachedTorrent) ToManagedTorrent() *Entry {
 	return mt
 }
 
-// GetTorrentFolder returns the folder name for a torrent by debrid ID
+// GetTorrentFolder returns the folder name for a torrent by debrid ID.
+//
+// 🔴 IT MUST NEVER RETURN "." — path.Clean("") does, and "." is not a name, it
+// is THIS DIRECTORY. Every path derived from it collapses onto the parent that
+// every sibling entry shares: filepath.Join(mount, __all__, ".") is __all__
+// itself. That is the category-directory shape the delete path already refuses
+// to act on, and it reached this function from a source no fallback covered.
+//
+// Measured on a live deployment: 3,864 of 3,870 downloads from ONE indexer had
+// no display name, and this function answered "." for every one of them — as
+// the entry's stored `name` metadata attribute (so listings and dedup see "."),
+// and as its folder. The entry's Name field was fine; it carried the infohash
+// placeholder. OriginalFilename did not, and two of the five naming modes read
+// OriginalFilename.
+//
+// The guard is placed HERE rather than only at the callers because this is the
+// single funnel every folder name passes through, and the naming mode decides
+// which field is read — so a fallback applied to one field is not a fallback at
+// all under a different config.
 func GetTorrentFolder(folderNaming config.WebDavFolderNaming, entry *Entry) string {
 	var folder string
 	switch folderNaming {
@@ -703,6 +721,13 @@ func GetTorrentFolder(folderNaming config.WebDavFolderNaming, entry *Entry) stri
 		folder = entry.InfoHash
 	default:
 		folder = path.Clean(entry.Name)
+	}
+
+	// The infohash is the identity every entry has and no entry shares. Falling
+	// back to it keeps a nameless entry addressable and unique until a real name
+	// arrives, instead of silently aliasing it onto its siblings' directory.
+	if !utils.IsUsableName(folder) {
+		return entry.InfoHash
 	}
 	return folder
 }

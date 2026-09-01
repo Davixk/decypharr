@@ -229,14 +229,25 @@ func newTorrentQueueEntry(importReq *ImportRequest, status debridTypes.TorrentSt
 	// to act on that, but the entry should never be built that way to begin
 	// with. Substitute the infohash, which is unique and filesystem-safe; the
 	// real name replaces it once the provider resolves it.
+	//
+	// ⚠️ THE FALLBACK HAS TO COVER OriginalFilename TOO, and for a long time it
+	// did not. Two of the five folder-naming modes read OriginalFilename rather
+	// than Name, so an entry with a correct placeholder Name still resolved to
+	// path.Clean("") — "." — under those modes. Measured: one indexer supplies
+	// magnets with no "dn" at all, 3,864 of 3,870 of its downloads, every one of
+	// them stored with "." as its name attribute.
 	name := importReq.Magnet.Name
 	if !utils.IsUsableName(name) {
 		name = importReq.Magnet.InfoHash
 	}
+	originalName := importReq.Magnet.Name
+	if !utils.IsUsableName(originalName) {
+		originalName = importReq.Magnet.InfoHash
+	}
 	torrent := &storage.Entry{
 		InfoHash:         importReq.Magnet.InfoHash,
 		Name:             name,
-		OriginalFilename: importReq.Magnet.Name,
+		OriginalFilename: originalName,
 		Protocol:         config.ProtocolTorrent,
 		Size:             importReq.Magnet.Size,
 		Bytes:            importReq.Magnet.Size,
@@ -687,8 +698,19 @@ func applyDebridTorrentToEntry(torrent *storage.Entry, debridTorrent *debridType
 	torrent.ActiveProvider = debridTorrent.Debrid
 	torrent.Bytes = debridTorrent.GetSize()
 	torrent.Size = debridTorrent.GetSize()
-	torrent.Name = debridTorrent.Name
-	torrent.OriginalFilename = debridTorrent.OriginalFilename
+	// 🛑 A PROVIDER'S ANSWER ONLY REPLACES A NAME IF IT IS ONE.
+	//
+	// This assigned unconditionally, so a provider that returned an empty name
+	// UNDID the infohash placeholder and left the entry nameless — the "." case
+	// again, arriving from the opposite direction and defeating the fallback
+	// applied moments earlier at creation. A nameless entry has to be a
+	// transient state; nothing here is allowed to make it permanent.
+	if utils.IsUsableName(debridTorrent.Name) {
+		torrent.Name = debridTorrent.Name
+	}
+	if utils.IsUsableName(debridTorrent.OriginalFilename) {
+		torrent.OriginalFilename = debridTorrent.OriginalFilename
+	}
 	torrent.UpdatedAt = time.Now()
 
 	for _, file := range debridTorrent.Files {
