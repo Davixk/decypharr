@@ -162,10 +162,21 @@ func TestStreamingReaderPrefetchesOutOfOrderAndReadsInOrder(t *testing.T) {
 		t.Fatalf("ordered output mismatch: got %d bytes, want %d", len(result.data), expected.Len())
 	}
 
-	order := server.completionOrder()
-	if len(order) != segmentCount {
-		t.Fatalf("completion order has %d segments, want %d: %v", len(order), segmentCount, order)
-	}
+	// 🔴 THE HARNESS RECORDS A COMPLETION AFTER IT FLUSHES, so this read has to
+	// wait for the record rather than sample it.
+	//
+	// finishBody appends to s.completed only once writer.Flush() has returned.
+	// The client can therefore have every byte of the last segment — and the
+	// ordered read can return — while that handler has not yet taken the lock
+	// to append. Sampling the order at this instant is allowed to come up
+	// short, and did: CI produced [1 3 2 4 0 5 7], missing segment 6 while 7
+	// was present.
+	//
+	// That is bookkeeping lag in this file, NOT a missing segment. The
+	// bytes.Equal above had already proved all segmentCount payloads arrived
+	// and assembled correctly, which is what makes the distinction certain
+	// rather than assumed.
+	order := waitForCompletionOrder(ctx, t, server, segmentCount)
 	if order[0] == 0 {
 		t.Fatalf("segments did not complete out of order: %v", order)
 	}
@@ -401,6 +412,29 @@ func (s *pipelineNNTPServer) peakActive() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.peak
+}
+
+// waitForCompletionOrder blocks until the harness has recorded want
+// completions, or the context expires.
+//
+// It waits rather than retrying an assertion because the shortfall is never a
+// product outcome: a segment that genuinely failed to arrive is caught by the
+// payload comparison, long before this. All that is being waited on is a
+// handler goroutine reaching its own bookkeeping.
+func waitForCompletionOrder(ctx context.Context, t *testing.T, s *pipelineNNTPServer, want int) []int {
+	t.Helper()
+	for {
+		order := s.completionOrder()
+		if len(order) >= want {
+			return order
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("completion order has %d segments, want %d after waiting: %v", len(order), want, order)
+			return nil
+		case <-time.After(time.Millisecond):
+		}
+	}
 }
 
 func (s *pipelineNNTPServer) completionOrder() []int {
