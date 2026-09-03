@@ -100,9 +100,21 @@ func GetMagnetFromBytes(torrentData []byte, rmTrackerUrls bool) (*Magnet, error)
 	magnet := &Magnet{
 		InfoHash: infoHash,
 		Name:     info.Name,
-		Size:     info.Length,
-		Link:     magnetMeta.String(),
-		File:     torrentData,
+		// 🔴 info.Length IS ONLY SET FOR SINGLE-FILE TORRENTS.
+		//
+		// A multi-file torrent carries its sizes in info.Files and leaves
+		// Length at zero, so every season pack that arrived through this path
+		// was recorded with Size 0 — and every *arr row for one showed 0 bytes.
+		// TotalLength() sums the files and returns Length for the single-file
+		// case, which is the same number in both shapes.
+		//
+		// This is the ONLY torrent-file path: an indexer that hands the *arr a
+		// Prowlarr /download URL rather than a magnet resolves through
+		// OpenMagnetHttpURL into here, so the defect applied to whole indexers
+		// at a time rather than to occasional entries.
+		Size: info.TotalLength(),
+		Link: magnetMeta.String(),
+		File: torrentData,
 	}
 	return magnet, nil
 }
