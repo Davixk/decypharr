@@ -167,6 +167,12 @@ func TestTokenWaitIsBoundedEvenWithNoContext(t *testing.T) {
 			t.Fatalf("give-up error is %v, want RateLimitedError. The classifier reads the TYPE to hold the "+
 				"entry; anything else is refused as unrecognised and the release is spent", err)
 		}
+		// 🔊 AND IT IS COUNTED. A bounded wait that gives up silently just moves
+		// the invisibility — both hangs were undetectable from inside the process
+		// until an *arr complained.
+		if n := client.RateWaitsAbandoned(); n != 1 {
+			t.Fatalf("RateWaitsAbandoned() = %d, want 1; a give-up that is not counted cannot be noticed", n)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("a contextless caller was still queued for a token after five seconds. This is the unbounded " +
 			"park that exhausted the worker pool and took the write path down")

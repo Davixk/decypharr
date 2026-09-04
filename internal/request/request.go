@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -36,14 +37,18 @@ type Client struct {
 	httpClient      *http.Client // underlying http client
 	rateLimiter     ratelimit.Limiter
 	rateWaitCeiling time.Duration
-	headers         map[string]string
-	headersMu       sync.RWMutex
-	maxRetries      int
-	timeout         time.Duration
-	skipTLSVerify   bool
-	retryableStatus map[int]struct{}
-	logger          zerolog.Logger
-	proxy           string
+	// rateWaitsAbandoned counts give-ups so the log can say how many, not just
+	// that one happened. Exposed via RateWaitsAbandoned for callers that want it.
+	rateWaitsAbandoned atomic.Int64
+	rateWaitLogger     *logger.RateLimitedLogger
+	headers            map[string]string
+	headersMu          sync.RWMutex
+	maxRetries         int
+	timeout            time.Duration
+	skipTLSVerify      bool
+	retryableStatus    map[int]struct{}
+	logger             zerolog.Logger
+	proxy              string
 }
 
 // WithMaxRetries sets the maximum number of retry attempts
@@ -195,6 +200,32 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ceiling:
+			// 🔊 NEVER SILENT. A bounded wait that gives up quietly just moves
+			// the invisibility: the fork.77 and fork.78 hangs were undetectable
+			// from inside this process until an *arr complained, and the only
+			// reason they were understood at all is that someone took a
+			// goroutine dump.
+			//
+			// This line is the signal that the ceiling is doing work — which
+			// also means it is the signal that something upstream is wrong,
+			// because at ordinary pacing it can never fire. Rate-limited per
+			// host so a congested provider reports once a minute rather than
+			// once per abandoned call, and counted so the log says how many
+			// gave up rather than merely that one did.
+			abandoned := c.rateWaitsAbandoned.Add(1)
+			host := req.URL.Host
+			// Guarded because a Client built outside New() has no logger, and a
+			// nil collaborator that panics on the failure path is worse than the
+			// failure it was added to report.
+			if c.rateWaitLogger != nil {
+				c.rateWaitLogger.Warn("rate-wait-ceiling:"+host).
+					Str("host", host).
+					Dur("ceiling", c.rateWaitCeiling).
+					Int64("abandoned_total", abandoned).
+					Msg("Gave up queueing for a rate-limit token; the entry is being held rather than refused. " +
+						"At healthy pacing this never fires — if it repeats, this provider is over-subscribed")
+			}
+
 			return nil, fmt.Errorf("%w: waited %s for a rate-limit token without reaching the front of the queue",
 				customerror.RateLimitedError, c.rateWaitCeiling)
 		}
@@ -293,6 +324,7 @@ func New(options ...ClientOption) *Client {
 	client := &Client{
 		maxRetries:      5,
 		rateWaitCeiling: defaultRateWaitCeiling,
+		rateWaitLogger:  logger.NewRateLimitedLogger(),
 		skipTLSVerify:   true,
 		retryableStatus: map[int]struct{}{
 			http.StatusTooManyRequests:     {},
@@ -487,4 +519,15 @@ func SetProxy(transport *http.Transport, proxyURL string) {
 	} else {
 		transport.Proxy = http.ProxyFromEnvironment
 	}
+}
+
+// RateWaitsAbandoned reports how many calls have given up queueing for a
+// rate-limit token on this client.
+//
+// Zero is the healthy value and stays zero at ordinary pacing. A rising count
+// means this client is asking faster than its configured rate for long enough
+// to matter, which is the condition that exhausted the worker pool twice before
+// anything bounded it.
+func (c *Client) RateWaitsAbandoned() int64 {
+	return c.rateWaitsAbandoned.Load()
 }
