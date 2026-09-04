@@ -2,6 +2,7 @@ package manager
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -205,21 +206,67 @@ func TestCapacityIsNeverAPermanentDecline(t *testing.T) {
 	}
 }
 
-func TestPerReleaseRefusalIsPermanent(t *testing.T) {
+// 🛑 REVERSED ON MEASUREMENT. This asserted that a 451 from an add is a
+// permanent verdict about the release. It is not, and the premise was disproved
+// against the live account with decypharr out of the path:
+//
+//	12 RANDOM synthetic infohashes offered to RealDebrid's add endpoint
+//	  -> 451 infringing_file : 4
+//	  -> 429 too_many_requests : 8
+//	one nonexistent hash, offered at 20s spacing -> 429, 429, 451, 429
+//
+// A takedown record cannot exist for a random 20-byte value, so under
+// add-throttle conditions RealDebrid emits 451 and 429 interchangeably. The
+// number is not a verdict; it is "not right now" with a different code on it.
+//
+// Keeping the old rule would park a live release for six hours on the strength
+// of a throttle response — and, because the test below shows the match was a
+// substring scan, it would do so for about one hash in a hundred even when the
+// provider said nothing of the sort.
+func TestAddTimeRefusalsAreNeverPermanentOnText(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		err  error
 	}{
-		{"451 from the provider", errors.New("realdebrid API error: Status: 451")},
+		{"451 under throttle", errors.New("realdebrid API error: Status: 451")},
 		{"wrapped in a stage error",
 			providerStageError("rd", "submit", errors.New("realdebrid API error: Status: 451"))},
-		{"named refusal", errors.New("infringing content")},
+		{"the word infringing", errors.New("infringing content")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := classifyDecline(tc.err); got != declinePermanent {
-				t.Fatalf("class = %v; this provider will refuse this release every time", got)
+			if got := classifyDecline(tc.err); got != declineTransient {
+				t.Fatalf("class = %v. RealDebrid returns 451 for random nonexistent infohashes while "+
+					"throttling adds, so treating it as a verdict parks releases the provider would accept", got)
 			}
 		})
+	}
+}
+
+// 🔴 AND THE MATCH WAS A SUBSTRING SCAN, so it did not test what it claimed.
+//
+// "451" appears in ordinary data: infohashes, byte counts, torrent ids,
+// timestamps. Roughly one hex infohash in a hundred contains it somewhere, so
+// about 1% of ALL declines were parked for six hours regardless of cause —
+// the same match-by-text defect as the cool-off wrapper, in the function whose
+// entire purpose is to preserve a class.
+func TestDeclineClassIsNotDecidedByDigitsInAnInfohash(t *testing.T) {
+	// Real-shaped hashes that happen to contain the digits.
+	for _, hash := range []string{
+		"c0e8694ca9b09d0117eb57b03ed451ccb7ae9c8a",
+		"451f5d2a8d0158df3fe20ea2d87d32f063dccec1",
+		"be1ff5d2a8d0158df3fe20ea2d87d32f06451cec",
+	} {
+		err := providerStageError("rd", "submit",
+			fmt.Errorf("provider declined %s: connection reset", hash))
+		if got := classifyDecline(err); got != declineTransient {
+			t.Errorf("a connection reset on hash %s was classified %v because the hash contains \"451\"", hash, got)
+		}
+	}
+
+	// And a byte count, which is the other place these digits live.
+	err := errors.New("provider declined: only 451 bytes read")
+	if got := classifyDecline(err); got != declineTransient {
+		t.Errorf("a short read was classified %v on the strength of a byte count", got)
 	}
 }
 

@@ -330,14 +330,39 @@ func classifyDecline(err error) declineClass {
 	// hash in response to a bad API key would be exactly the wrong reaction: it
 	// would quietly shed one release at a time while the real fault went
 	// unaddressed.
-	text := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(text, "451"):
-		// Unavailable for legal reasons. The provider's verdict on this
-		// specific release, and it will be the same verdict every time.
-		return declinePermanent
-	case strings.Contains(text, "infringing"):
-		return declinePermanent
-	}
+	// 🛑 A 451 FROM AN ADD IS NOT A VERDICT, AND THIS USED TO SAY IT WAS.
+	//
+	// Two independent defects lived in the four lines removed here.
+	//
+	// FIRST — THE PREMISE IS FALSE. RealDebrid emits `451 infringing_file` under
+	// add-throttle conditions for content that does not exist. Measured against
+	// the live account, decypharr out of the path: of 12 RANDOM synthetic
+	// infohashes — values that cannot correspond to any torrent anywhere — FOUR
+	// came back 451 and eight came back 429, and a single nonexistent hash
+	// offered repeatedly drew 429, 429, 451, 429 at twenty-second spacing. A
+	// takedown record cannot exist for a random hash, so on this endpoint 451
+	// and 429 are the same signal wearing different numbers: "not right now".
+	//
+	// SECOND — IT WAS A SUBSTRING SCAN, so it did not even test what it claimed.
+	// `strings.Contains(text, "451")` matches the digits ANYWHERE in the
+	// formatted error: inside an infohash, a byte count, a torrent id, a
+	// timestamp. Roughly one hex infohash in a hundred contains "451"
+	// somewhere, so about 1% of ALL declines were parked for six hours
+	// regardless of what actually happened to them. That is the same
+	// match-by-text defect this codebase has now hit five times, and the fifth
+	// one was sitting in the function whose entire job is to preserve a class.
+	//
+	// WHAT REPLACES IT: nothing. Permanent requires a positive, typed,
+	// release-specific signal, and no such signal exists on the add path today
+	// — the only typed content verdict in the RealDebrid client (code 35 ->
+	// NewContentTakedownError) is raised in fetchDownloadLink, when minting a
+	// link for a named file, not when offering a hash. If a trustworthy add-time
+	// verdict is ever found, it gets a sentinel and an errors.Is test here.
+	//
+	// The asymmetry stated above decides the default, and it decides it the
+	// same way it always did: a transient misclassification costs one more
+	// attempt after a bounded backoff, a permanent one parks a good release for
+	// six hours. Under a throttle that returns 451 at random, defaulting to
+	// permanent parks the library.
 	return declineTransient
 }

@@ -292,23 +292,37 @@ func New(options ...ClientOption) *Client {
 			return false, ctx.Err()
 		}
 
-		// First use the default retry policy for error handling
-		// This handles the case when resp is nil (network errors)
-		shouldRetry, defaultErr := retryablehttp.DefaultRetryPolicy(ctx, resp, err)
-		if defaultErr != nil {
-			return false, defaultErr
+		// 🔴 THE STATUS LIST IS AUTHORITATIVE. IT USED TO BE ADDITIVE, WHICH
+		// MADE IT IMPOSSIBLE TO TURN A RETRY OFF.
+		//
+		// DefaultRetryPolicy was consulted FIRST and retries 429 and 5xx on its
+		// own, so the configured list could only ever ADD codes. Removing 429
+		// from a client's list — the obvious way to stop retrying a rate limit —
+		// changed nothing at all, and did so silently.
+		//
+		// That mattered because retrying a 429 is actively harmful on
+		// RealDebrid: its limit is global across every endpoint and refused
+		// requests count toward it, so each retry spends the budget that decides
+		// the next answer. Measured live, an add refusal comes back in ~0.15s
+		// while decypharr took a median 205s to record the verdict — six
+		// requests separated by a backoff capped at 30s, holding a worker
+		// through the short bursts of capacity it was waiting for.
+		//
+		// A transport failure has no status to consult, so DefaultRetryPolicy
+		// still decides those. A response that arrived is judged ONLY by the
+		// configured list — which by default still carries 429 and the 5xx set,
+		// so every client that does not override it behaves exactly as before.
+		if resp == nil || err != nil {
+			shouldRetry, defaultErr := retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+			if defaultErr != nil {
+				return false, defaultErr
+			}
+			return shouldRetry, nil
 		}
-		if shouldRetry {
+
+		if _, ok := client.retryableStatus[resp.StatusCode]; ok {
 			return true, nil
 		}
-
-		// Check for retryable status codes (only if resp is not nil)
-		if resp != nil {
-			if _, ok := client.retryableStatus[resp.StatusCode]; ok {
-				return true, nil
-			}
-		}
-
 		return false, nil
 	}
 

@@ -79,7 +79,35 @@ func New(dc config.Debrid, ratelimits map[string]ratelimit.Limiter) (*RealDebrid
 		request.WithHeaders(headers),
 		request.WithMaxRetries(cfg.Retries),
 		request.WithRateLimiter(ratelimits["main"]),
-		request.WithRetryableStatus(http.StatusTooManyRequests),
+		// 🛑 429 IS NOT RETRIED HERE, AND RETRYING IT WAS THE STORM'S ENGINE.
+		//
+		// This listed 429 as the ONLY retryable status, so RealDebrid's answer
+		// to "you are asking too fast" was met with up to cfg.Retries more
+		// requests, spaced by a backoff capped at 30s each. add_pacer.go has
+		// carried the reason that is wrong since it was written:
+		//
+		//	RealDebrid 250 requests/minute, GLOBAL across every endpoint.
+		//	⚠️ Refused requests COUNT TOWARD THE LIMIT. Retrying into a 429
+		//	therefore makes the situation strictly worse — which is exactly how
+		//	the measured storm sustained itself.
+		//
+		// The code did the opposite of its own research. Measured on the live
+		// account with decypharr out of the path, RealDebrid answers an add
+		// refusal in ~0.15s — while the median time from add attempt to
+		// recorded verdict inside decypharr was 205s. Nearly all of that was
+		// this backoff: a worker held for minutes re-asking a question already
+		// answered, spending the budget that decides the next answer.
+		//
+		// It also made us miss the openings. RealDebrid grants add capacity in
+		// short bursts, and a worker asleep in a 30s backoff sleeps through them.
+		//
+		// An EMPTY list, not the default set — the default includes 429 as well.
+		// Network failures and 5xx still retry; retryablehttp's own policy covers
+		// those and is untouched. A 429 now returns immediately as
+		// RateLimitedError, the classifier holds the entry, and the add pacer
+		// slows the LANE, which is the layer that can pace without holding a
+		// worker hostage.
+		request.WithRetryableStatus(),
 		request.WithProxy(dc.Proxy),
 	}
 
