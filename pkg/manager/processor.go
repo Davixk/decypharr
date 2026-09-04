@@ -288,7 +288,41 @@ func newTorrentQueueEntry(importReq *ImportRequest, status debridTypes.TorrentSt
 // failure, not a verdict about capacity, so it must not manufacture a refusal:
 // declining an add because we could not reach an endpoint is the same mistake
 // as condemning a release because a probe timed out.
-func admitToProvider(db common.Client, providerName string) error {
+// 🔴 AND A PROVIDER AT ITS STORED-ITEM CAP IS TURNED AWAY WITHOUT ASKING.
+//
+// This is the fix for the fork.77 outage, and it is the cheapest one available:
+// the goroutine dump showed 151 of 176 workers queued for a rate-limit token on
+// AllDebrid — every one of them waiting to submit an add to an account holding
+// 4,998 of 4,998 items, which refuses deterministically. The whole pool was
+// spending itself on work whose answer was already known.
+//
+// The cap check runs BEFORE GetAvailableSlots on purpose. It costs no request
+// and no token: the fill comes from the shared cache that collapses a storm of
+// reads into one enumeration per TTL. Asking the provider whether it has room,
+// when we already know it does not, is exactly the request that saturated the
+// queue.
+//
+// It answers with the provider's OWN quota sentinel rather than a bespoke one,
+// so classifyQuotaRefusal resolves it against this account's cap and fill and
+// reaches the same verdict it would have reached after a real submission —
+// permanent at cap, transient below it. Skipping the request must not change
+// the classification, only its cost.
+//
+// ⚠️ THE CAP HAS TO BE RIGHT OR THIS IS INERT. The comparison is exact, so an
+// account refusing at 4,998 against a configured 5,000 never trips it and every
+// item pays the full doomed submission. That is not hypothetical — it is what
+// the live deployment did for days, until max_magnets was set to the measured
+// ceiling.
+func (m *Manager) admitToProvider(db common.Client, providerName string) error {
+	cfg := db.Config()
+	if capacity, capped := cfg.MagnetCap(); capped {
+		if fill, known := m.providerFill(providerName); known && fill >= capacity {
+			return providerStageError(providerName, "admission", fmt.Errorf(
+				"%w: %s is storing %d of its %d items, so an add cannot be accepted",
+				customerror.ProviderAddQuotaExhaustedError, providerName, fill, capacity))
+		}
+	}
+
 	slots, err := db.GetAvailableSlots()
 	switch {
 	case errors.Is(err, debridTypes.ErrAvailableSlotsUnknown):
@@ -780,7 +814,7 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		//
 		// This never blocks. Waiting here for capacity would rebuild, one level
 		// down, exactly the head-of-line blocking this layer exists to remove.
-		if err := admitToProvider(db, providerName); err != nil {
+		if err := m.admitToProvider(db, providerName); err != nil {
 			errs = append(errs, err)
 			logDebridAttemptFailure(db.Logger(), providerName, "admission", importRequest.Magnet.InfoHash, err)
 			continue

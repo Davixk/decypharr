@@ -120,13 +120,38 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	}
 	c.headersMu.RUnlock()
 
-	// Apply rate limiting
+	// Apply rate limiting.
+	//
+	// 🔴 Take() HAS NO CONTEXT AND CANNOT BE CANCELLED, which is why this is not
+	// simply a call. The old form checked the context once and then blocked
+	// unconditionally, so a caller whose request had already been abandoned —
+	// an *arr that hung up, a shutdown in progress — still waited its full turn
+	// in a queue it no longer had any reason to be in.
+	//
+	// That is harmless while demand sits below the limiter's rate and fatal
+	// above it: the queue grows without bound, every waiter blocks forever, and
+	// because the qBittorrent add path is synchronous the *arr sees a hung
+	// connection rather than an answer. Observed in production on fork.77, with
+	// the process at 0.28% CPU — nothing was working, everything was waiting.
+	//
+	// Waiting in a goroutine lets the caller leave. The goroutine still finishes
+	// when its turn arrives, so the limiter's pacing is unchanged and no token
+	// is skipped; what changes is that an abandoned request stops occupying the
+	// caller.
 	if c.rateLimiter != nil {
-		select {
-		case <-req.Context().Done():
-			return nil, req.Context().Err()
-		default:
+		ctx := req.Context()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		ready := make(chan struct{})
+		go func() {
 			c.rateLimiter.Take()
+			close(ready)
+		}()
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 
