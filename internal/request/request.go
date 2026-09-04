@@ -35,6 +35,7 @@ type Client struct {
 	client          *retryablehttp.Client
 	httpClient      *http.Client // underlying http client
 	rateLimiter     ratelimit.Limiter
+	rateWaitCeiling time.Duration
 	headers         map[string]string
 	headersMu       sync.RWMutex
 	maxRetries      int
@@ -56,6 +57,25 @@ func WithMaxRetries(maxRetries int) ClientOption {
 func WithTimeout(timeout time.Duration) ClientOption {
 	return func(c *Client) {
 		c.timeout = timeout
+	}
+}
+
+// defaultRateWaitCeiling bounds how long ANY single call will queue for a
+// rate-limit token before giving up with a typed transient error.
+//
+// Sized against the *arr, not the provider: the qBittorrent add runs the
+// provider walk synchronously, sonarr gives up at 60s, and a chain can visit
+// more than one provider. Ten seconds keeps the worst realistic case inside
+// that budget while still absorbing ordinary pacing, which at 250/min is a
+// 240ms gap — three orders of magnitude below this.
+//
+// Zero disables the ceiling, for callers that genuinely want to wait.
+const defaultRateWaitCeiling = 10 * time.Second
+
+// WithRateWaitCeiling overrides how long a call may queue for a token.
+func WithRateWaitCeiling(d time.Duration) ClientOption {
+	return func(c *Client) {
+		c.rateWaitCeiling = d
 	}
 }
 
@@ -128,16 +148,30 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// an *arr that hung up, a shutdown in progress — still waited its full turn
 	// in a queue it no longer had any reason to be in.
 	//
-	// That is harmless while demand sits below the limiter's rate and fatal
-	// above it: the queue grows without bound, every waiter blocks forever, and
-	// because the qBittorrent add path is synchronous the *arr sees a hung
-	// connection rather than an answer. Observed in production on fork.77, with
-	// the process at 0.28% CPU — nothing was working, everything was waiting.
-	//
 	// Waiting in a goroutine lets the caller leave. The goroutine still finishes
 	// when its turn arrives, so the limiter's pacing is unchanged and no token
 	// is skipped; what changes is that an abandoned request stops occupying the
 	// caller.
+	//
+	// 🔴 BUT CANCELLATION ALONE DOES NOT SAVE THIS — THE CEILING IS THE FIX.
+	//
+	// Most provider calls are built with http.NewRequest and carry
+	// context.Background(), so there is nothing to cancel: a caller can be stuck
+	// here forever underneath a perfectly correct select. The real defect is not
+	// that the wait is uncancellable, it is that the queue has NO BOUND.
+	//
+	// On fork.77, 151 of 176 workers were asleep in Take() against one provider.
+	// The pool was exhausted, the synchronous qBittorrent add handler was never
+	// serviced, and the *arrs saw a dead download client while the process idled
+	// at 0.28% CPU — nothing working, everything waiting.
+	//
+	// A ceiling turns that unbounded park into a fast, typed answer. Waiting
+	// longer than this cannot help: if we are this far behind the configured
+	// rate, the provider is not going to accept this request in time to matter,
+	// and RateLimitedError is exactly what the situation is. The classifier
+	// already treats it as transient and HOLDS the entry, so nothing is refused
+	// on the strength of our own congestion — the item waits in decypharr's
+	// queue, where waiting is free, instead of in a token queue holding a worker.
 	if c.rateLimiter != nil {
 		ctx := req.Context()
 		if err := ctx.Err(); err != nil {
@@ -148,10 +182,21 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			c.rateLimiter.Take()
 			close(ready)
 		}()
+
+		var ceiling <-chan time.Time
+		if c.rateWaitCeiling > 0 {
+			timer := time.NewTimer(c.rateWaitCeiling)
+			defer timer.Stop()
+			ceiling = timer.C
+		}
+
 		select {
 		case <-ready:
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-ceiling:
+			return nil, fmt.Errorf("%w: waited %s for a rate-limit token without reaching the front of the queue",
+				customerror.RateLimitedError, c.rateWaitCeiling)
 		}
 	}
 
@@ -246,8 +291,9 @@ func classSpecs(raw map[string]string) map[netbind.Class]string {
 // New creates a new HTTP client with the specified options
 func New(options ...ClientOption) *Client {
 	client := &Client{
-		maxRetries:    5,
-		skipTLSVerify: true,
+		maxRetries:      5,
+		rateWaitCeiling: defaultRateWaitCeiling,
+		skipTLSVerify:   true,
 		retryableStatus: map[int]struct{}{
 			http.StatusTooManyRequests:     {},
 			http.StatusInternalServerError: {},
@@ -285,7 +331,7 @@ func New(options ...ClientOption) *Client {
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: client.skipTLSVerify,
 			},
-			DialContext: binder.DialContext(netbind.ClassDefault, 30*time.Second, 15*time.Second),
+			DialContext:           binder.DialContext(netbind.ClassDefault, 30*time.Second, 15*time.Second),
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
 			IdleConnTimeout:       30 * time.Second,
