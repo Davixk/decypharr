@@ -43,6 +43,8 @@ func newSyncRefusalManager(t *testing.T, client *fakeDebridClient) *Manager {
 		storage:           store,
 		queue:             newQueue(store, ""),
 		clients:           clientMap,
+		slotCache:         newProviderSlotCache(),
+		fillCache:         newProviderFillCache(),
 		config:            cfg,
 		logger:            zerolog.Nop(),
 		ctx:               context.Background(),

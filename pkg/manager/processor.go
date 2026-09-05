@@ -323,7 +323,33 @@ func (m *Manager) admitToProvider(db common.Client, providerName string) error {
 		}
 	}
 
-	slots, err := db.GetAvailableSlots()
+	// 🔑 MEMOIZED, BECAUSE THIS PROBE WAS HALF THE OUTAGE.
+	//
+	// Every provider visit made two limiter-gated calls — this probe, then the
+	// submit — and each can wait up to the token-wait ceiling. One add therefore
+	// cost 2x the ceiling before anything else went wrong: 20s against a 10s
+	// ceiling, with the *arr giving up at 25s. Reproduced off-production at
+	// 2.02x the ceiling against production's 2.5x.
+	//
+	// Collapsing this to one probe per TTV per provider halves the gated waits
+	// in the synchronous path. See providerSlotCache for why a stale read is
+	// safe here — this function's own comment already said so.
+	// ⚠️ THE FALLBACK KEYS ON THE CACHE BEING ABSENT, NOT ON ITS ANSWER.
+	//
+	// Keying it on "the cache did not know" silently defeated the whole thing:
+	// a provider that refuses the probe caches known=false, and every later
+	// caller then read that as "no cache" and issued the direct call anyway. The
+	// memoization was live, correct, and bypassed — the load harness measured
+	// exactly the same 2x ceiling with it in place as without.
+	var (
+		slots int
+		err   error
+	)
+	if m.slotCache != nil {
+		slots, _, err = m.slotCache.slots(providerName, db, time.Now())
+	} else {
+		slots, err = db.GetAvailableSlots()
+	}
 	switch {
 	case errors.Is(err, debridTypes.ErrAvailableSlotsUnknown):
 		return nil

@@ -32,14 +32,18 @@ import (
 
 // Manager handles unified torrent management - replaces wire.Store completely
 type Manager struct {
-	storage      *storage.Storage
-	migrator     *Migrator
-	repair       *Repair
-	clients      *xsync.Map[string, debrid.Client]
+	storage  *storage.Storage
+	migrator *Migrator
+	repair   *Repair
+	clients  *xsync.Map[string, debrid.Client]
 	// fillCache memoizes per-provider stored-item counts, used to tell
 	// AllDebrid's transient daily allowance apart from its permanent
 	// stored-item cap. Both raise the same error code.
-	fillCache    *providerFillCache
+	fillCache *providerFillCache
+	// slotCache memoizes per-provider FREE-SLOT counts. Separate from fillCache
+	// because they answer different questions on different timescales: stored
+	// items move slowly, free slots move every time a download finishes.
+	slotCache *providerSlotCache
 	// capacityHold holds grabs accepted at add time that no provider had room
 	// for yet. Drained on slot-free events and by the per-provider admission
 	// controller — never by a per-entry timer.
@@ -51,7 +55,7 @@ type Manager struct {
 	// progress remembers where each in-flight provider transfer had got to, so
 	// the stall sweep can measure an absence of movement instead of inferring it
 	// from a lifetime average that flatters anything that started fast.
-	progress        *progressTracker
+	progress *progressTracker
 	// pendingAdds records submitted infohashes so an ambiguous outcome can be
 	// settled by asking the provider, rather than losing a transfer we started.
 	pendingAdds   *pendingAddLedger
@@ -67,17 +71,17 @@ type Manager struct {
 	// livePrunes rate-limits the DELETIONS that happen on a read rather than
 	// inside a repair run — confirmed debrid takedowns and confirmed usenet dead
 	// articles. repairDeletionBudget cannot reach those: there is no run.
-	livePrunes      *livePruneBudget
-	arr             *arr.Storage
-	logger       zerolog.Logger
-	ready        chan struct{}
-	readyOnce    sync.Once
+	livePrunes *livePruneBudget
+	arr        *arr.Storage
+	logger     zerolog.Logger
+	ready      chan struct{}
+	readyOnce  sync.Once
 	// restoreDone is closed when the backgrounded boot restore finishes. See
 	// WaitForRestore for why callers that seed entries right after construction
 	// need it.
 	restoreDone     chan struct{}
 	restoreDoneOnce sync.Once
-	streamClient *http.Client
+	streamClient    *http.Client
 
 	// Migration jobs tracking
 	migrationJobs   *xsync.Map[string, *storage.SwitcherJob]
@@ -228,6 +232,7 @@ func New() *Manager {
 		storage:                strg,
 		clients:                xsync.NewMap[string, debrid.Client](),
 		fillCache:              newProviderFillCache(),
+		slotCache:              newProviderSlotCache(),
 		providerOrphans:        newProviderOrphanTracker(),
 		progress:               newProgressTracker(),
 		pendingAdds:            newPendingAddLedger(),
