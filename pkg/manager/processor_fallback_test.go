@@ -155,8 +155,8 @@ func (f *fakeDebridClient) slotQueries() int {
 	defer f.mu.Unlock()
 	return f.slotCalls
 }
-func (f *fakeDebridClient) SyncAccounts()                                   {}
-func (f *fakeDebridClient) DeleteLink(debridTypes.DownloadLink) error       { return nil }
+func (f *fakeDebridClient) SyncAccounts()                             {}
+func (f *fakeDebridClient) DeleteLink(debridTypes.DownloadLink) error { return nil }
 func (f *fakeDebridClient) SpeedTest(context.Context) debridTypes.SpeedTestResult {
 	return debridTypes.SpeedTestResult{}
 }

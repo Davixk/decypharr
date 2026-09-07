@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,6 +20,32 @@ import (
 )
 
 // AddNewTorrent submits a torrent to debrid before entering the active-download queue.
+//
+// 🔴 IT ANSWERS THE *ARR ON A BOUNDED WINDOW, THEN FINISHES IN THE BACKGROUND.
+//
+// This runs the provider walk inside the qBittorrent HTTP handler, and that is
+// what turned provider slowness into an *arr-visible outage three times:
+// fork.77, .78 and .79 each hung the write path, sonarr reported "Failed to
+// connect to qBittorrent, Http request timed out", and it acquired nothing at
+// all while the process sat idle waiting on a token queue.
+//
+// ⚠️ BUT MAKING IT FULLY ASYNCHRONOUS WOULD BE THE WRONG TRADE, and it is worth
+// writing down why, because "just make it async" is the obvious answer. The
+// operator's economics are explicit: a synchronous refusal costs the *arr ONE
+// candidate from a ranked list it is still holding, while a failure after
+// acceptance costs a whole new search across every indexer. Answering every add
+// with "queued" would convert every content refusal into that expensive shape.
+//
+// So the window is short and the answer is kept whenever it arrives in time:
+//
+//	verdict within addSyncWindow -> answered synchronously, refusal stays cheap
+//	still working after that     -> accepted as queued, resolution continues
+//
+// EXACTLY ONE SIDE DECIDES, via a compare-and-swap. Without it there is a race
+// where the handler times out and answers "accepted" while the resolver is
+// already deleting the reservation for a refusal — the *arr would be told its
+// grab was taken and then find no row at all. Whoever swaps first owns the
+// outcome; the loser adapts.
 func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) error {
 	if importReq == nil || importReq.Magnet == nil {
 		return fmt.Errorf("magnet is required")
@@ -29,9 +56,58 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 
 	torrent := newTorrentQueueEntry(importReq, debridTypes.TorrentStatusQueued)
 	if err := m.queue.Add(torrent); err != nil {
+		// Reserving the row is local and fast, so its failure stays synchronous.
 		return fmt.Errorf("failed to reserve torrent queue entry: %w", err)
 	}
 
+	// 🛑 EVERYTHING THE HANDLER WILL EVER NEED FROM THE ENTRY IS COPIED HERE.
+	//
+	// The resolver takes ownership the instant that goroutine starts — it calls
+	// BeginAction, which refreshes the entry in place — so any later read of
+	// `torrent` from this side is a data race. It is not theoretical: the first
+	// version of this function logged torrent.InfoHash and torrent.Name on the
+	// timeout path, and -race caught both reads against RefreshSnapshot's write.
+	// The comment below already said the goroutine owns the entry; the code did
+	// not, one line later.
+	hash, name := torrent.InfoHash, torrent.Name
+
+	var answered atomic.Bool
+	done := make(chan error, 1)
+	go func() {
+		done <- m.resolveAddWithProviders(ctx, importReq, torrent, &answered)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(addSyncWindow):
+		if !answered.CompareAndSwap(false, true) {
+			// The resolver got there first; its answer is authoritative and is
+			// already on the channel.
+			return <-done
+		}
+		m.logger.Debug().
+			Str("hash", hash).
+			Str("name", name).
+			Dur("window", addSyncWindow).
+			Msg("No provider verdict within the synchronous window; acknowledging the grab as queued and " +
+				"resolving in the background")
+		return nil
+	}
+}
+
+// resolveAddWithProviders walks the provider chain and settles the entry.
+//
+// answered is the shared decision: if it is already set, this function is
+// running after the *arr was told the grab was accepted, so a refusal has to
+// leave a FAILED row the *arr can see on its next poll rather than deleting the
+// reservation out from under it.
+func (m *Manager) resolveAddWithProviders(
+	ctx context.Context,
+	importReq *ImportRequest,
+	torrent *storage.Entry,
+	answered *atomic.Bool,
+) error {
 	var debridTorrent *debridTypes.Torrent
 	err := func() error {
 		admissionCtx, release, err := m.queue.BeginAction(ctx, torrent)
@@ -98,6 +174,33 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 		if reason == "" {
 			reason = refusalReason(err)
 		}
+
+		// 🛑 A REFUSAL AFTER THE *ARR WAS ANSWERED MUST NOT DELETE THE ROW.
+		//
+		// The synchronous refusal works by leaving nothing behind: the *arr gets
+		// a 400, takes its next candidate, and there is no corpse. That is only
+		// correct while the *arr is still on the line. Once it has been told the
+		// grab was accepted, deleting the reservation makes the row silently
+		// vanish — the *arr believes it has a download that no longer exists
+		// anywhere, which is the one outcome worse than either answer.
+		//
+		// So past the window a refusal becomes a FAILED row, which is what the
+		// *arr polls for and can act on. Same verdict, delivered by the only
+		// channel still open.
+		if !answered.CompareAndSwap(false, true) {
+			torrent.MarkAsError(fmt.Errorf("%s: %w", reason, err))
+			if updateErr := m.queue.Update(torrent); updateErr != nil {
+				m.logger.Error().Err(updateErr).
+					Str("infohash", torrent.InfoHash).
+					Msg("Could not record a post-acknowledgement refusal; the arr may keep waiting on this row")
+			}
+			m.logger.Info().
+				Str("infohash", torrent.InfoHash).
+				Str("name", torrent.Name).
+				Msgf("Refused after acknowledging the grab; failing the row so the arr can re-search: %s", reason)
+			return nil
+		}
+
 		if deleted, deleteErr := m.queue.DeleteCurrent(torrent, nil); deleteErr != nil {
 			return errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("delete failed reservation: %w", deleteErr), err)
 		} else if !deleted {
@@ -346,7 +449,24 @@ func (m *Manager) admitToProvider(db common.Client, providerName string) error {
 		err   error
 	)
 	if m.slotCache != nil {
-		slots, _, err = m.slotCache.slots(providerName, db, time.Now())
+		var known bool
+		slots, known, err = m.slotCache.slots(providerName, db, time.Now())
+
+		// 🛑 A CACHED FAILED PROBE IS "WE DO NOT KNOW", NOT "ZERO FREE SLOTS".
+		//
+		// The cache stores a failed probe as slots=0, known=false, and the
+		// slots<=0 branch below would then read that zero as the provider being
+		// full — manufacturing a refusal out of a question we failed to ask, and
+		// doing it for the whole TTL without a single request going out.
+		//
+		// That inverts this function's own rule, stated directly above: an error
+		// asking is OUR failure, not a verdict about capacity. It also hid the
+		// bug that found it — the load harness looked fast because adds were
+		// being declined at admission with no provider call at all, which is a
+		// very convincing way to pass a latency test while doing nothing.
+		if !known && err == nil {
+			return nil
+		}
 	} else {
 		slots, err = db.GetAvailableSlots()
 	}

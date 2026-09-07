@@ -12,11 +12,11 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	"github.com/sirrobot01/decypharr/pkg/storage"
-	"github.com/puzpuzpuz/xsync/v4"
 )
 
 // ARR-DELETE used to mean one thing — "delete the arr file record, blocklist the

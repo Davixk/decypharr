@@ -95,8 +95,8 @@ type ProviderOrphaned struct {
 }
 
 type providerOrphanTracker struct {
-	mu        sync.Mutex
-	checkedAt time.Time
+	mu         sync.Mutex
+	checkedAt  time.Time
 	byProvider map[string]ProviderOrphaned
 }
 

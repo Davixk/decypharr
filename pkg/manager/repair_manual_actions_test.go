@@ -155,8 +155,8 @@ func TestFixBrokenOmittedFallsBackToConfigured(t *testing.T) {
 		m, r, _, _ := newRepairCapFixture(t, 0)
 		off := false
 		cfg := config.Get()
-		cfg.Repair.Repair = &off  // REPAIR off
-		cfg.Repair.Prune = false  // PRUNE off
+		cfg.Repair.Repair = &off    // REPAIR off
+		cfg.Repair.Prune = false    // PRUNE off
 		cfg.Repair.ArrDelete = &off // ARR-DELETE off
 		seedBrokenEntry(t, m, "fbcfg-a", "FbCfgA")
 

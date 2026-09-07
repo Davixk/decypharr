@@ -124,8 +124,8 @@ type fileResult struct {
 
 // Component names used as EntryHealth.ActionSkips keys.
 const (
-	componentRepair = "repair"
-	componentPrune  = "prune"
+	componentRepair    = "repair"
+	componentPrune     = "prune"
 	componentArrDelete = "arr_delete"
 	componentEnumerate = "enumerate"
 )
@@ -314,7 +314,6 @@ func (r *Repair) executeSweep(ctx context.Context, run *storage.RepairRun, opts 
 		Int("repair_skipped_unsupported", run.Stats.RepairSkippedUnsupported).
 		Int("pruned", run.Stats.Pruned).
 		Int("prune_skipped_not_eligible", run.Stats.PruneSkippedNotEligible).
-		
 		Int("arr_deleted", run.Stats.ArrDeleted).
 		Int("arr_blocklisted", run.Stats.ArrBlocklisted).
 		Int("arr_searched", run.Stats.ArrSearched).
@@ -2598,7 +2597,6 @@ func (r *Repair) FixBroken(ctx context.Context, names []string, sel *ManualActio
 			Int("repair_skipped_unsupported", run.Stats.RepairSkippedUnsupported).
 			Int("pruned", run.Stats.Pruned).
 			Int("prune_skipped_not_eligible", run.Stats.PruneSkippedNotEligible).
-			
 			Int("arr_deleted", run.Stats.ArrDeleted).
 			Int("arr_blocklisted", run.Stats.ArrBlocklisted).
 			Int("arr_searched", run.Stats.ArrSearched).
@@ -2816,7 +2814,6 @@ func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun
 		Int("broken", run.Stats.Broken).
 		Int("reacquired", run.Stats.Reacquired).
 		Int("pruned", run.Stats.Pruned).
-		
 		Str("actions", actions.label()).
 		Msg("RecheckMedia: completed")
 }

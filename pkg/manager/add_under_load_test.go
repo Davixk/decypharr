@@ -10,10 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"errors"
+
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/request"
 	"github.com/sirrobot01/decypharr/pkg/arr"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/sirrobot01/decypharr/pkg/storage"
 	"go.uber.org/ratelimit"
 )
 
@@ -91,12 +94,36 @@ func (c *loadDebridClient) GetAvailableSlots() (int, error) {
 }
 
 func newLoadFixture(t *testing.T) (*Manager, *loadDebridClient) {
+	return newLoadFixtureWithCeiling(t, loadReproCeiling)
+}
+
+// newLoadFixtureWithCeiling lets a test choose how long a token wait may run.
+// The async-window test needs a ceiling LONGER than the window, or the resolver
+// finishes first and the window bounds nothing — which is exactly how the first
+// version of that test passed with the window disabled.
+func newLoadFixtureWithCeiling(t *testing.T, ceiling time.Duration) (*Manager, *loadDebridClient) {
+	return newLoadFixtureOpts(t, ceiling, 0)
+}
+
+// newLoadFixtureOpts adds a provider RESPONSE DELAY.
+//
+// The window test needs resolution to reliably outlast the window, and the
+// token queue cannot be trusted to deliver that: go.uber.org/ratelimit's Take()
+// is a mutex and a sleep, not a FIFO queue, so a fresh caller is not reliably
+// stuck behind the crowd at test-scale contention. The first version of that
+// test passed with the window DISABLED for exactly this reason, and the negative
+// control is what exposed it. A slow provider makes "resolution outlasts the
+// window" deterministic instead of probabilistic.
+func newLoadFixtureOpts(t *testing.T, ceiling, serverDelay time.Duration) (*Manager, *loadDebridClient) {
 	t.Helper()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The provider answers instantly. Measured against the live account,
-		// RealDebrid refuses an add in ~0.15s — it is not slow, and every
-		// second the add path spends is ours.
+		// Instant by default: measured against the live account, RealDebrid
+		// refuses an add in ~0.15s — it is not slow, and every second the add
+		// path spends is ours.
+		if serverDelay > 0 {
+			time.Sleep(serverDelay)
+		}
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	t.Cleanup(server.Close)
@@ -117,7 +144,7 @@ func newLoadFixture(t *testing.T) (*Manager, *loadDebridClient) {
 	client.http = request.New(
 		// Arrivals must outrun the bucket, which is the whole condition.
 		request.WithRateLimiter(ratelimit.New(10, ratelimit.Per(time.Second))),
-		request.WithRateWaitCeiling(loadReproCeiling),
+		request.WithRateWaitCeiling(ceiling),
 		request.WithRetryableStatus(),
 		request.WithTimeout(30*time.Second),
 	)
@@ -185,5 +212,120 @@ func TestAddStaysResponsiveUnderSustainedArrivalPressure(t *testing.T) {
 			"consumes the token when its turn arrives. The waiters are bounded; the WASTE is not, so a live "+
 			"caller queues behind a crowd of ghosts. Provider calls made: %d",
 			elapsed, limit, 2, loadReproCeiling, client.calls.Load())
+	}
+}
+
+// 🎯 THE (c) CONTRACT: the handler answers on ITS OWN clock, not the provider's.
+//
+// The three production hangs all had the same shape — the *arr's connection was
+// held open for the provider walk, so provider trouble became *arr-visible
+// outage. Bounding the token wait made the walk finish; it did not stop the
+// *arr from waiting for it.
+//
+// With the window in place the add returns regardless of what the providers are
+// doing, and resolution continues in the background. The window here is set
+// SHORTER than the provider can possibly answer, so this exercises the
+// background path specifically rather than happening to be fast.
+func TestAddAnswersWithinTheSyncWindowUnderLoad(t *testing.T) {
+	originalWindow := addSyncWindow
+	addSyncWindow = 50 * time.Millisecond
+	t.Cleanup(func() { addSyncWindow = originalWindow })
+
+	// The ceiling must exceed the window, or the resolver answers first and this
+	// test proves nothing — the negative control caught exactly that.
+	m, _ := newLoadFixtureOpts(t, 2*time.Second, 400*time.Millisecond)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range loadReproConcurrency {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for seq := 0; ; seq++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = m.AddNewTorrent(context.Background(), loadRequest(fmt.Sprintf("%040x", 500000+n*100000+seq)))
+			}
+		}(i)
+	}
+	t.Cleanup(func() { close(stop); wg.Wait() })
+
+	time.Sleep(1500 * time.Millisecond)
+
+	start := time.Now()
+	err := m.AddNewTorrent(context.Background(), loadRequest("00000000000000000000000000000000cafebabe"))
+	elapsed := time.Since(start)
+
+	// Accepted, because no verdict arrived inside the window.
+	if err != nil {
+		t.Fatalf("the add was refused (%v) despite no provider answering within the window; a verdict we did "+
+			"not receive is not a verdict about the release", err)
+	}
+	if limit := 3 * addSyncWindow; elapsed >= limit {
+		t.Fatalf("the add took %v, at or beyond %v. The handler is still waiting on the provider walk, which "+
+			"is the shape that took the write path down three times", elapsed, limit)
+	}
+	// And it is well inside the token ceiling, which is the number the old code
+	// was bounded by and the *arr was still timing out against.
+	if elapsed >= 2*time.Second {
+		t.Fatalf("the add took %v, at or beyond the %v token ceiling; the window is not what is bounding it",
+			elapsed, 2*time.Second)
+	}
+}
+
+// 🛑 A REFUSAL AFTER ACKNOWLEDGEMENT LEAVES A FAILED ROW, NEVER A VANISHED ONE.
+//
+// The synchronous refusal works by leaving nothing behind — the *arr takes its
+// next candidate and there is no corpse. Past the window that becomes the worst
+// available outcome: the *arr was told the grab was accepted, so deleting the
+// reservation makes its download disappear with no record anywhere.
+func TestPostAcknowledgementRefusalLeavesAFailedRow(t *testing.T) {
+	originalWindow := addSyncWindow
+	addSyncWindow = 30 * time.Millisecond
+	t.Cleanup(func() { addSyncWindow = originalWindow })
+
+	// Refuses — a CONTENT refusal, the shape that would normally delete the row
+	// — but only after the window has closed.
+	client := &fakeDebridClient{
+		cfg:      config.Debrid{Name: "primary", Provider: "realdebrid"},
+		recorder: &fallbackCallRecorder{},
+		submitFn: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
+			time.Sleep(200 * time.Millisecond)
+			return nil, errors.New("torrent is not cached and uncached downloads are disabled")
+		},
+	}
+	m := newSyncRefusalManager(t, client)
+	m.capacityHold = newCapacityHoldQueue()
+	m.jobQueue = NewJobQueue(context.Background(), 1, func(context.Context, *Job) {})
+	t.Cleanup(m.jobQueue.Close)
+
+	req := fallbackTestRequest("", false, nil)
+	if err := m.AddNewTorrent(context.Background(), req); err != nil {
+		t.Fatalf("the add should have been acknowledged: %v", err)
+	}
+
+	// Let the background resolution reach its verdict.
+	deadline := time.Now().Add(3 * time.Second)
+	var entry *storage.Entry
+	for time.Now().Before(deadline) {
+		e, err := m.queue.GetTorrent(req.Magnet.InfoHash)
+		if err == nil && e != nil && e.State == storage.EntryStateError {
+			entry = e
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if entry == nil {
+		current, err := m.queue.GetTorrent(req.Magnet.InfoHash)
+		if err != nil || current == nil {
+			t.Fatal("the row was DELETED after the arr was told the grab was accepted. The arr now believes it " +
+				"has a download that exists nowhere, and will wait on it forever")
+		}
+		t.Fatalf("the row never reached a failed state; it is %q/%q, so the arr has no way to learn the "+
+			"release was refused", current.State, current.Status)
 	}
 }

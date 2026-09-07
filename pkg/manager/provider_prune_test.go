@@ -159,7 +159,7 @@ func TestAMomentaryLullDoesNotDelete(t *testing.T) {
 		if age < s.sampleWindow/6 {
 			return 0.60 // the lull
 		}
-		return 0.60 - (age - s.sampleWindow/6).Minutes()*0.002
+		return 0.60 - (age-s.sampleWindow/6).Minutes()*0.002
 	})
 
 	if released := m.pruneProviderStalled(context.Background(), s); released != 0 {

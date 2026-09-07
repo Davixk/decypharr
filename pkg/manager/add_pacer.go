@@ -246,3 +246,21 @@ func (p *addPacer) rates(provider string) (budgetPerMin, currentPerMin float64) 
 	lane := p.laneLocked(provider)
 	return lane.budget * 60, lane.rate * 60
 }
+
+// addSyncWindow is how long the qBittorrent add handler waits for a provider
+// verdict before acknowledging the grab as queued and finishing in the
+// background.
+//
+// Sized from the two economics that pull in opposite directions. A synchronous
+// refusal is worth having — it costs the *arr one candidate from a list it is
+// still holding, where a failure after acceptance costs a whole new search — so
+// the window must be long enough to catch the answers that arrive quickly. And
+// the *arr times out, so it must be short enough that the handler never becomes
+// the outage: sonarr gave up at 60s and reported a dead download client three
+// times running.
+//
+// Two seconds sits between them. A provider that is going to refuse promptly
+// does so in ~0.15s measured live, so the cheap refusal is preserved with an
+// order of magnitude to spare; anything slower is congestion, and congestion is
+// exactly the case that must not hold the *arr's connection.
+var addSyncWindow = 2 * time.Second

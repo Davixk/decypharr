@@ -39,14 +39,14 @@ import (
 const providerFillTTL = 3 * time.Minute
 
 type providerFillSnapshot struct {
-	count int
-	known bool
+	count   int
+	known   bool
 	takenAt time.Time
 }
 
 // providerFillCache memoizes per-provider stored-item counts.
 type providerFillCache struct {
-	mu   sync.Mutex
+	mu         sync.Mutex
 	byProvider map[string]providerFillSnapshot
 	inflight   map[string]*sync.WaitGroup
 }
