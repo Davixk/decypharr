@@ -3,9 +3,11 @@ package manager
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/customerror"
+	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
@@ -81,20 +83,31 @@ func TestSkippedAtCapAdmissionStillClassifiesAsPermanent(t *testing.T) {
 	}
 }
 
-// ⚠️ AND BELOW THE CAP NOTHING CHANGES. The skip is for accounts that cannot
-// accept, not a general shortcut — a provider with room must still be asked,
-// or a full account and a busy one become the same thing.
-func TestBelowCapProviderIsStillProbed(t *testing.T) {
+// ⚠️ AND BELOW THE CAP THE PROVIDER IS ADMITTED — WITHOUT BEING ASKED EITHER.
+//
+// This assertion is inverted from what it used to be, deliberately. Admission
+// once probed here, and that probe was half the outage: it and the submit drew
+// from the same token bucket, so one add cost two token waits and the *arr
+// timed out at 25s. Capacity now arrives from a background poller, and NOTHING
+// on the request-serving path may call a provider for any reason.
+//
+// Pinned as a test because it is invisible in review: adding one innocuous
+// probe back into this function reintroduces the whole outage, and every
+// functional test would still pass.
+func TestBelowCapProviderIsAdmittedWithoutAskingIt(t *testing.T) {
 	client := &slotProbeClient{fillClient: fillClient{count: 10}}
 	cfg := config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(4998)}
 	client.cfg = cfg
 	m := newRefusalFixture(t, "ad", cfg, client)
+	seedSlotReading(t, m, "ad", client)
+	client.slotCalls.Store(0)
 
 	if err := m.admitToProvider(client, "ad"); err != nil {
-		t.Fatalf("a provider at 10/4998 was refused admission: %v", err)
+		t.Fatalf("a provider at 10/4998 with free slots was refused admission: %v", err)
 	}
-	if n := client.slotCalls.Load(); n != 1 {
-		t.Fatalf("the provider was probed %d times, want 1; below the cap its own answer is the gate", n)
+	if n := client.slotCalls.Load(); n != 0 {
+		t.Fatalf("admission called the provider %d times. It must read the poller's last reading and "+
+			"never issue a request: that probe is what put 151 of 176 workers in a token queue", n)
 	}
 }
 
@@ -107,14 +120,31 @@ func TestCapOffByTwoLeavesTheSkipInert(t *testing.T) {
 	cfg := config.Debrid{Name: "ad", Provider: "alldebrid", MaxMagnets: intPtr(5000)}
 	client.cfg = cfg
 	m := newRefusalFixture(t, "ad", cfg, client)
+	seedSlotReading(t, m, "ad", client)
+	client.slotCalls.Store(0)
 
 	if err := m.admitToProvider(client, "ad"); err != nil {
 		t.Fatalf("4998 against a cap of 5000 was skipped: %v. The comparison is exact by design, so this "+
 			"must fall through — the fix depends on max_magnets holding the MEASURED ceiling", err)
 	}
-	if n := client.slotCalls.Load(); n != 1 {
-		t.Fatalf("probed %d times, want 1", n)
+	if n := client.slotCalls.Load(); n != 0 {
+		t.Fatalf("admission called the provider %d times; it must never issue a request", n)
 	}
 	_ = debridTypes.TorrentStatusQueued
 	_ = customerror.ProviderAddQuotaExhaustedError
+}
+
+// seedSlotReading stands in for one tick of the background poller.
+//
+// 🛑 IT FAILS LOUDLY ON A FIXTURE WITH NO SLOT CACHE. A nil cache makes
+// admission a silent no-op that admits everything, which is indistinguishable
+// from a passing test — this codebase has already shipped one defect that hid
+// behind exactly that shape.
+func seedSlotReading(t *testing.T, m *Manager, name string, client debrid.Client) {
+	t.Helper()
+	if m.slotCache == nil {
+		t.Fatal("fixture has no slot cache, so admission would admit everything without running any of " +
+			"the code this test names")
+	}
+	m.slotCache.refresh(name, client, time.Now())
 }

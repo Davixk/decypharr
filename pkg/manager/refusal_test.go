@@ -46,6 +46,7 @@ func newRefusalFixture(t *testing.T, name string, cfg config.Debrid, client debr
 	m := newActionLifecycleFixture(t, 2)
 	m.clients = xsync.NewMap[string, debrid.Client]()
 	m.fillCache = newProviderFillCache()
+	m.slotCache = newProviderSlotCache()
 	if fc, ok := client.(*fillClient); ok {
 		fc.cfg = cfg
 	}

@@ -40,9 +40,11 @@ type Manager struct {
 	// AllDebrid's transient daily allowance apart from its permanent
 	// stored-item cap. Both raise the same error code.
 	fillCache *providerFillCache
-	// slotCache memoizes per-provider FREE-SLOT counts. Separate from fillCache
-	// because they answer different questions on different timescales: stored
-	// items move slowly, free slots move every time a download finishes.
+	// slotCache holds per-provider FREE-SLOT readings, refreshed by a background
+	// poller rather than on demand, so admission never waits on a provider.
+	// Separate from fillCache because they answer different questions on
+	// different timescales: stored items move slowly, free slots move every
+	// time a download finishes.
 	slotCache *providerSlotCache
 	// capacityHold holds grabs accepted at add time that no provider had room
 	// for yet. Drained on slot-free events and by the per-provider admission
@@ -802,6 +804,12 @@ func (m *Manager) Start(ctx context.Context) error {
 	// erased by a restart, so it can only be observed from inside the running
 	// process.
 	go m.watchQueueConsistency(ctx)
+
+	// Keep provider capacity current OUT OF BAND, so admission never has to ask
+	// for it. The probe this replaces sat in the qBittorrent add handler behind
+	// the same rate limiter as the submit, which is how one add came to cost
+	// two token waits and how the *arr came to time out at 25s.
+	m.pollProviderSlots(ctx)
 
 	// Start workers
 	if err := m.StartWorker(ctx); err != nil {

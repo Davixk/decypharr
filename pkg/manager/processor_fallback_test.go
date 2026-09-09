@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -181,10 +182,24 @@ func (f *fakeDebridClient) deleted() []string {
 
 func fallbackTestManager(clients ...*fakeDebridClient) *Manager {
 	clientMap := xsync.NewMap[string, common.Client]()
+	m := &Manager{
+		clients:   clientMap,
+		logger:    zerolog.Nop(),
+		slotCache: newProviderSlotCache(),
+		fillCache: newProviderFillCache(),
+	}
 	for _, client := range clients {
 		clientMap.Store(client.cfg.Name, client)
+		// ⚠️ STAND IN FOR ONE POLLER TICK, or these fixtures test nothing.
+		//
+		// Admission no longer probes; it reads whatever the background poller
+		// last published. A fixture that never publishes leaves every provider
+		// in the "no reading yet" state, which ADMITS — so a test asserting a
+		// full provider gets refused would pass for the wrong reason, forever,
+		// while exercising none of the code it names.
+		m.slotCache.refresh(client.cfg.Name, client, time.Now())
 	}
-	return &Manager{clients: clientMap, logger: zerolog.Nop()}
+	return m
 }
 
 func fallbackTestRequest(selected string, fallback bool, downloadUncached *bool) *ImportRequest {

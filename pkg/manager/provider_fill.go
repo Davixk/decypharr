@@ -117,6 +117,37 @@ func (c *providerFillCache) observe(name string, count int, now time.Time) {
 	c.mu.Unlock()
 }
 
+// consume records that we just stored one more item on this provider.
+//
+// 🔴 THE ASYMMETRY THIS CLOSES. Every refresh path here moved the count in the
+// direction that FREES room — invalidate on delete, observe on enumeration —
+// and nothing at all moved it in the direction that CONSUMES room. So a
+// snapshot stayed stale-low for up to the full TTL after a burst of adds, and
+// the cap check read capacity we had already spent ourselves.
+//
+// That bias was deliberate once: freeing-direction refreshes are the ones that
+// prevent inventing a refusal. It is still exactly backwards at the cap, which
+// is the only place this count is ever consulted.
+//
+// ⚠️ takenAt IS NOT ADVANCED. Spending capacity says nothing about how current
+// the underlying enumeration is, so it must not renew its claim to being fresh.
+// An unknown snapshot stays unknown: incrementing a count we never had would
+// invent one, and "the account has room" is the one wrong answer that costs a
+// permanent refusal to add.
+func (c *providerFillCache) consume(name string) {
+	if c == nil || name == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	snap, ok := c.byProvider[name]
+	if !ok || !snap.known {
+		return
+	}
+	snap.count++
+	c.byProvider[name] = snap
+}
+
 // invalidate drops a provider's snapshot so the next read re-enumerates. Used
 // after we delete items on that provider, where waiting out the TTL would keep
 // reporting a cap that is no longer full.

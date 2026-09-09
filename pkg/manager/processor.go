@@ -426,59 +426,40 @@ func (m *Manager) admitToProvider(db common.Client, providerName string) error {
 		}
 	}
 
-	// 🔑 MEMOIZED, BECAUSE THIS PROBE WAS HALF THE OUTAGE.
+	// 🔑 THIS READS A CAPACITY. IT DOES NOT ASK FOR ONE.
 	//
-	// Every provider visit made two limiter-gated calls — this probe, then the
-	// submit — and each can wait up to the token-wait ceiling. One add therefore
-	// cost 2x the ceiling before anything else went wrong: 20s against a 10s
-	// ceiling, with the *arr giving up at 25s. Reproduced off-production at
-	// 2.02x the ceiling against production's 2.5x.
+	// The probe that used to live here was half the outage. It and the submit
+	// each waited on the same token bucket, so one add cost 2x the token-wait
+	// ceiling before anything else went wrong — 20s against a 10s ceiling, with
+	// the *arr giving up at 25s, reproduced off-production at 2.02x.
 	//
-	// Collapsing this to one probe per TTV per provider halves the gated waits
-	// in the synchronous path. See providerSlotCache for why a stale read is
-	// safe here — this function's own comment already said so.
-	// ⚠️ THE FALLBACK KEYS ON THE CACHE BEING ABSENT, NOT ON ITS ANSWER.
+	// Memoizing that probe only made the contention rarer. A background poller
+	// removes it: capacity is refreshed on its own schedule, and this path —
+	// which runs inside the qBittorrent HTTP handler — never blocks on a
+	// provider for any reason at all.
 	//
-	// Keying it on "the cache did not know" silently defeated the whole thing:
-	// a provider that refuses the probe caches known=false, and every later
-	// caller then read that as "no cache" and issued the direct call anyway. The
-	// memoization was live, correct, and bypassed — the load harness measured
-	// exactly the same 2x ceiling with it in place as without.
-	var (
-		slots int
-		err   error
-	)
-	if m.slotCache != nil {
-		var known bool
-		slots, known, err = m.slotCache.slots(providerName, db, time.Now())
-
-		// 🛑 A CACHED FAILED PROBE IS "WE DO NOT KNOW", NOT "ZERO FREE SLOTS".
-		//
-		// The cache stores a failed probe as slots=0, known=false, and the
-		// slots<=0 branch below would then read that zero as the provider being
-		// full — manufacturing a refusal out of a question we failed to ask, and
-		// doing it for the whole TTL without a single request going out.
-		//
-		// That inverts this function's own rule, stated directly above: an error
-		// asking is OUR failure, not a verdict about capacity. It also hid the
-		// bug that found it — the load harness looked fast because adds were
-		// being declined at admission with no provider call at all, which is a
-		// very convincing way to pass a latency test while doing nothing.
-		if !known && err == nil {
-			return nil
-		}
-	} else {
-		slots, err = db.GetAvailableSlots()
-	}
-	switch {
-	case errors.Is(err, debridTypes.ErrAvailableSlotsUnknown):
+	// 🛑 EVERY UNCERTAIN STATE ADMITS, AND THAT IS THE WHOLE RULE HERE.
+	//
+	// No reading yet, a probe that failed, or a reading old enough that the
+	// poller has plainly stalled — each of those means "we do not know", and
+	// not knowing is not a verdict. Refusing on a question we failed to ask is
+	// precisely the defect that shipped in .81: a failed probe stored as zero
+	// was read as "provider full", manufacturing refusals for a whole TTL
+	// without a single request going out — which also passes a latency test
+	// very convincingly while doing nothing.
+	if m.slotCache == nil {
 		return nil
-	case err != nil:
-		// Could not ask. Proceed and let the provider answer for itself.
+	}
+	slots, known, age := m.slotCache.reading(providerName, time.Now())
+	switch {
+	case !known:
+		return nil
+	case age > providerSlotMaxAge:
 		logger := db.Logger()
-		logger.Debug().Err(err).
+		logger.Debug().
 			Str("Provider", providerName).
-			Msg("Could not read provider capacity; proceeding and relying on the provider to refuse if full")
+			Dur("reading_age", age).
+			Msg("Provider capacity reading is too stale to refuse on; admitting and relying on the provider to refuse if full")
 		return nil
 	case slots <= 0:
 		return fmt.Errorf("%w: provider %q reports no free slots", customerror.TooManyActiveDownloadsError, providerName)
@@ -1077,6 +1058,25 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 		}
 		m.pendingAdds.resolve(providerName, debridTorrent.InfoHash)
 		m.declines.clear(providerName, debridTorrent.InfoHash)
+		// 🔴 WE JUST SPENT CAPACITY, SO SAY SO. Nothing used to.
+		//
+		// Both readings below are snapshots taken on someone else's schedule,
+		// and an accepted add invalidates each of them by exactly one. Without
+		// this, every add inside the same interval read a number stale by at
+		// least one item — stale because WE made it so — and a burst all read
+		// the same pre-burst value, so the error grew with the concurrency this
+		// machinery exists to survive. At a provider's ceiling that is the
+		// difference between admitting what fits and admitting a storm the
+		// provider then refuses one request at a time, each refusal costing a
+		// token and, on RealDebrid, counting against the same global budget.
+		//
+		// ⚠️ ONE-DIRECTIONAL ON PURPOSE. A later cleanup may delete this very
+		// torrent and hand the capacity back, and we do not credit that here.
+		// Erring toward "less room than we have" costs a hold and a retry;
+		// erring the other way costs the storm. Both estimates are erased by
+		// the next authoritative reading anyway.
+		m.slotCache.consume(providerName)
+		m.fillCache.consume(providerName)
 		// An add landed, so climb back toward the configured budget. Gradual by
 		// design: one success does not prove a provider that just throttled us
 		// has recovered, and jumping straight back to full rate would oscillate.
