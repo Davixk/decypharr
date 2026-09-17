@@ -59,14 +59,27 @@ LABEL org.opencontainers.image.documentation="https://github.com/sirrobot01/decy
 
 # Install a repository-verified rclone plus both FUSE ABIs. cgofuse is built
 # against FUSE2; the pure-Go/default and rclone paths use FUSE3.
+#
+# ⚠️ THESE PINS ROT, AND THE BUILD FAILS CLOSED WHEN THEY DO. The base image is
+# digest-pinned, but `apk add` still fetches from the live Alpine repository,
+# which serves only the CURRENT build of each package on a stable branch — a
+# security update replaces the old one rather than keeping it. So a Dockerfile
+# that built last week can fail this week with "breaks: world[pkg=<pinned>]".
+#
+# That is the pinning working, not a reason to unpin: an unpinned rebuild would
+# silently change what ships. The fix is to re-read the versions the pinned base
+# actually offers and bump to those:
+#
+#   docker run --rm alpine:3.23@<digest> sh -c \
+#     'apk update >/dev/null; apk policy ca-certificates fuse fuse3 rclone shadow su-exec tzdata'
 RUN apk add --no-cache \
-        ca-certificates=20260611-r0 \
+        ca-certificates=20260909-r0 \
         fuse=2.9.9-r7 \
-        fuse3=3.17.3-r1 \
+        fuse3=3.18.3-r0 \
         rclone=1.72.1-r4 \
         shadow=4.18.0-r0 \
         su-exec=0.3-r0 \
-        tzdata=2026c-r0 && \
+        tzdata=2026d-r0 && \
     echo "user_allow_other" >> /etc/fuse.conf
 
 # Copy binaries and entrypoint
