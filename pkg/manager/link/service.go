@@ -256,6 +256,15 @@ func (s *Service) fetchAndValidate(ctx context.Context, entry *storage.Entry, fi
 	}
 	link, err := s.fetchLink(ctx, entry, filename, attempt)
 	if err != nil {
+		// 🔑 BEFORE THE CLASSIFIER, NOT INSIDE IT. The mint takes our stored
+		// link as its INPUT, so a failure here may be nothing but our own cached
+		// state having gone stale. handleBadLink can turn this error into a
+		// durable content verdict — and on RealDebrid a mint 404 arrives already
+		// typed as one — so a verdict derived from stale input must never reach
+		// it. See stale_input.go.
+		if dl, retryErr, handled := s.retryWithRefreshedInput(ctx, err, entry, filename, attempt); handled {
+			return dl, retryErr
+		}
 		return s.handleBadLink(ctx, err, entry, filename, link, attempt)
 	}
 
