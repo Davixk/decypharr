@@ -54,7 +54,7 @@ func TestRefreshKeepsPlacementForAnInProgressProviderCopy(t *testing.T) {
 		Status:   debridTypes.TorrentStatusDownloading,
 	}
 
-	_, removals, err := m.detectTorrentChanges(
+	_, removals, _, err := m.detectTorrentChanges(
 		"provider",
 		map[string]*debridTypes.Torrent{},
 		map[string]*debridTypes.Torrent{},
@@ -87,7 +87,7 @@ func TestRefreshKeepsPlacementForADeadProviderCopy(t *testing.T) {
 		ProviderDead:   true,
 	}
 
-	_, removals, err := m.detectTorrentChanges(
+	_, removals, _, err := m.detectTorrentChanges(
 		"provider",
 		map[string]*debridTypes.Torrent{},
 		map[string]*debridTypes.Torrent{},
@@ -118,7 +118,7 @@ func TestRefreshStillRemovesGenuinelyAbsentPlacements(t *testing.T) {
 		Status:   debridTypes.TorrentStatusDownloaded,
 	}
 
-	_, removals, err := m.detectTorrentChanges(
+	_, removals, _, err := m.detectTorrentChanges(
 		"provider",
 		map[string]*debridTypes.Torrent{},
 		map[string]*debridTypes.Torrent{},

@@ -181,9 +181,29 @@ func (m *Manager) doRefreshTorrents(_ context.Context, provider string, debridCl
 	}
 
 	// Detect changes by streaming through cached entries
-	refreshes, removals, err := m.detectTorrentChanges(provider, remoteTorrentsByHash, remoteTorrentsByID, presence)
+	refreshes, removals, heldLocally, err := m.detectTorrentChanges(provider, remoteTorrentsByHash, remoteTorrentsByID, presence)
 	if err != nil {
 		return err
+	}
+
+	// 🛑 A REMOVAL BATCH THIS LARGE DESCRIBES A BAD ENUMERATION, NOT AN EMPTIED
+	// ACCOUNT. Removing a placement deletes the ENTRY when it is the only one,
+	// so a provider answering 200 with an empty or short list would otherwise
+	// empty the library of everything placed on it — and with arr_delete on,
+	// spend one indexer search per entry to get it back. See
+	// provider_removal_guard.go.
+	if removalBatchIsImplausible(len(removals), heldLocally) {
+		m.logger.Error().
+			Str("debrid", provider).
+			Int("would_remove", len(removals)).
+			Int("held_locally", heldLocally).
+			Int("listed_by_provider", len(remote)).
+			Msg("REFUSING a mass placement removal: the provider listed far too little to account for what " +
+				"we hold, so its answer is not describing the account. No placements removed and no entries " +
+				"deleted this pass. If the account really was emptied this clears once the provider lists " +
+				"it consistently; if a subscription lapsed or a key was revoked, remove the provider from " +
+				"the config rather than letting an empty listing delete the library")
+		removals = nil
 	}
 
 	removalErr := m.handleProviderRemovals(removals)
@@ -222,6 +242,7 @@ func (m *Manager) detectTorrentChanges(
 ) (
 	refreshes []providerRefreshCandidate,
 	removals []providerRemovalCandidate,
+	heldLocally int,
 	err error,
 ) {
 	refreshes = make([]providerRefreshCandidate, 0, 100)
@@ -256,6 +277,10 @@ func (m *Manager) detectTorrentChanges(
 			}
 
 			if placementOnDebrid && oldPlacement != nil {
+				// Denominator for the mass-removal guard: what we believe this
+				// provider holds for us, counted on the same pass that decides
+				// what to remove.
+				heldLocally++
 				if !onRemote {
 					// Not in the LIBRARY view. Before concluding the provider
 					// dropped it, ask whether the provider holds it at all: an
@@ -289,7 +314,7 @@ func (m *Manager) detectTorrentChanges(
 
 	if err != nil {
 		m.logger.Error().Err(err).Msg("Failed to stream cached remote")
-		return nil, nil, err
+		return nil, nil, heldLocally, err
 	}
 
 	// Check for brand new torrents (not in cache at all)
@@ -299,7 +324,7 @@ func (m *Manager) detectTorrentChanges(
 		}
 	}
 
-	return refreshes, removals, nil
+	return refreshes, removals, heldLocally, nil
 }
 
 // handleProviderRemovals independently removes placements that disappeared
