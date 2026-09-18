@@ -785,3 +785,53 @@ func TestRecheckEntryCarriesDeletionBudget(t *testing.T) {
 		t.Fatal("single-entry recheck did not prune the dead entry; the budget must not block one legitimate action")
 	}
 }
+
+// 🔴 A TRANSIENT PROVIDER ANSWER MUST NOT REACH PRUNE.
+//
+// HosterUnavailableError is the codebase's transient class: reinsertReason
+// treats it as a re-insertion trigger, Fixer wraps its INCONCLUSIVE result in it
+// to say "no provider reached a verdict about the content", and
+// IsContentPermanentlyGone excludes it by name. This probe nonetheless recorded
+// it as `broken`, which is destructive-eligible — so the one function that
+// condemns disagreed with every function that refuses to.
+//
+// Production consequence, measured on two entries: the sweep logged
+//
+//	"Re-insertion inconclusive: no provider reached a verdict about the
+//	 content; entry left unmarked"
+//
+// and PRUNE deleted the entry ONE SECOND LATER. Both unlock 200 OK on the
+// provider today, and one was re-grabbed and fully re-downloaded afterwards —
+// precisely the cost Fixer's own comment says the asymmetry exists to avoid.
+//
+// Real death has its own signals and none of them route through here: HTTP 451,
+// a torrent resolving with zero links, and absence from the account listing.
+func TestATransientProviderAnswerIsNeverPruneEligible(t *testing.T) {
+	client := &probeClient{checkErr: customerror.HosterUnavailableError}
+	_, r := newProbeFixture(t, client)
+
+	entry := probeTorrentEntry("transient", "Transient.Entry")
+	res := r.probeTorrentFile(context.Background(), entry, entry.Files["file.mkv"], "file.mkv",
+		fileResult{name: "file.mkv"}, RepairRunOptions{}, false, storage.HealthHealthy)
+
+	if res.broken {
+		t.Fatalf("a transient provider answer probed BROKEN (reason %q). That record is prune-eligible, "+
+			"so a provider having a bad hour deletes live content — measured twice in production, "+
+			"one second after the repair path declined to condemn the same entry", res.reason)
+	}
+	if res.healthy {
+		t.Fatalf("a provider that refused to answer probed HEALTHY (reason %q); not knowing is not "+
+			"evidence of health either", res.reason)
+	}
+
+	// And the verdict it DOES reach must be the non-actionable one, so the entry
+	// is re-examined on the short indeterminate retry rather than parked for a
+	// full recheck interval.
+	h := &storage.EntryHealth{Status: rollupStatus([]fileResult{res}), BrokenCount: 0}
+	if h.Status != storage.HealthUnknown {
+		t.Fatalf("rollup = %q, want %q", h.Status, storage.HealthUnknown)
+	}
+	if pruneEligible(h) {
+		t.Fatal("an unknown verdict is prune-eligible; `unknown` must stay non-actionable")
+	}
+}

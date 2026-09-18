@@ -1079,8 +1079,29 @@ func (r *Repair) probeTorrentFile(ctx context.Context, entry *storage.Entry, fil
 	case err == nil:
 		// Availability claimed. Prove it with bytes below.
 	case errors.Is(err, customerror.HosterUnavailableError):
-		res.broken = true
-		res.reason = "hoster_unavailable"
+		// 🛑 NOT BROKEN. THIS SENTINEL IS THE TRANSIENT CLASS EVERYWHERE ELSE.
+		//
+		// reinsertReason treats HosterUnavailableError as a re-insertion trigger,
+		// Fixer wraps its INCONCLUSIVE result in it to say "no provider reached a
+		// verdict about the content", and IsContentPermanentlyGone excludes it by
+		// name. Recording it as broken here made it destructive-eligible, so the
+		// one function that condemns disagreed with every function that refuses
+		// to — a classification carrying two opposite meanings depending on which
+		// caller produced it.
+		//
+		// Production consequence, measured: a sweep logged "Re-insertion
+		// inconclusive: no provider reached a verdict about the content; entry
+		// left unmarked" and PRUNE deleted the entry ONE SECOND LATER. Both
+		// audited survivors unlock 200 OK on the provider today, and one was
+		// re-grabbed and fully re-downloaded afterwards. The code that correctly
+		// declined to condemn was overruled by the code that deletes.
+		//
+		// Indeterminate is the honest verdict: never healthy, never broken,
+		// re-checked on the short indeterminate retry rather than parked for a
+		// full recheck interval. Real death is detected by 451, by a torrent
+		// resolving with zero links, and by absence from the account listing —
+		// none of which route through here.
+		res.reason = "provider_probe_indeterminate"
 		return res
 	case errors.Is(err, debridTypes.ErrAvailabilityIndeterminate):
 		// 401/403/429/5xx/transport: the provider never gave a verdict about the

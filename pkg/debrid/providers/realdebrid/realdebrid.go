@@ -913,11 +913,41 @@ func (r *RealDebrid) GetFileDownloadLinks(t *types.Torrent) (map[string]types.Do
 	return links, nil
 }
 
-// CheckFile probes link availability with a three-way verdict:
-// nil (available), customerror.HosterUnavailableError (definitively gone, 404/410),
-// or types.ErrAvailabilityIndeterminate (unknown — 401/403/429/5xx, transport failure).
-// Anything that is not a clean 2xx or a definitive 404/410 must NOT score healthy:
-// an outage or a rate limit is not evidence that the file is fine.
+// CheckFile probes link availability with a two-way verdict: nil (available) or
+// types.ErrAvailabilityIndeterminate (unknown). Anything that is not a clean 2xx
+// must NOT score healthy — an outage or a rate limit is not evidence that the
+// file is fine.
+//
+// 🔴 A 404/410 HERE IS NOT A CONTENT VERDICT, AND TREATING IT AS ONE DELETED
+// LIVE CONTENT.
+//
+// This used to return HosterUnavailableError for 404/410 and call it
+// "definitively gone". Two things were wrong with that, and production paid for
+// both:
+//
+//  1. `/unrestrict/check` IS A FIXED API ROUTE. A 404 on it describes OUR
+//     request or their infrastructure, not the resource. AllDebrid's CheckFile
+//     already says exactly this about its own endpoint, in as many words — this
+//     function made the mistake that comment warns against.
+//
+//  2. THE SENTINEL MEANS THE OPPOSITE EVERYWHERE ELSE. HosterUnavailableError
+//     is the canonical TRANSIENT class: reinsertReason treats it as a
+//     re-insertion trigger, Fixer wraps its inconclusive result in it precisely
+//     to say "no verdict was reached", and IsContentPermanentlyGone excludes it
+//     by name. The repair probe nonetheless recorded it as broken, which is
+//     destructive-eligible — so one sentinel carried two opposite meanings
+//     depending on which function produced it.
+//
+// Measured: a sweep logged "Re-insertion inconclusive: no provider reached a
+// verdict about the content; entry left unmarked" and PRUNE deleted the entry
+// ONE SECOND LATER. Both audited survivors unlock 200 OK on RealDebrid today,
+// and one was re-grabbed and fully re-downloaded afterwards. The premise for
+// deleting them was this branch.
+//
+// Genuine death has its own signals, measured across 21 probes: HTTP 451
+// (`infringing_file`, code 35), a torrent that resolves with `links: 0`, and
+// absence from the account listing. A 404 from this endpoint was not observed
+// once. Death is detected by those, not by this.
 func (r *RealDebrid) CheckFile(ctx context.Context, infohash, link string) error {
 	form := url.Values{}
 	form.Set("link", link)
@@ -937,8 +967,6 @@ func (r *RealDebrid) CheckFile(ctx context.Context, infohash, link string) error
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return nil
-	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
-		return customerror.HosterUnavailableError
 	default:
 		return fmt.Errorf("%w: realdebrid check: HTTP status %d", types.ErrAvailabilityIndeterminate, resp.StatusCode)
 	}

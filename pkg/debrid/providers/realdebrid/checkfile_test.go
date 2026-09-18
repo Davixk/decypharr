@@ -81,15 +81,44 @@ func TestCheckFileAvailable(t *testing.T) {
 	}
 }
 
-func TestCheckFileDefinitivelyUnavailable(t *testing.T) {
+// 🔴 A 404/410 FROM THIS ENDPOINT IS NOT A DEATH VERDICT, AND CALLING IT ONE
+// DELETED LIVE CONTENT.
+//
+// This test previously asserted the opposite. That assumption was INHERITED
+// rather than established: the work the rest of this file documents was about
+// 401/429/5xx wrongly scoring healthy, and it carried "404 means definitively
+// gone" through untouched.
+//
+// It is wrong for two independent reasons. `/unrestrict/check` is a fixed API
+// route, so a 404 on it describes our request or their infrastructure, not the
+// resource — AllDebrid's CheckFile says exactly this about its own endpoint.
+// And HosterUnavailableError is the codebase's TRANSIENT class: reinsertReason
+// treats it as a re-insertion trigger, Fixer wraps its inconclusive result in
+// it, IsContentPermanentlyGone excludes it by name — yet the repair probe
+// recorded it as broken, which is destructive-eligible.
+//
+// Production consequence, measured: a sweep logged "Re-insertion inconclusive:
+// no provider reached a verdict about the content; entry left unmarked" and
+// PRUNE deleted the entry ONE SECOND LATER. Both audited survivors unlock
+// 200 OK on RealDebrid today; one was re-grabbed and fully re-downloaded.
+//
+// ⚠️ THE ORIGINAL PROPERTY IS PRESERVED AND STILL ASSERTED: a 404/410 must
+// never score healthy. It simply reaches "unknown" rather than "dead".
+func TestCheckFileNotFoundIsIndeterminateNotDead(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
 		r := newTestRealDebrid(t, statusHandler(status))
 		err := r.CheckFile(context.Background(), "hash", "https://real-debrid.com/d/ABCDEF")
-		if !errors.Is(err, customerror.HosterUnavailableError) {
-			t.Fatalf("CheckFile() with status %d error = %v, want customerror.HosterUnavailableError", status, err)
+		if err == nil {
+			t.Fatalf("CheckFile() with status %d = nil; an unusable answer must never score healthy", status)
 		}
-		if errors.Is(err, types.ErrAvailabilityIndeterminate) {
-			t.Fatalf("CheckFile() with status %d must be a definitive verdict, got indeterminate", status)
+		if errors.Is(err, customerror.HosterUnavailableError) {
+			t.Fatalf("CheckFile() with status %d error = %v; that sentinel makes the repair probe record "+
+				"`broken`, which PRUNE and ARR-DELETE act on. A fixed API route answering 404 says "+
+				"nothing about whether the content exists", status, err)
+		}
+		if !errors.Is(err, types.ErrAvailabilityIndeterminate) {
+			t.Fatalf("CheckFile() with status %d error = %v, want types.ErrAvailabilityIndeterminate — "+
+				"never healthy, never broken, re-checked soon", status, err)
 		}
 	}
 }
