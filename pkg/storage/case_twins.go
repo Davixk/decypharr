@@ -36,15 +36,19 @@ import (
 //
 // SURVIVOR RULE. The survivor keeps its Name and OriginalFilename, so its
 // folder (the one the library symlinks point into) is unchanged. Candidates are
-// the rows with a non-empty ActiveProvider, or every row if none has one. Among
-// candidates the lowercase key wins, then the lexicographically smallest key.
+// the LIVE rows — servable ones, whose ActiveProvider names a placement the row
+// actually holds — or every row if none is live. Among candidates the
+// lowercase key wins, then the lexicographically smallest key. A row whose
+// ActiveProvider dangles is reported (dangling_active) and is never live.
 // Placements, files and tags of the other rows are unioned onto the survivor.
 // On a filename both rows hold, the survivor's record is kept and the
 // difference is reported.
 //
 // CONFLICTS are reported and left completely untouched, never guessed:
 //   - the rows have different protocols;
-//   - two or more rows are live (non-empty ActiveProvider) with different folders;
+//   - two or more rows are live with different folders;
+//   - a row's ActiveProvider dangles and its folder differs from the
+//     survivor's: it claimed to be live, so its folder may be the library's;
 //   - no row is live and their folders differ, since nothing says which one
 //     the library uses;
 //   - two rows hold the same placement key for a different provider/id, since
@@ -139,7 +143,12 @@ type CaseTwinRow struct {
 	ActiveProvider string `json:"active_provider"`
 	Placements     int    `json:"placements"`
 	Files          int    `json:"files"`
-	Survivor       bool   `json:"survivor"`
+	// Live: the row is servable (it holds the placement ActiveProvider names).
+	Live bool `json:"live"`
+	// DanglingActive: ActiveProvider names a provider the row holds no
+	// placement for. Such a row is never live.
+	DanglingActive bool `json:"dangling_active,omitempty"`
+	Survivor       bool `json:"survivor"`
 }
 
 // CaseTwinPlacement is a placement unioned onto the survivor.
@@ -308,6 +317,8 @@ func (s *Storage) mergeCaseTwinGroup(
 			ActiveProvider: row.entry.ActiveProvider,
 			Placements:     len(row.entry.Providers),
 			Files:          len(row.entry.Files),
+			Live:           caseTwinRowIsLive(row.entry),
+			DanglingActive: row.entry.ActiveProvider != "" && !caseTwinRowIsLive(row.entry),
 		})
 	}
 	switch {
@@ -447,10 +458,13 @@ func planCaseTwinGroup(canonical string, rows []*caseTwinStoredRow, result *Case
 		conflict("rows have different protocols")
 	}
 
-	var live []*caseTwinStoredRow
+	var live, dangling []*caseTwinStoredRow
 	for _, row := range rows {
-		if row.entry.ActiveProvider != "" {
+		switch {
+		case caseTwinRowIsLive(row.entry):
 			live = append(live, row)
+		case row.entry.ActiveProvider != "":
+			dangling = append(dangling, row)
 		}
 	}
 	if folders := distinctCaseTwinFolders(live); len(folders) > 1 {
@@ -477,6 +491,15 @@ func planCaseTwinGroup(canonical string, rows []*caseTwinStoredRow, result *Case
 	survivor := survivorRow.entry
 	result.Survivor = survivorRow.key
 	result.SurvivorFolder = survivorRow.folder
+
+	// A dangling row CLAIMED to be live, so its folder may be the one the
+	// library reads. Merging it away into a different folder would be a guess.
+	for _, row := range dangling {
+		if row != survivorRow && row.folder != survivorRow.folder {
+			conflict("row %s names active provider %q but holds no placement for it, and its folder %q differs from the survivor's %q; it may be what the library reads",
+				row.key, row.entry.ActiveProvider, row.folder, survivorRow.folder)
+		}
+	}
 
 	canonicalizeEntryIdentity(survivor, canonical)
 	if folder := survivor.GetFolder(); folder != survivorRow.folder {
@@ -561,6 +584,15 @@ func planCaseTwinGroup(canonical string, rows []*caseTwinStoredRow, result *Case
 		return nil
 	}
 	return survivor
+}
+
+// caseTwinRowIsLive reports whether a row is SERVABLE: it names an active
+// provider AND holds that placement (resolved exactly as GetActiveProvider
+// does). A row whose ActiveProvider dangles is not live; letting it survive
+// would carry the dangling name onto the merged row and make an entry that one
+// input could serve unservable.
+func caseTwinRowIsLive(entry *Entry) bool {
+	return entry != nil && entry.ActiveProvider != "" && entry.GetActiveProvider() != nil
 }
 
 func distinctCaseTwinFolders(rows []*caseTwinStoredRow) []string {

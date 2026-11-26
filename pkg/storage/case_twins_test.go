@@ -472,3 +472,64 @@ func TestCaseTwinMergeRefusesAConcurrentRun(t *testing.T) {
 		t.Fatalf("a second merge returned %v, want ErrCaseTwinMergeRunning", err)
 	}
 }
+
+// danglingActive names "rd" as its active provider but holds no rd placement,
+// so it cannot serve a single read.
+func danglingActive(hash, name string) *Entry {
+	entry := caseTestEntry(hash, name, "tb", "tb-3")
+	entry.ActiveProvider = "rd"
+	return entry
+}
+
+// 🛑 LIVE MEANS SERVABLE. A lowercase row whose ActiveProvider dangles must not
+// beat a really-live uppercase row on the lowercase tie-break: the merged entry
+// would keep the dangling name and become unservable, although one input row
+// could serve it.
+func TestCaseTwinDanglingActiveRowNeverWinsSurvivor(t *testing.T) {
+	lower := strings.Repeat("ac", 20)
+	upper := strings.ToUpper(lower)
+	store, _ := openLegacyStore(t, liveUpperTwin(upper), danglingActive(lower, "Upper Name"))
+
+	report, err := store.MergeCaseTwins(false)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	group := onlyGroup(t, report)
+	if group.Action != CaseTwinActionMerged || group.Survivor != upper {
+		t.Fatalf("group = action %q survivor %q conflicts %v; want merged keeping the servable %s", group.Action, group.Survivor, group.Conflicts, upper)
+	}
+	for _, row := range group.Rows {
+		if want := row.Key == lower; row.DanglingActive != want || row.Live == want {
+			t.Fatalf("row %s reported live=%v dangling_active=%v", row.Key, row.Live, row.DanglingActive)
+		}
+	}
+	merged, err := store.Get(lower)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if merged.ActiveProvider != "ad" || merged.GetActiveProvider() == nil || merged.GetActiveProvider().ID != "ad-1" {
+		t.Fatalf("merged active = %q (placement %+v); want the servable ad-1", merged.ActiveProvider, merged.GetActiveProvider())
+	}
+	if merged.Providers["tb"] == nil {
+		t.Fatalf("the dangling row's real placement was not unioned: %+v", merged.Providers)
+	}
+}
+
+// A dangling row in a DIFFERENT folder claimed to be live, so its folder may be
+// the one the library reads: conflict, untouched.
+func TestCaseTwinDanglingActiveRowInAnotherFolderIsAConflict(t *testing.T) {
+	lower := strings.Repeat("bd", 20)
+	upper := strings.ToUpper(lower)
+	store, dir := openLegacyStore(t, liveUpperTwin(upper), danglingActive(lower, "Lower Name"))
+	before := storeImage(t, store, dir)
+
+	report, err := store.MergeCaseTwins(false)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	group := onlyGroup(t, report)
+	if group.Action != CaseTwinActionConflict || len(group.Conflicts) != 1 || !strings.Contains(group.Conflicts[0], "holds no placement") {
+		t.Fatalf("group = action %q conflicts %v; want one dangling-active conflict", group.Action, group.Conflicts)
+	}
+	assertImageUnchanged(t, before, storeImage(t, store, dir))
+}
