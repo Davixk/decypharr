@@ -408,14 +408,31 @@ func (d *Downloader) scanMountForFilesBounded(ctx context.Context, mountPath str
 // triggerMountRefresh asks the configured mount (e.g. external rclone rc
 // vfs/forget + vfs/refresh) to refresh its directory listings. It is a no-op
 // without a mount manager, runs detached so the poll loop is never blocked on
-// the rc endpoint, and is deduplicated through singleflight so hundreds of
-// concurrent mount waits collapse into one in-flight refresh.
+// the rc endpoint, and the GROUP refresh is deduplicated through singleflight so
+// hundreds of concurrent mount waits collapse into one in-flight refresh.
+//
+// 🔴 IT ALSO FORGETS THE ENTRY'S OWN PATH, FIRST. The group refresh is
+// NON-RECURSIVE: it re-reads `__all__` and keeps every child node beneath it
+// with whatever that node had cached. Measured in production during the AD
+// migration: radarr deleted the only file of a usenet entry THROUGH the rclone
+// mount, which removed the entry and left rclone's `__all__/<folder>/` node
+// cached as EMPTY. The same NZB, re-added under the same name, re-created the
+// same folder, and the group refresh never touched that stale node, so this
+// wait would have run its full 30 minutes and failed a download whose files
+// decypharr was already serving. Forgetting one path costs one call per entry
+// and cannot scale with the library (see RefreshDeletedEntry for the
+// recursive-refresh alternative and why it is wrong). It is per entry, so it
+// sits outside the singleflight: collapsing it would forget only one waiter's
+// path.
 func (d *Downloader) triggerMountRefresh(entry *storage.Entry) {
 	m := d.manager
 	if m == nil || m.mountManager == nil {
 		return
 	}
+	folder := entry.GetFolder()
 	go func() {
+		m.forgetEntryPaths(folder, "Could not drop the mount's cached node for an entry awaiting symlinks; "+
+			"a stale node may hide its files until the client expires it")
 		if _, err, _ := m.refreshSG.Do("symlink-mount-refresh", func() (any, error) {
 			return nil, m.RefreshMount()
 		}); err != nil {
@@ -459,10 +476,12 @@ func (d *Downloader) createSymlinksWhenMountFilesAppear(ctx context.Context, ent
 			delete(remainingFiles, name)
 			d.logger.Info().Msgf("File is ready: %s/%s", entry.GetFolder(), file.Name)
 		}
-		if attempt == 1 && len(result.found) == 0 {
-			// Nothing visible on the first scan (directory absent, empty, or the
-			// scan timed out): nudge the mount to refresh its listing instead of
-			// waiting out its natural cache interval.
+		if attempt == 1 && len(remainingFiles) > 0 {
+			// Not everything visible on the first scan (directory absent, empty,
+			// partially stale, or the scan timed out): nudge the mount to drop
+			// this entry's node and refresh its listing, instead of waiting out
+			// its natural cache interval. A partial first scan counts too: a
+			// stale node can hold some of an entry's files and not others.
 			d.triggerMountRefresh(entry)
 		}
 		if len(remainingFiles) == 0 {

@@ -100,6 +100,14 @@ func (m *Manager) RefreshMount() error {
 // leaves exactly the behaviour that shipped before it, so it is logged and never
 // returned: it must not be able to fail a deletion that has already succeeded.
 func (m *Manager) RefreshDeletedEntry(folder string) {
+	m.forgetEntryPaths(folder, "Could not drop the mount's cached node for a deleted entry; it may serve stale metadata "+
+		"for that path until the client expires it on its own")
+}
+
+// forgetEntryPaths drops the mount's cached node for one entry folder under
+// every refresh dir: one ForgetPath per dir, re-reading nothing else. Best
+// effort: a failure is logged with failMsg and never returned.
+func (m *Manager) forgetEntryPaths(folder, failMsg string) {
 	if m.mountManager == nil || folder == "" {
 		return
 	}
@@ -109,10 +117,7 @@ func (m *Manager) RefreshDeletedEntry(folder string) {
 			path = dir + "/" + folder
 		}
 		if err := m.mountManager.ForgetPath(path); err != nil {
-			m.logger.Debug().Err(err).
-				Str("path", path).
-				Msg("Could not drop the mount's cached node for a deleted entry; it may serve stale metadata " +
-					"for that path until the client expires it on its own")
+			m.logger.Debug().Err(err).Str("path", path).Msg(failMsg)
 		}
 	}
 }
