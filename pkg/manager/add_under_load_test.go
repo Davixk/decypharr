@@ -152,6 +152,13 @@ func newLoadFixtureOpts(t *testing.T, ceiling, serverDelay time.Duration) (*Mana
 	m.capacityHold = newCapacityHoldQueue()
 	m.jobQueue = NewJobQueue(context.Background(), 1, func(context.Context, *Job) {})
 	t.Cleanup(m.jobQueue.Close)
+	// 🛑 Registered LAST so it runs FIRST among this fixture's cleanups: past
+	// the sync window an add's resolver keeps running after AddNewTorrent
+	// returns, and the config.Reset registered by newSyncRefusalManager would
+	// otherwise race the resolvers still reading config. A test's own cleanup
+	// that stops its arrival workers is registered later still, so it runs
+	// before this one and no add can start while the group drains.
+	t.Cleanup(m.addResolvers.Wait)
 	return m, client
 }
 

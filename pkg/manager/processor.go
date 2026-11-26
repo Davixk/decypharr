@@ -73,7 +73,9 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 
 	var answered atomic.Bool
 	done := make(chan error, 1)
+	m.addResolvers.Add(1)
 	go func() {
+		defer m.addResolvers.Done()
 		done <- m.resolveAddWithProviders(ctx, importReq, torrent, &answered)
 	}()
 

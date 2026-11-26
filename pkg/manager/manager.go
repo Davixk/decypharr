@@ -50,6 +50,11 @@ type Manager struct {
 	// for yet. Drained on slot-free events and by the per-provider admission
 	// controller — never by a per-entry timer.
 	capacityHold *capacityHoldQueue
+	// addResolvers counts add resolutions still running. On the sync-window
+	// timeout path the resolver outlives the request that started it, so this
+	// is the only handle that knows when it ends. Tests drain it before tearing
+	// down shared state.
+	addResolvers sync.WaitGroup
 	// providerOrphans records items a provider holds that no local record
 	// claims — the divergence the local consistency checker cannot see, because
 	// it only compares our index against our own scan.
