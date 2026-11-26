@@ -1,0 +1,306 @@
+package manager
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/sirrobot01/decypharr/pkg/storage"
+)
+
+// dualPlacementEntry is an entry reading from "rd" that still carries an "ad"
+// copy — the shape a library migrating off AllDebrid is full of.
+func dualPlacementEntry(hash string) *storage.Entry {
+	entry := lifecycleEntry(hash, "rd", "rd-1")
+	entry.Providers["ad"] = &storage.ProviderEntry{
+		Provider: "ad",
+		ID:       "ad-1",
+		Status:   debridTypes.TorrentStatusDownloaded,
+		Files: map[string]*storage.ProviderFile{
+			"Movie.mkv": {Id: "file-ad-1", Link: "https://example.invalid/ad-1"},
+		},
+	}
+	return entry
+}
+
+func placementManager(t *testing.T) (*Manager, *lifecycleDebridClient, *lifecycleDebridClient) {
+	t.Helper()
+	m := newProviderLifecycleManager(t)
+	ad := &lifecycleDebridClient{name: "ad"}
+	rd := &lifecycleDebridClient{name: "rd"}
+	m.clients.Store("ad", ad)
+	m.clients.Store("rd", rd)
+	return m, ad, rd
+}
+
+// THE MIGRATION'S CORE MOVE: drop the stale copy, keep the one the library reads.
+func TestDropPlacementRemovesOnlyTheNamedNonActiveCopy(t *testing.T) {
+	m, ad, rd := placementManager(t)
+	hash := strings.Repeat("a", 40)
+	persistLifecycleEntry(t, m, dualPlacementEntry(hash))
+
+	if err := m.DropPlacement(hash, "ad"); err != nil {
+		t.Fatalf("DropPlacement: %v", err)
+	}
+
+	current, err := m.storage.Get(hash)
+	if err != nil {
+		t.Fatalf("the entry is gone after dropping one of its two copies: %v", err)
+	}
+	if _, still := current.Providers["ad"]; still {
+		t.Fatal("the ad placement is still recorded after it was dropped")
+	}
+	if current.Providers["rd"] == nil || current.ActiveProvider != "rd" {
+		t.Fatalf("the copy the library reads was disturbed: active=%q providers=%v", current.ActiveProvider, current.Providers)
+	}
+	if got := ad.deleted(); len(got) != 1 || got[0] != "ad-1" {
+		t.Fatalf("ad provider deletions = %v, want exactly [ad-1]; the slot is not freed otherwise", got)
+	}
+	if got := rd.deleted(); len(got) != 0 {
+		t.Fatalf("the ACTIVE provider was told to delete %v — that destroys the library's copy", got)
+	}
+}
+
+// 🛑 Dropping the active copy would leave the entry reading from nothing.
+func TestDropPlacementRefusesTheActiveProvider(t *testing.T) {
+	m, ad, rd := placementManager(t)
+	hash := strings.Repeat("b", 40)
+	persistLifecycleEntry(t, m, dualPlacementEntry(hash))
+
+	err := m.DropPlacement(hash, "rd")
+	if !errors.Is(err, ErrPlacementIsActive) {
+		t.Fatalf("dropping the active provider returned %v, want ErrPlacementIsActive", err)
+	}
+	assertNothingDeleted(t, ad, rd)
+	assertPlacements(t, m, hash, "ad", "rd")
+}
+
+// 🛑 An entry's only copy is not a "placement to drop", it is the entry.
+func TestDropPlacementRefusesTheOnlyPlacement(t *testing.T) {
+	m, ad, rd := placementManager(t)
+	hash := strings.Repeat("c", 40)
+	// Active names a provider the map does not hold — exactly the inconsistent
+	// row the migration feared: "active_debrid is RealDebrid" while only an AD
+	// copy exists. Dropping AD here would strand the entry with no copy at all.
+	entry := lifecycleEntry(hash, "ad", "ad-1")
+	entry.ActiveProvider = "rd"
+	persistLifecycleEntry(t, m, entry)
+
+	err := m.DropPlacement(hash, "ad")
+	if !errors.Is(err, ErrLastPlacement) {
+		t.Fatalf("dropping the only placement returned %v, want ErrLastPlacement", err)
+	}
+	assertNothingDeleted(t, ad, rd)
+	assertPlacements(t, m, hash, "ad")
+}
+
+// 🛑 A copy still downloading is not yet a copy, so the one being dropped may be
+// the only complete one.
+func TestDropPlacementRefusesWhenTheActiveCopyIsIncomplete(t *testing.T) {
+	m, ad, rd := placementManager(t)
+	hash := strings.Repeat("d", 40)
+	entry := dualPlacementEntry(hash)
+	entry.Providers["rd"].Status = debridTypes.TorrentStatusDownloading
+	persistLifecycleEntry(t, m, entry)
+
+	err := m.DropPlacement(hash, "ad")
+	if !errors.Is(err, storage.ErrPlacementNotCompleted) {
+		t.Fatalf("dropping while the active copy is incomplete returned %v, want ErrPlacementNotCompleted", err)
+	}
+	assertNothingDeleted(t, ad, rd)
+	assertPlacements(t, m, hash, "ad", "rd")
+}
+
+// CASE TWINS share provider copies. The main store keys rows by the hash string
+// as it arrived, so "abc…" and "ABC…" are two rows that can hold the SAME AD
+// torrent. Releasing it on behalf of one row would delete it out from under the
+// other.
+func TestDropPlacementKeepsACopyACaseTwinStillReferences(t *testing.T) {
+	m, ad, rd := placementManager(t)
+	lower := strings.Repeat("e", 40)
+	upper := strings.ToUpper(lower)
+	persistLifecycleEntry(t, m, dualPlacementEntry(lower))
+	twin := lifecycleEntry(upper, "ad", "ad-1") // same AD torrent id
+	twin.Name = "Movie (old name).mkv"
+	persistLifecycleEntry(t, m, twin)
+
+	if err := m.DropPlacement(lower, "ad"); err != nil {
+		t.Fatalf("DropPlacement: %v", err)
+	}
+	if got := ad.deleted(); len(got) != 0 {
+		t.Fatalf("released AD torrent %v while the case twin %s still references it", got, upper)
+	}
+	assertNothingDeleted(t, ad, rd)
+	assertPlacements(t, m, lower, "rd")
+	assertPlacements(t, m, upper, "ad")
+}
+
+func TestEntryPlacementsReportsCaseTwinsAndAnExactMiss(t *testing.T) {
+	m, _, _ := placementManager(t)
+	lower := strings.Repeat("f", 40)
+	upper := strings.ToUpper(lower)
+	persistLifecycleEntry(t, m, dualPlacementEntry(lower))
+	persistLifecycleEntry(t, m, lifecycleEntry(upper, "ad", "ad-9"))
+
+	report, _, err := m.EntryPlacements(lower)
+	if err != nil {
+		t.Fatalf("EntryPlacements: %v", err)
+	}
+	if report.ActiveProvider != "rd" || len(report.Placements) != 2 {
+		t.Fatalf("report = active %q, %d placements; want rd and 2", report.ActiveProvider, len(report.Placements))
+	}
+	if len(report.CaseTwins) != 1 || report.CaseTwins[0].InfoHash != upper {
+		t.Fatalf("case twins = %+v, want exactly %s", report.CaseTwins, upper)
+	}
+
+	// A caller holding a THIRD casing (say, a normalised id) must be told the
+	// hash exists — not handed a bare "not found" it will read as "gone".
+	mixed := "F" + lower[1:]
+	_, twins, err := m.EntryPlacements(mixed)
+	if !errors.Is(err, storage.ErrEntryNotFound) {
+		t.Fatalf("lookup of %s returned %v, want ErrEntryNotFound", mixed, err)
+	}
+	if len(twins) != 2 {
+		t.Fatalf("a miss reported %d twins, want both rows: %+v", len(twins), twins)
+	}
+}
+
+// After a switch, the target must hold every file the library links to. A
+// provider that names files differently leaves them unreadable even though the
+// switch "succeeded".
+func TestEntryPlacementsFlagsFilesTheActiveCopyLacks(t *testing.T) {
+	m, _, _ := placementManager(t)
+	hash := strings.Repeat("9", 40)
+	entry := dualPlacementEntry(hash)
+	entry.Files["Extra.mkv"] = &storage.File{Name: "Extra.mkv", Size: 10, InfoHash: hash}
+	persistLifecycleEntry(t, m, entry)
+
+	report, _, err := m.EntryPlacements(hash)
+	if err != nil {
+		t.Fatalf("EntryPlacements: %v", err)
+	}
+	if len(report.MissingFromActive) != 1 || report.MissingFromActive[0] != "Extra.mkv" {
+		t.Fatalf("missing_from_active = %v, want [Extra.mkv]", report.MissingFromActive)
+	}
+}
+
+func TestSwitchTorrentValidatesBeforeCreatingAJob(t *testing.T) {
+	m, _, _ := placementManager(t)
+	hash := strings.Repeat("8", 40)
+	persistLifecycleEntry(t, m, dualPlacementEntry(hash))
+
+	if _, err := m.SwitchTorrent(context.Background(), hash, "rd", false, false); !errors.Is(err, storage.ErrAlreadyOnDebrid) {
+		t.Fatalf("switching to the active provider returned %v, want ErrAlreadyOnDebrid", err)
+	}
+	if _, err := m.SwitchTorrent(context.Background(), hash, "nope", false, false); !errors.Is(err, ErrSwitchTargetUnknown) {
+		t.Fatalf("switching to an unconfigured provider returned %v, want ErrSwitchTargetUnknown", err)
+	}
+	if _, err := m.SwitchTorrent(context.Background(), strings.Repeat("7", 40), "ad", false, false); !errors.Is(err, storage.ErrEntryNotFound) {
+		t.Fatalf("switching a missing entry returned %v, want ErrEntryNotFound", err)
+	}
+	jobs := 0
+	m.migrationJobs.Range(func(string, *storage.SwitcherJob) bool { jobs++; return true })
+	if jobs != 0 {
+		t.Fatalf("%d jobs were created by refused switches; a refusal must leave no job behind", jobs)
+	}
+}
+
+// 🔴 Job state is written on the migration goroutine and read on request
+// goroutines. Run with -race: storing the live pointer instead of a snapshot
+// makes this fail.
+func TestSwitchJobReadsAreRaceFree(t *testing.T) {
+	m, _, _ := placementManager(t)
+	hash := strings.Repeat("6", 40)
+	persistLifecycleEntry(t, m, lifecycleEntry(hash, "ad", "ad-1"))
+	target := &lifecycleDebridClient{name: "rd"}
+	target.submit = func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
+		time.Sleep(20 * time.Millisecond)
+		return completedRemote(hash, "rd", "rd-1"), nil
+	}
+	m.clients.Store("rd", target)
+
+	job, err := m.SwitchTorrent(context.Background(), hash, "rd", false, false)
+	if err != nil {
+		t.Fatalf("SwitchTorrent: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for range 4 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if snap, err := m.GetMigrationJob(job.ID); err == nil {
+					_ = snap.Status
+					_ = snap.Progress
+					_ = snap.Error
+					_ = snap.CompletedAt
+				}
+				m.migrationJobs.Range(func(_ string, j *storage.SwitcherJob) bool {
+					_ = j.Status
+					return true
+				})
+			}
+		})
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	var final *storage.SwitcherJob
+	for time.Now().Before(deadline) {
+		snap, err := m.GetMigrationJob(job.ID)
+		if err == nil && (snap.Status == storage.SwitcherStatusCompleted || snap.Status == storage.SwitcherStatusFailed) {
+			final = snap
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
+
+	if final == nil {
+		t.Fatal("the switch never reached a terminal state")
+	}
+	if final.Status != storage.SwitcherStatusCompleted {
+		t.Fatalf("switch ended %s: %s", final.Status, final.Error)
+	}
+	assertPlacements(t, m, hash, "rd")
+}
+
+func assertNothingDeleted(t *testing.T, clients ...*lifecycleDebridClient) {
+	t.Helper()
+	for _, c := range clients {
+		if got := c.deleted(); len(got) != 0 {
+			t.Fatalf("a refused drop still told %s to delete %v", c.name, got)
+		}
+	}
+}
+
+func assertPlacements(t *testing.T, m *Manager, hash string, want ...string) {
+	t.Helper()
+	current, err := m.storage.Get(hash)
+	if err != nil {
+		t.Fatalf("Get %s: %v", hash, err)
+	}
+	got := make(map[string]bool, len(current.Providers))
+	for _, p := range current.Providers {
+		if p != nil {
+			got[p.Provider] = true
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s placements = %v, want %v", hash, got, want)
+	}
+	for _, w := range want {
+		if !got[w] {
+			t.Fatalf("%s placements = %v, want %v", hash, got, want)
+		}
+	}
+}

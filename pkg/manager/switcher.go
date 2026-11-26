@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,11 +15,34 @@ func ptrTime(t time.Time) *time.Time {
 	return new(t)
 }
 
+var (
+	// ErrSwitchTargetUnknown reports a switch to a provider that is not configured.
+	ErrSwitchTargetUnknown = errors.New("target provider is not configured")
+	// ErrSwitchUnsupported reports an entry that cannot move between providers.
+	ErrSwitchUnsupported = errors.New("entry cannot be moved between providers")
+)
+
 // This is in-charge of moving torrents between different debrid services
 
-// SwitchTorrent moves a torrent from one debrid to another
+// SwitchTorrent moves a torrent from one debrid to another.
+//
+// It keeps the SAME entry — same infohash, same Name and OriginalFilename — so
+// the mount folder, and every library symlink into it, survives the move.
+// commitMove only adds the target placement and its files; it never renames.
+//
+// ⚠️ CACHED CONTENT ONLY, IN PRACTICE. commitMove refuses to activate a target
+// copy that is not `downloaded` after the provider's status poll, and deletes
+// the copy it just added. An uncached release therefore fails the job and the
+// entry stays exactly where it was — which is the safe outcome, not a bug.
+// waitComplete is recorded on the job but nothing reads it; do not offer it as a
+// knob until something does.
+//
+// Validation that can be answered locally happens HERE, before a job exists, so
+// a caller is told synchronously rather than finding a failed job later.
 func (m *Manager) SwitchTorrent(ctx context.Context, infohash, target string, keepOld, waitComplete bool) (*storage.SwitcherJob, error) {
-	// GetReader the entry
+	if exists, _ := m.EntryExists(infohash); !exists {
+		return nil, fmt.Errorf("%w: %s", storage.ErrEntryNotFound, infohash)
+	}
 	entry, err := m.GetEntry(infohash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get entry: %w", err)
@@ -27,6 +51,12 @@ func (m *Manager) SwitchTorrent(ctx context.Context, infohash, target string, ke
 	// Check if already on target debrid
 	if entry.ActiveProvider == target {
 		return nil, storage.ErrAlreadyOnDebrid
+	}
+	if m.ProviderClient(target) == nil {
+		return nil, fmt.Errorf("%w: %s", ErrSwitchTargetUnknown, target)
+	}
+	if !entry.CanBeMoved() {
+		return nil, fmt.Errorf("%w: %s is not a torrent", ErrSwitchUnsupported, infohash)
 	}
 
 	// Need to actually migrate - create job
@@ -42,17 +72,45 @@ func (m *Manager) SwitchTorrent(ctx context.Context, infohash, target string, ke
 		WaitComplete:   waitComplete,
 	}
 
-	// Store job
-	m.migrationJobs.Store(job.ID, job)
+	// Snapshot BEFORE the goroutine owns job: it mutates the struct as it goes,
+	// so handing the caller the live pointer would be a data race.
+	accepted := snapshotJob(job)
+	m.publishJob(job)
 
 	// Start migration in background
 	go m.executeMigration(job, entry)
 
-	return job, nil
+	return accepted, nil
+}
+
+// snapshotJob returns an independent copy of job, deep enough that nothing the
+// migration goroutine later writes can reach it.
+func snapshotJob(job *storage.SwitcherJob) *storage.SwitcherJob {
+	snap := *job
+	if job.CompletedAt != nil {
+		completed := *job.CompletedAt
+		snap.CompletedAt = &completed
+	}
+	return &snap
+}
+
+// publishJob stores an immutable snapshot of job.
+//
+// 🔴 THE STORED VALUE IS NEVER MUTATED AFTER IT IS STORED. executeMigration
+// writes Status, Progress, Error and CompletedAt on its own goroutine while
+// GetMigrationJob and the stats Range read jobs from request goroutines. Storing
+// the live pointer made every such read a data race; it went unnoticed only
+// because nothing called SwitchTorrent until an API route was added. Readers now
+// only ever see a finished snapshot.
+func (m *Manager) publishJob(job *storage.SwitcherJob) {
+	m.migrationJobs.Store(job.ID, snapshotJob(job))
 }
 
 // executeMigration performs the actual torrent migration - COMPLETE IMPLEMENTATION
 func (m *Manager) executeMigration(job *storage.SwitcherJob, torrent *storage.Entry) {
+	// Every return path below publishes the job's final state.
+	defer m.publishJob(job)
+
 	m.logger.Info().
 		Str("job_id", job.ID).
 		Str("torrent", torrent.Name).
@@ -75,6 +133,7 @@ func (m *Manager) executeMigration(job *storage.SwitcherJob, torrent *storage.En
 	}
 
 	job.Progress = 10
+	m.publishJob(job)
 
 	success, err := m.fixer.MoveTorrent(torrent, job.TargetProvider, false) // false = don't force re-download
 

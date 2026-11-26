@@ -102,6 +102,15 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Post("/torrents/{hash}/prune", s.handlePruneTorrent)
 			r.Post("/torrents/prune", s.handlePruneTorrents)
 
+			// Provider placements: see which providers hold an entry, drop ONE
+			// non-active copy, or move the entry to another provider while
+			// keeping its folder (and so every library symlink) intact. Keys are
+			// the exact, case-sensitive infohash from /api/browse.
+			r.Get("/torrents/{hash}/placements", s.handleGetPlacements)
+			r.Delete("/torrents/{hash}/placements/{provider}", s.handleDropPlacement)
+			r.Post("/torrents/{hash}/switch", s.handleSwitchProvider)
+			r.Get("/migrations/{id}", s.handleGetMigration)
+
 			// Browse - WebDAV-style hierarchical file browser
 			r.Route("/browse", func(r chi.Router) {
 				// Hierarchical browse endpoints

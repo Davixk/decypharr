@@ -1091,12 +1091,18 @@ func (m *Manager) DeleteTorrents(infohashes []string, removeFromDebrid bool) err
 	return nil
 }
 
+// ErrMigrationJobNotFound reports a switch job id this process has no record of.
+// Jobs live in memory only, so every id is forgotten across a restart.
+var ErrMigrationJobNotFound = errors.New("migration job not found")
+
+// GetMigrationJob returns a copy of the job's latest published snapshot.
+// See publishJob for why the stored value is never handed out directly.
 func (m *Manager) GetMigrationJob(jobID string) (*storage.SwitcherJob, error) {
 	job, exists := m.migrationJobs.Load(jobID)
 	if !exists {
-		return nil, fmt.Errorf("migration job not found: %s", jobID)
+		return nil, fmt.Errorf("%w: %s", ErrMigrationJobNotFound, jobID)
 	}
-	return job, nil
+	return snapshotJob(job), nil
 }
 
 // SubmitJob submits an import to the unified active-download queue.
