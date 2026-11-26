@@ -116,6 +116,10 @@ func (s *Server) WebRoutes() http.Handler {
 			// a real run needs dry_run=false and journals every row it changes.
 			// It moves records only and never contacts a provider.
 			r.Post("/maintenance/merge-case-twins", s.handleMergeCaseTwins)
+			// Undo it from the journal the merge reported. FENCED: a group whose
+			// merged row was written since the merge is refused unless force is
+			// set. dry_run defaults to TRUE; journal is a bare file name only.
+			r.Post("/maintenance/merge-case-twins/restore", s.handleRestoreCaseTwins)
 
 			// Browse - WebDAV-style hierarchical file browser
 			r.Route("/browse", func(r chi.Router) {

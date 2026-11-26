@@ -67,8 +67,10 @@ import (
 //
 // REVERSIBILITY. Before a group's first write, the exact stored bytes and index
 // attributes of every row it will overwrite or delete are appended to a
-// JSON-lines journal beside the database and synced.
-// RestoreCaseTwinMergeJournal puts them back byte for byte.
+// JSON-lines journal beside the database and synced, together with the exact
+// version the merge then writes to the canonical row. RestoreCaseTwinMergeJournal
+// puts them back byte for byte, but only while that row still carries that
+// version (the fence), unless forced.
 //
 // CRASH SAFETY. The merged row is written before any twin is deleted. A crash
 // in between leaves a group the next run converges: the merged row is live and
@@ -108,9 +110,11 @@ type CaseTwinMergeReport struct {
 	Errors    int `json:"errors"`
 	// RowsRemoved is the number of non-lowercase keys deleted, or that would be.
 	RowsRemoved int `json:"rows_removed"`
-	// JournalPath / JournalRows locate the pre-image of every row a real run
-	// changed. Empty when nothing was changed.
+	// JournalPath / JournalName / JournalRows locate the pre-image of every row
+	// a real run changed. JournalName is what the restore route takes. Empty
+	// when nothing was changed.
 	JournalPath string          `json:"journal_path,omitempty"`
+	JournalName string          `json:"journal_name,omitempty"`
 	JournalRows int             `json:"journal_rows"`
 	Results     []CaseTwinGroup `json:"results"`
 }
@@ -215,6 +219,7 @@ func (s *Storage) MergeCaseTwins(dryRun bool) (*CaseTwinMergeReport, error) {
 	}
 	if journal != nil {
 		report.JournalPath = journal.path
+		report.JournalName = filepath.Base(journal.path)
 		report.JournalRows = journal.rows
 	}
 	if !dryRun && len(affected) > 0 {
@@ -358,7 +363,14 @@ func (s *Storage) mergeCaseTwinGroup(
 		}
 		*journal = opened
 	}
-	if err := (*journal).append(canonical, rows); err != nil {
+	// The version is fixed BEFORE journaling so the record can carry it: a
+	// restore later proves the canonical row is still exactly what this merge
+	// wrote, and refuses otherwise.
+	nextGeneration, nextRevision, _ := advanceStoreVersion(
+		merged.mainStoreGeneration, merged.mainStoreRevision,
+		merged.mainStoreGeneration, merged.mainStoreRevision,
+	)
+	if err := (*journal).append(canonical, rows, nextGeneration, nextRevision); err != nil {
 		result.Action, result.Error = CaseTwinActionError, err.Error()
 		return result, err
 	}
@@ -368,10 +380,6 @@ func (s *Storage) mergeCaseTwinGroup(
 	}
 	affected[merged.GetFolder()] = merged.Protocol
 
-	nextGeneration, nextRevision, _ := advanceStoreVersion(
-		merged.mainStoreGeneration, merged.mainStoreRevision,
-		merged.mainStoreGeneration, merged.mainStoreRevision,
-	)
 	merged.mainStoreGeneration, merged.mainStoreRevision = nextGeneration, nextRevision
 	merged.UpdatedAt = time.Now()
 	data, err := proto.Marshal(EntryToProto(merged))
@@ -708,13 +716,30 @@ func (s *Storage) rebuildEntryItemsBatch(folders map[string]config.Protocol) err
 // Journal
 // ---------------------------------------------------------------------------
 
+// caseTwinJournalPattern is the only shape of name a journal may have; a
+// restore accepts nothing else.
+const caseTwinJournalPattern = "case-twin-merge-*.jsonl"
+
+// ErrInvalidCaseTwinJournal refuses a journal name that is not a bare
+// case-twin-merge-*.jsonl file name resolving to a regular file inside the
+// database directory.
+var ErrInvalidCaseTwinJournal = errors.New("invalid case-twin journal name")
+
 // caseTwinJournalRecord is one group's pre-image: one JSON line, written and
 // synced before the group's first write.
+//
+// MergedGeneration/MergedRevision are the exact version the merge then wrote
+// to the canonical row. They FENCE a restore: a canonical row that no longer
+// carries that version has been written since the merge (a switch, a new
+// grab), and restoring over it would drop that write. Journals from builds
+// before the fence lack them and are treated as unfenced.
 type caseTwinJournalRecord struct {
 	Run              string               `json:"run"`
 	At               time.Time            `json:"at"`
 	CanonicalKey     string               `json:"canonical_key"`
 	CanonicalExisted bool                 `json:"canonical_existed"`
+	MergedGeneration string               `json:"merged_generation,omitempty"`
+	MergedRevision   uint64               `json:"merged_revision,omitempty"`
 	Rows             []caseTwinJournalRow `json:"rows"`
 }
 
@@ -745,8 +770,14 @@ func (s *Storage) openCaseTwinJournal(started time.Time) (*caseTwinJournal, erro
 	return &caseTwinJournal{path: path, run: run, file: file}, nil
 }
 
-func (j *caseTwinJournal) append(canonical string, rows []*caseTwinStoredRow) error {
-	record := caseTwinJournalRecord{Run: j.run, At: time.Now().UTC(), CanonicalKey: canonical}
+func (j *caseTwinJournal) append(canonical string, rows []*caseTwinStoredRow, mergedGeneration string, mergedRevision uint64) error {
+	record := caseTwinJournalRecord{
+		Run:              j.run,
+		At:               time.Now().UTC(),
+		CanonicalKey:     canonical,
+		MergedGeneration: mergedGeneration,
+		MergedRevision:   mergedRevision,
+	}
 	for _, row := range rows {
 		if row.key == canonical {
 			record.CanonicalExisted = true
@@ -771,78 +802,228 @@ func (j *caseTwinJournal) close() error {
 	return j.file.Close()
 }
 
-// RestoreCaseTwinMergeJournal undoes a merge from its journal. For every
-// recorded group (only canonicalKey's when it is non-empty) it removes the
-// merged lowercase row if the merge created it, and puts every recorded row
-// back under its original key with its exact original bytes and index
-// attributes. Groups are restored newest first. It returns the number of rows
-// restored.
+// caseTwinJournalPath resolves a journal NAME to its path in the database
+// directory. It accepts only a bare file name matching case-twin-merge-*.jsonl
+// that is a regular file directly inside the directory: no separator, no
+// "..", no absolute path, and no symlink that could point elsewhere.
+func (s *Storage) caseTwinJournalPath(name string) (string, error) {
+	invalid := func(why string) (string, error) {
+		return "", fmt.Errorf("%w %q: %s", ErrInvalidCaseTwinJournal, name, why)
+	}
+	switch {
+	case name == "":
+		return invalid("a journal file name is required")
+	case strings.ContainsAny(name, `/\`), strings.Contains(name, ".."), filepath.IsAbs(name), filepath.Base(name) != name:
+		return invalid("must be a bare file name inside the database directory")
+	}
+	if matched, _ := filepath.Match(caseTwinJournalPattern, name); !matched {
+		return invalid("must match " + caseTwinJournalPattern)
+	}
+	path := filepath.Join(s.dir, name)
+	if filepath.Dir(path) != filepath.Clean(s.dir) {
+		return invalid("does not resolve inside the database directory")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("case-twin journal %q: %w", name, err)
+	}
+	if !info.Mode().IsRegular() {
+		return invalid("is not a regular file")
+	}
+	return path, nil
+}
+
+// CaseTwinRestoreOptions selects what a journal restore does.
+type CaseTwinRestoreOptions struct {
+	// InfoHash restores only that hash's group (any casing); empty means all.
+	InfoHash string
+	// DryRun reports what would be restored or refused and writes nothing.
+	DryRun bool
+	// Force restores a group even when the fence refuses it.
+	Force bool
+}
+
+// Restore actions.
+const (
+	CaseTwinRestoreWouldRestore = "would_restore"
+	CaseTwinRestoreRestored     = "restored"
+	CaseTwinRestoreWouldRefuse  = "would_refuse"
+	CaseTwinRestoreRefused      = "refused"
+	CaseTwinRestoreError        = "error"
+)
+
+// CaseTwinRestoreReport is the outcome of one journal restore, dry or real.
+type CaseTwinRestoreReport struct {
+	Journal      string                 `json:"journal"`
+	DryRun       bool                   `json:"dry_run"`
+	Force        bool                   `json:"force"`
+	Groups       int                    `json:"groups"`
+	Restored     int                    `json:"restored"`
+	Refused      int                    `json:"refused"`
+	Errors       int                    `json:"errors"`
+	RowsRestored int                    `json:"rows_restored"`
+	Results      []CaseTwinRestoreGroup `json:"results"`
+}
+
+// CaseTwinRestoreGroup is one journal group's restore result.
+type CaseTwinRestoreGroup struct {
+	CanonicalKey string   `json:"canonical_key"`
+	Action       string   `json:"action"`
+	Keys         []string `json:"keys"`
+	// Fenced is false for a journal written before merges recorded their version.
+	Fenced bool `json:"fenced"`
+	// Forced: the fence refused this group and Force overrode it.
+	Forced       bool   `json:"forced,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	RowsRestored int    `json:"rows_restored,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// RestoreCaseTwinMergeJournal undoes a merge from the journal named journal
+// (a bare file name in the database directory; see caseTwinJournalPath). For
+// each recorded group, newest first, it removes the merged lowercase row if the
+// merge created it and puts every recorded row back under its original key
+// with its exact original bytes and index attributes.
 //
-// ⚠️ It restores the PRE-MERGE state as is: anything written to those rows
-// since the merge is overwritten. Like the merge, it never calls a provider.
-func (s *Storage) RestoreCaseTwinMergeJournal(path, canonicalKey string) (int, error) {
+// 🛑 FENCED. A group is refused unless the canonical row still carries exactly
+// the version the merge wrote and no recorded legacy key exists again: any
+// write since the merge (a provider switch, a new grab) would otherwise be
+// silently dropped, orphaning a provider copy nobody tracks. Unfenced journals
+// are refused too. Only opts.Force overrides a refusal.
+//
+// Like the merge, it never contacts a provider.
+func (s *Storage) RestoreCaseTwinMergeJournal(journal string, opts CaseTwinRestoreOptions) (*CaseTwinRestoreReport, error) {
+	path, err := s.caseTwinJournalPath(journal)
+	if err != nil {
+		return nil, err
+	}
 	if !s.caseTwinMergeMu.TryLock() {
-		return 0, ErrCaseTwinMergeRunning
+		return nil, ErrCaseTwinMergeRunning
 	}
 	defer s.caseTwinMergeMu.Unlock()
 
 	records, err := readCaseTwinJournal(path)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
+	report := &CaseTwinRestoreReport{Journal: journal, DryRun: opts.DryRun, Force: opts.Force, Results: []CaseTwinRestoreGroup{}}
 	affected := make(map[string]config.Protocol)
-	restored := 0
-	matched := false
+	var runErr error
 	for i := len(records) - 1; i >= 0; i-- {
 		record := records[i]
-		if canonicalKey != "" && record.CanonicalKey != canonicalMainKey(canonicalKey) {
+		if opts.InfoHash != "" && record.CanonicalKey != canonicalMainKey(opts.InfoHash) {
 			continue
 		}
-		matched = true
-		n, err := s.restoreCaseTwinRecord(record, affected)
-		restored += n
-		if err != nil {
-			return restored, err
+		result := s.restoreCaseTwinRecord(record, opts, affected)
+		report.Groups++
+		switch result.Action {
+		case CaseTwinRestoreRestored, CaseTwinRestoreWouldRestore:
+			report.Restored++
+		case CaseTwinRestoreRefused, CaseTwinRestoreWouldRefuse:
+			report.Refused++
+		case CaseTwinRestoreError:
+			report.Errors++
+			runErr = errors.Join(runErr, fmt.Errorf("restore %s: %s", result.CanonicalKey, result.Error))
 		}
+		report.RowsRestored += result.RowsRestored
+		report.Results = append(report.Results, result)
 	}
-	if canonicalKey != "" && !matched {
-		return 0, fmt.Errorf("%w: journal %s holds no group for %s", ErrEntryNotFound, path, canonicalKey)
+	if opts.InfoHash != "" && report.Groups == 0 {
+		return report, fmt.Errorf("%w: journal %s holds no group for %s", ErrEntryNotFound, journal, opts.InfoHash)
 	}
-	if len(affected) > 0 {
+	if !opts.DryRun && len(affected) > 0 {
 		if err := s.rebuildEntryItemsBatch(affected); err != nil {
-			return restored, fmt.Errorf("rebuild derived folder rows after restore: %w", err)
+			runErr = errors.Join(runErr, fmt.Errorf("rebuild derived folder rows after restore: %w", err))
 		}
 	}
-	s.logger.Warn().Str("journal", path).Str("key", canonicalKey).Int("rows", restored).Msg("Restored case-twin rows from merge journal")
-	return restored, nil
+	s.logger.Warn().
+		Str("journal", journal).
+		Str("infohash", opts.InfoHash).
+		Bool("dry_run", opts.DryRun).
+		Bool("force", opts.Force).
+		Int("restored", report.Restored).
+		Int("refused", report.Refused).
+		Int("rows", report.RowsRestored).
+		Msg("Case-twin journal restore finished")
+	return report, runErr
 }
 
-func (s *Storage) restoreCaseTwinRecord(record caseTwinJournalRecord, affected map[string]config.Protocol) (int, error) {
+// restoreCaseTwinRecord checks one group's fence and, unless refused or dry,
+// restores it. The group's mutation stripe is held across check and write, so
+// no writer can slip in between the fence and the restore.
+func (s *Storage) restoreCaseTwinRecord(record caseTwinJournalRecord, opts CaseTwinRestoreOptions, affected map[string]config.Protocol) CaseTwinRestoreGroup {
+	result := CaseTwinRestoreGroup{CanonicalKey: record.CanonicalKey, Fenced: record.MergedGeneration != ""}
+	for _, row := range record.Rows {
+		result.Keys = append(result.Keys, row.Key)
+	}
 	unlock := s.lockEntryMutation(record.CanonicalKey)
 	defer unlock()
 
-	if current, present, err := s.loadCaseTwinRow(record.CanonicalKey); err == nil && present {
+	current, present, loadErr := s.loadCaseTwinRow(record.CanonicalKey)
+	if refusal := s.caseTwinRestoreRefusal(record, current, present, loadErr); refusal != "" {
+		if !opts.Force {
+			result.Action = CaseTwinRestoreRefused
+			if opts.DryRun {
+				result.Action = CaseTwinRestoreWouldRefuse
+			}
+			result.Reason = refusal
+			return result
+		}
+		result.Forced = true
+		result.Reason = "forced past: " + refusal
+	}
+	if opts.DryRun {
+		result.Action = CaseTwinRestoreWouldRestore
+		return result
+	}
+
+	if present {
 		affected[current.folder] = current.entry.Protocol
 	}
 	if !record.CanonicalExisted && s.entries.Exists(record.CanonicalKey) {
 		if err := s.entries.Delete(record.CanonicalKey); err != nil {
-			return 0, fmt.Errorf("remove merged row %s: %w", record.CanonicalKey, err)
+			result.Action, result.Error = CaseTwinRestoreError, fmt.Sprintf("remove merged row %s: %v", record.CanonicalKey, err)
+			return result
 		}
 	}
-	restored := 0
 	for _, row := range record.Rows {
 		if err := s.entries.Put(row.Key, row.Value, &appendstore.PutOptions{Attributes: row.Attributes}); err != nil {
-			return restored, fmt.Errorf("restore row %s: %w", row.Key, err)
+			result.Action, result.Error = CaseTwinRestoreError, fmt.Sprintf("restore row %s: %v", row.Key, err)
+			return result
 		}
 		s.rememberLegacyMainKey(row.Key)
-		restored++
+		result.RowsRestored++
 		var pb EntryProto
 		if proto.Unmarshal(row.Value, &pb) == nil {
 			entry := ProtoToEntry(&pb)
 			affected[entry.GetFolder()] = entry.Protocol
 		}
 	}
-	return restored, nil
+	result.Action = CaseTwinRestoreRestored
+	return result
+}
+
+// caseTwinRestoreRefusal returns why the fence refuses a group, or "".
+func (s *Storage) caseTwinRestoreRefusal(record caseTwinJournalRecord, current *caseTwinStoredRow, present bool, loadErr error) string {
+	if record.MergedGeneration == "" {
+		return "unfenced journal: it was written before merges recorded the version they wrote, so the row cannot be proven unchanged since the merge"
+	}
+	if loadErr != nil {
+		return fmt.Sprintf("the current row %s cannot be read to check the fence: %v", record.CanonicalKey, loadErr)
+	}
+	if !present {
+		return fmt.Sprintf("changed since merge: the merged row %s has been deleted", record.CanonicalKey)
+	}
+	if got, gotRev := current.entry.mainStoreGeneration, current.entry.mainStoreRevision; got != record.MergedGeneration || gotRev != record.MergedRevision {
+		return fmt.Sprintf("changed since merge: the merge wrote version %s/%d, the row now carries %s/%d",
+			record.MergedGeneration, record.MergedRevision, got, gotRev)
+	}
+	for _, row := range record.Rows {
+		if row.Key != record.CanonicalKey && s.entries.Exists(row.Key) {
+			return fmt.Sprintf("changed since merge: key %s exists again", row.Key)
+		}
+	}
+	return ""
 }
 
 func readCaseTwinJournal(path string) ([]caseTwinJournalRecord, error) {

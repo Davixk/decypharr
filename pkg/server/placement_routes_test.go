@@ -28,6 +28,7 @@ func TestPlacementRoutesResolveToTheirOwnPatterns(t *testing.T) {
 		{"POST", "/api/torrents/abc123/switch", "/api/torrents/{hash}/switch"},
 		{"GET", "/api/migrations/job-1", "/api/migrations/{id}"},
 		{"POST", "/api/maintenance/merge-case-twins", "/api/maintenance/merge-case-twins"},
+		{"POST", "/api/maintenance/merge-case-twins/restore", "/api/maintenance/merge-case-twins/restore"},
 		// The whole-entry delete is still where it was, and still distinct.
 		{"DELETE", "/api/torrents/radarr/abc123", "/api/torrents/{category}/{hash}"},
 	}

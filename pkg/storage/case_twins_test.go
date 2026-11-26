@@ -2,8 +2,11 @@ package storage
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -359,12 +362,12 @@ func TestCaseTwinMergeJournalRestoresAGroupByteForByte(t *testing.T) {
 		t.Fatalf("journal = %q with %d rows, want a path and 3 rows (2 twins + 1 singleton)", report.JournalPath, report.JournalRows)
 	}
 
-	restored, err := store.RestoreCaseTwinMergeJournal(report.JournalPath, upper)
+	restore, err := store.RestoreCaseTwinMergeJournal(report.JournalName, CaseTwinRestoreOptions{InfoHash: upper})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	if restored != 2 {
-		t.Fatalf("restored %d rows, want 2", restored)
+	if restore.RowsRestored != 2 || restore.Restored != 1 || restore.Results[0].Action != CaseTwinRestoreRestored || !restore.Results[0].Fenced {
+		t.Fatalf("restore = %+v, want one fenced group with 2 rows restored", restore)
 	}
 	for key, want := range original {
 		got, err := store.entries.Get(key)
@@ -532,4 +535,200 @@ func TestCaseTwinDanglingActiveRowInAnotherFolderIsAConflict(t *testing.T) {
 		t.Fatalf("group = action %q conflicts %v; want one dangling-active conflict", group.Action, group.Conflicts)
 	}
 	assertImageUnchanged(t, before, storeImage(t, store, dir))
+}
+
+// mergedTwinStore merges one twin pair and returns the store, its directory,
+// the journal name, and each row's exact pre-merge bytes.
+func mergedTwinStore(t *testing.T, lower string) (*Storage, string, string, map[string][]byte) {
+	t.Helper()
+	upper := strings.ToUpper(lower)
+	store, dir := openLegacyStore(t, liveUpperTwin(upper), staleLowerTwin(lower))
+	original := make(map[string][]byte)
+	for _, key := range []string{upper, lower} {
+		value, err := store.entries.Get(key)
+		if err != nil {
+			t.Fatalf("read %s: %v", key, err)
+		}
+		original[key] = append([]byte(nil), value...)
+	}
+	report, err := store.MergeCaseTwins(false)
+	if err != nil || report.Merged != 1 || report.JournalName == "" {
+		t.Fatalf("merge = %+v, %v; want one merged group and a journal", report, err)
+	}
+	return store, dir, report.JournalName, original
+}
+
+func assertRowsAreOriginal(t *testing.T, store *Storage, original map[string][]byte) {
+	t.Helper()
+	for key, want := range original {
+		got, err := store.entries.Get(key)
+		if err != nil {
+			t.Fatalf("row %s missing after restore: %v", key, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("row %s differs from its pre-merge bytes", key)
+		}
+	}
+}
+
+// 🛑 THE FENCE. A merged row that gained a placement after the merge (a
+// switch, a new grab) must not be silently rolled back: that would drop the
+// record and orphan a live provider copy. Only force overrides.
+func TestCaseTwinRestoreRefusesARowChangedSinceMergeUnlessForced(t *testing.T) {
+	lower := strings.Repeat("c1", 20)
+	store, dir, journal, original := mergedTwinStore(t, lower)
+	if _, _, err := store.MutateEntryIfPresent(lower, func(entry *Entry) (bool, error) {
+		entry.Providers["tb"] = &ProviderEntry{Provider: "tb", ID: "tb-new", Status: debridTypes.TorrentStatusDownloaded}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("post-merge write: %v", err)
+	}
+	before := storeImage(t, store, dir)
+
+	report, err := store.RestoreCaseTwinMergeJournal(journal, CaseTwinRestoreOptions{})
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if report.Refused != 1 || report.RowsRestored != 0 || report.Results[0].Action != CaseTwinRestoreRefused ||
+		!strings.Contains(report.Results[0].Reason, "changed since merge") {
+		t.Fatalf("restore over a changed row = %+v; want refused: changed since merge", report.Results)
+	}
+	assertImageUnchanged(t, before, storeImage(t, store, dir))
+
+	forced, err := store.RestoreCaseTwinMergeJournal(journal, CaseTwinRestoreOptions{Force: true})
+	if err != nil {
+		t.Fatalf("forced restore: %v", err)
+	}
+	if forced.Restored != 1 || !forced.Results[0].Forced || forced.Results[0].Action != CaseTwinRestoreRestored {
+		t.Fatalf("forced restore = %+v; want restored and marked forced", forced.Results)
+	}
+	assertRowsAreOriginal(t, store, original)
+}
+
+// A merged row deleted since the merge is also "changed since merge".
+func TestCaseTwinRestoreRefusesADeletedMergedRow(t *testing.T) {
+	lower := strings.Repeat("c2", 20)
+	store, _, journal, _ := mergedTwinStore(t, lower)
+	if err := store.Delete(lower); err != nil {
+		t.Fatalf("delete merged row: %v", err)
+	}
+	report, err := store.RestoreCaseTwinMergeJournal(journal, CaseTwinRestoreOptions{})
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if report.Refused != 1 || !strings.Contains(report.Results[0].Reason, "deleted") {
+		t.Fatalf("restore after delete = %+v; want refused", report.Results)
+	}
+	if len(mainKeys(t, store)) != 0 {
+		t.Fatalf("a refused restore wrote rows: %v", mainKeys(t, store))
+	}
+}
+
+// A dry restore reports and writes nothing, whether it would restore or refuse.
+func TestCaseTwinRestoreDryRunWritesNothing(t *testing.T) {
+	lower := strings.Repeat("c3", 20)
+	store, dir, journal, _ := mergedTwinStore(t, lower)
+	before := storeImage(t, store, dir)
+
+	report, err := store.RestoreCaseTwinMergeJournal(journal, CaseTwinRestoreOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry restore: %v", err)
+	}
+	if !report.DryRun || report.Results[0].Action != CaseTwinRestoreWouldRestore || report.RowsRestored != 0 {
+		t.Fatalf("dry restore = %+v; want would_restore and nothing written", report)
+	}
+	assertImageUnchanged(t, before, storeImage(t, store, dir))
+
+	if _, _, err := store.MutateEntryIfPresent(lower, func(entry *Entry) (bool, error) {
+		entry.Category = "changed"
+		return true, nil
+	}); err != nil {
+		t.Fatalf("post-merge write: %v", err)
+	}
+	before = storeImage(t, store, dir)
+	report, err = store.RestoreCaseTwinMergeJournal(journal, CaseTwinRestoreOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("dry restore: %v", err)
+	}
+	if report.Results[0].Action != CaseTwinRestoreWouldRefuse || !strings.Contains(report.Results[0].Reason, "changed since merge") {
+		t.Fatalf("dry restore over a changed row = %+v; want would_refuse", report.Results)
+	}
+	assertImageUnchanged(t, before, storeImage(t, store, dir))
+}
+
+// A journal written before merges recorded their version cannot prove the row
+// is unchanged: refused, with that reason, unless forced.
+func TestCaseTwinRestoreRefusesAnUnfencedJournalUnlessForced(t *testing.T) {
+	lower := strings.Repeat("c4", 20)
+	store, dir, journal, original := mergedTwinStore(t, lower)
+	data, err := os.ReadFile(filepath.Join(dir, journal))
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	var legacy bytes.Buffer
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode journal line: %v", err)
+		}
+		delete(record, "merged_generation")
+		delete(record, "merged_revision")
+		out, _ := json.Marshal(record)
+		legacy.Write(append(out, '\n'))
+	}
+	const legacyName = "case-twin-merge-legacy.jsonl"
+	if err := os.WriteFile(filepath.Join(dir, legacyName), legacy.Bytes(), 0o600); err != nil {
+		t.Fatalf("write legacy journal: %v", err)
+	}
+
+	report, err := store.RestoreCaseTwinMergeJournal(legacyName, CaseTwinRestoreOptions{})
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if report.Refused != 1 || report.Results[0].Fenced || !strings.Contains(report.Results[0].Reason, "unfenced journal") {
+		t.Fatalf("unfenced restore = %+v; want refused as unfenced", report.Results)
+	}
+	forced, err := store.RestoreCaseTwinMergeJournal(legacyName, CaseTwinRestoreOptions{Force: true})
+	if err != nil || forced.Restored != 1 {
+		t.Fatalf("forced unfenced restore = %+v, %v", forced, err)
+	}
+	assertRowsAreOriginal(t, store, original)
+}
+
+// The journal argument is a bare file name in the database directory and
+// nothing else.
+func TestCaseTwinRestoreRejectsJournalNamesOutsideTheDatabase(t *testing.T) {
+	lower := strings.Repeat("c5", 20)
+	store, dir, _, _ := mergedTwinStore(t, lower)
+
+	outside := filepath.Join(t.TempDir(), "case-twin-merge-outside.jsonl")
+	if err := os.WriteFile(outside, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "case-twin-merge-link.jsonl")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	for _, name := range []string{
+		"",
+		"..",
+		"../case-twin-merge-x.jsonl",
+		"sub/case-twin-merge-x.jsonl",
+		`..\case-twin-merge-x.jsonl`,
+		outside,
+		"/etc/passwd",
+		"case-twin-merge-..jsonl",
+		"entries.db",
+		"case-twin-merge-x.json",
+		"case-twin-merge-link.jsonl",
+	} {
+		if _, err := store.RestoreCaseTwinMergeJournal(name, CaseTwinRestoreOptions{Force: true}); !errors.Is(err, ErrInvalidCaseTwinJournal) {
+			t.Errorf("journal name %q returned %v, want ErrInvalidCaseTwinJournal", name, err)
+		}
+	}
+	if _, err := store.RestoreCaseTwinMergeJournal("case-twin-merge-missing.jsonl", CaseTwinRestoreOptions{}); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a well-formed missing journal returned %v, want not-exist", err)
+	}
+	if keys := mainKeys(t, store); len(keys) != 1 || keys[0] != lower {
+		t.Fatalf("a refused journal name changed the store: %v", keys)
+	}
 }

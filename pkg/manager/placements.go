@@ -178,6 +178,19 @@ func (m *Manager) MergeCaseTwins(dryRun bool) (*storage.CaseTwinMergeReport, err
 	return report, err
 }
 
+// RestoreCaseTwinMergeJournal undoes a case-twin merge from its journal
+// (storage.RestoreCaseTwinMergeJournal). It is fenced: a group whose merged
+// row has been written since the merge is refused unless opts.Force. Like the
+// merge it moves records only and NEVER contacts a provider.
+func (m *Manager) RestoreCaseTwinMergeJournal(journal string, opts storage.CaseTwinRestoreOptions) (*storage.CaseTwinRestoreReport, error) {
+	report, err := m.storage.RestoreCaseTwinMergeJournal(journal, opts)
+	if !opts.DryRun && report != nil && report.RowsRestored > 0 {
+		// Cached listings still name the merged keys.
+		m.refreshEntryCache()
+	}
+	return report, err
+}
+
 // DropPlacement removes ONE non-active placement from an entry and releases its
 // provider copy, unless another row still references that copy.
 //
