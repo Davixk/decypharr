@@ -104,8 +104,8 @@ func (s *Server) WebRoutes() http.Handler {
 
 			// Provider placements: see which providers hold an entry, drop ONE
 			// non-active copy, or move the entry to another provider while
-			// keeping its folder (and so every library symlink) intact. Keys are
-			// the exact, case-sensitive infohash from /api/browse.
+			// keeping its folder (and so every library symlink) intact. Keys
+			// resolve case-tolerantly; see storage/case_keys.go.
 			r.Get("/torrents/{hash}/placements", s.handleGetPlacements)
 			r.Delete("/torrents/{hash}/placements/{provider}", s.handleDropPlacement)
 			r.Post("/torrents/{hash}/switch", s.handleSwitchProvider)

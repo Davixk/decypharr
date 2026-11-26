@@ -43,6 +43,7 @@ func (s *Storage) addOrUpdateLocked(entry *Entry) error {
 	previousRevision := entry.mainStoreRevision
 	previousCreatedAt := entry.CreatedAt
 	previousUpdatedAt := entry.UpdatedAt
+	previousInfoHash := entry.InfoHash
 	var previousEntry *Entry
 	committed := false
 	defer func() {
@@ -51,12 +52,19 @@ func (s *Storage) addOrUpdateLocked(entry *Entry) error {
 			entry.mainStoreRevision = previousRevision
 			entry.CreatedAt = previousCreatedAt
 			entry.UpdatedAt = previousUpdatedAt
+			entry.InfoHash = previousInfoHash
 		}
 	}()
 
+	// One hash is one row whatever case it arrives in: a new row is written
+	// under the lowercase key, and an existing row (including an unmerged
+	// legacy uppercase one) is updated in place. See case_keys.go.
+	key := s.resolveMainKey(entry.InfoHash)
+	canonicalizeEntryIdentity(entry, key)
+
 	now := time.Now()
-	if s.entries.Exists(entry.InfoHash) {
-		current, err := s.Get(entry.InfoHash)
+	if s.entries.Exists(key) {
+		current, err := s.Get(key)
 		if err != nil {
 			return err
 		}
@@ -93,7 +101,7 @@ func (s *Storage) addOrUpdateLocked(entry *Entry) error {
 		return fmt.Errorf("failed to marshal entry: %w", err)
 	}
 
-	if err := s.entries.Put(entry.InfoHash, data, entryPutOptions(entry)); err != nil {
+	if err := s.entries.Put(key, data, entryPutOptions(entry)); err != nil {
 		return err
 	}
 	committed = true
@@ -139,10 +147,11 @@ func (s *Storage) MutateEntryIfPresent(infohash string, mutate func(*Entry) (boo
 	unlock := s.lockEntryMutation(infohash)
 	defer unlock()
 
-	if !s.entries.Exists(infohash) {
+	key := s.resolveMainKey(infohash)
+	if !s.entries.Exists(key) {
 		return nil, false, nil
 	}
-	entry, err := s.Get(infohash)
+	entry, err := s.Get(key)
 	if err != nil {
 		return nil, true, err
 	}
@@ -181,10 +190,11 @@ func (s *Storage) MutateEntrySnapshot(snapshot *Entry, mutate func(*Entry) (bool
 	}
 	unlock := s.lockEntryMutation(snapshot.InfoHash)
 	defer unlock()
-	if !s.entries.Exists(snapshot.InfoHash) {
+	key := s.resolveMainKey(snapshot.InfoHash)
+	if !s.entries.Exists(key) {
 		return nil, false, nil
 	}
-	entry, err := s.Get(snapshot.InfoHash)
+	entry, err := s.Get(key)
 	if err != nil {
 		return nil, true, err
 	}
@@ -249,14 +259,16 @@ func (s *Storage) BatchAddOrUpdate(entries []*Entry) error {
 	return errors.Join(errs...)
 }
 
-// Exists checks if an entry exists
+// Exists checks if an entry exists, resolving the hash case-tolerantly
+// (see resolveMainKey).
 func (s *Storage) Exists(infohash string) (bool, error) {
-	return s.entries.Exists(infohash), nil
+	return s.entries.Exists(s.resolveMainKey(infohash)), nil
 }
 
-// Get retrieves an entry by InfoHash
+// Get retrieves an entry by InfoHash, resolving the hash case-tolerantly
+// (see resolveMainKey).
 func (s *Storage) Get(infohash string) (*Entry, error) {
-	data, err := s.entries.Get(infohash)
+	data, err := s.entries.Get(s.resolveMainKey(infohash))
 	if err != nil {
 		return nil, err
 	}
@@ -556,9 +568,10 @@ func (s *Storage) deleteEntryIfCurrent(infohash string, expected *Entry, cleanup
 	unlock := s.lockEntryMutation(infohash)
 	defer unlock()
 
-	entry, err := s.Get(infohash)
+	key := s.resolveMainKey(infohash)
+	entry, err := s.Get(key)
 	if err != nil {
-		if !s.entries.Exists(infohash) {
+		if !s.entries.Exists(key) {
 			return false, nil
 		}
 		return false, err
@@ -574,12 +587,13 @@ func (s *Storage) deleteEntryIfCurrent(infohash string, expected *Entry, cleanup
 	// cannot adopt the resource mid-delete.
 	if cleanup != nil {
 		if err := cleanup(entry); err != nil {
-			return false, fmt.Errorf("cleanup before deleting main entry %s failed: %w", infohash, err)
+			return false, fmt.Errorf("cleanup before deleting main entry %s failed: %w", key, err)
 		}
 	}
-	if err := s.entries.Delete(infohash); err != nil {
+	if err := s.entries.Delete(key); err != nil {
 		return false, err
 	}
+	s.forgetLegacyMainKey(key)
 	s.removeFromEntryItem(entry)
 	return true, nil
 }

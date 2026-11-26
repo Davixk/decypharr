@@ -294,6 +294,8 @@ func (s *Storage) adoptLegacyItemFileDeletions(projections map[string]*entryItem
 func (s *Storage) persistAdoptedFileDeletions(infohash string, fileNames map[string]struct{}) error {
 	unlock := s.lockEntryMutation(infohash)
 	defer unlock()
+	// A file's owning hash may differ in case from its row's key.
+	infohash = s.resolveMainKey(infohash)
 	entry, decodeErr, err := s.loadEntryClassified(s.entries, infohash)
 	if err != nil {
 		return fmt.Errorf("load entry %s for legacy deletion adoption: %w", infohash, err)

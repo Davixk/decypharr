@@ -3,13 +3,16 @@ package manager
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/sirrobot01/appendstore"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
+	"google.golang.org/protobuf/proto"
 )
 
 // dualPlacementEntry is an entry reading from "rd" that still carries an "ad"
@@ -123,10 +126,9 @@ func TestDropPlacementKeepsACopyACaseTwinStillReferences(t *testing.T) {
 	m, ad, rd := placementManager(t)
 	lower := strings.Repeat("e", 40)
 	upper := strings.ToUpper(lower)
-	persistLifecycleEntry(t, m, dualPlacementEntry(lower))
 	twin := lifecycleEntry(upper, "ad", "ad-1") // same AD torrent id
 	twin.Name = "Movie (old name).mkv"
-	persistLifecycleEntry(t, m, twin)
+	withLegacyMainRows(t, m, dualPlacementEntry(lower), twin)
 
 	if err := m.DropPlacement(lower, "ad"); err != nil {
 		t.Fatalf("DropPlacement: %v", err)
@@ -143,8 +145,7 @@ func TestEntryPlacementsReportsCaseTwinsAndAnExactMiss(t *testing.T) {
 	m, _, _ := placementManager(t)
 	lower := strings.Repeat("f", 40)
 	upper := strings.ToUpper(lower)
-	persistLifecycleEntry(t, m, dualPlacementEntry(lower))
-	persistLifecycleEntry(t, m, lifecycleEntry(upper, "ad", "ad-9"))
+	withLegacyMainRows(t, m, dualPlacementEntry(lower), lifecycleEntry(upper, "ad", "ad-9"))
 
 	report, _, err := m.EntryPlacements(lower)
 	if err != nil {
@@ -157,16 +158,61 @@ func TestEntryPlacementsReportsCaseTwinsAndAnExactMiss(t *testing.T) {
 		t.Fatalf("case twins = %+v, want exactly %s", report.CaseTwins, upper)
 	}
 
-	// A caller holding a THIRD casing (say, a normalised id) must be told the
-	// hash exists — not handed a bare "not found" it will read as "gone".
+	// The uppercase twin, addressed by its own key, reports itself and names
+	// the lowercase row — never itself.
+	report, _, err = m.EntryPlacements(upper)
+	if err != nil {
+		t.Fatalf("EntryPlacements(upper): %v", err)
+	}
+	if report.InfoHash != upper || len(report.CaseTwins) != 1 || report.CaseTwins[0].InfoHash != lower {
+		t.Fatalf("upper report = %s twins %+v, want %s with twin %s", report.InfoHash, report.CaseTwins, upper, lower)
+	}
+
+	// A caller holding a THIRD casing (say, a normalised id) resolves to the
+	// lowercase row and is told about the other one, instead of a bare miss.
 	mixed := "F" + lower[1:]
-	_, twins, err := m.EntryPlacements(mixed)
-	if !errors.Is(err, storage.ErrEntryNotFound) {
-		t.Fatalf("lookup of %s returned %v, want ErrEntryNotFound", mixed, err)
+	report, _, err = m.EntryPlacements(mixed)
+	if err != nil {
+		t.Fatalf("lookup of %s returned %v, want the lowercase row", mixed, err)
 	}
-	if len(twins) != 2 {
-		t.Fatalf("a miss reported %d twins, want both rows: %+v", len(twins), twins)
+	if report.InfoHash != lower || len(report.CaseTwins) != 1 || report.CaseTwins[0].InfoHash != upper {
+		t.Fatalf("mixed-case report = %s twins %+v, want %s with twin %s", report.InfoHash, report.CaseTwins, lower, upper)
 	}
+
+	if _, _, err := m.EntryPlacements(strings.Repeat("5", 40)); !errors.Is(err, storage.ErrEntryNotFound) {
+		t.Fatalf("lookup of an absent hash returned %v, want ErrEntryNotFound", err)
+	}
+}
+
+// withLegacyMainRows swaps m's store for one reopened from a database whose
+// main rows were written under their raw keys — exactly how builds before
+// case-canonical keys stored them. It is the only way to create a case twin
+// now that every write resolves to an existing row.
+func withLegacyMainRows(t *testing.T, m *Manager, rows ...*storage.Entry) {
+	t.Helper()
+	dir := t.TempDir()
+	raw, err := appendstore.Open(filepath.Join(dir, "entries.db"), appendstore.Options{})
+	if err != nil {
+		t.Fatalf("open raw entries store: %v", err)
+	}
+	for _, row := range rows {
+		data, err := proto.Marshal(storage.EntryToProto(row))
+		if err != nil {
+			t.Fatalf("marshal legacy row %s: %v", row.InfoHash, err)
+		}
+		if err := raw.Put(row.InfoHash, data, nil); err != nil {
+			t.Fatalf("put legacy row %s: %v", row.InfoHash, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw entries store: %v", err)
+	}
+	reopened, err := storage.NewStorage(dir)
+	if err != nil {
+		t.Fatalf("reopen legacy store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	m.storage = reopened
 }
 
 // After a switch, the target must hold every file the library links to. A

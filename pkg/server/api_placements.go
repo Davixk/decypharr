@@ -14,9 +14,11 @@ import (
 // Provider placement endpoints.
 //
 // These exist for moving a library off a provider without deleting anything the
-// library reads. Every lookup takes the infohash EXACTLY as given: the main store
-// is case-sensitive, so `GET /api/browse/__all__` is the source of truth for the
-// key, and Sonarr/Radarr's uppercase downloadId is not.
+// library reads. Lookups resolve the infohash case-tolerantly (the exact key
+// first, then lowercase, then a legacy variant), so Sonarr/Radarr's uppercase
+// downloadId finds the row. Until the case-twin merge has run, one hash can
+// still have two rows; the report's `infohash` names the row it describes and
+// `case_twins` names the others, which are addressable by their exact key.
 
 // handleGetPlacements serves GET /api/torrents/{hash}/placements.
 func (s *Server) handleGetPlacements(w http.ResponseWriter, r *http.Request) {
@@ -127,12 +129,12 @@ func (s *Server) handleGetMigration(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, job, http.StatusOK)
 }
 
-// writePlacementLookupError answers a miss on an exact key, naming any row that
-// matches only case-insensitively so the caller can retry with the right key.
+// writePlacementLookupError answers a lookup that resolved to no row, naming any
+// row a case-insensitive scan still found so the caller can retry with its key.
 func writePlacementLookupError(w http.ResponseWriter, hash string, twins []manager.CaseTwin, err error) {
 	if errors.Is(err, storage.ErrEntryNotFound) {
 		utils.JSONResponse(w, map[string]any{
-			"error":      "no entry has this exact infohash; keys are case-sensitive",
+			"error":      "no entry has this infohash in any case",
 			"infohash":   hash,
 			"case_twins": twins,
 		}, http.StatusNotFound)

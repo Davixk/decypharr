@@ -48,6 +48,12 @@ type Storage struct {
 	entryItemAliases   map[string]map[string]struct{}
 	entryItemAliasesAt uint64
 	entryItemAliasesOK bool
+
+	// Non-lowercase main-store keys written before keys were case-canonical,
+	// grouped by their lowercase form; see case_keys.go. New writes never add
+	// to it, so it only shrinks as legacy rows are deleted or merged.
+	legacyMainKeysMu sync.Mutex
+	legacyMainKeys   map[string]map[string]struct{}
 }
 
 type keyedLockPool struct {
@@ -87,8 +93,11 @@ func (p *keyedLockPool) lock(key string) func() {
 	}
 }
 
+// lockEntryMutation stripes by the CANONICAL (lowercase) infohash, so every
+// casing of one hash — and with it key resolution, legacy-index maintenance and
+// the case-twin merge — serialises on a single lock.
 func (s *Storage) lockEntryMutation(infohash string) func() {
-	return s.entryMutationLocks.lock(infohash)
+	return s.entryMutationLocks.lock(canonicalMainKey(infohash))
 }
 
 func (s *Storage) lockQueueMutation(infohash string) func() {
@@ -177,6 +186,12 @@ func NewStorage(dbPath string) (*Storage, error) {
 		repairRuns:  itemStores["repair_runs"],
 		dir:         dbPath,
 		logger:      log,
+	}
+	// The legacy-key index must exist before anything resolves a main key,
+	// including the startup migrations below.
+	s.rebuildLegacyMainKeys()
+	if count := s.legacyMainKeyCount(); count > 0 {
+		log.Warn().Int("count", count).Msg("Main store holds non-lowercase legacy keys; they stay reachable, and POST /api/maintenance/merge-case-twins canonicalises them")
 	}
 	// Startup migrations distinguish two failure classes. Per-row corruption
 	// (a record that no longer decodes) is logged and skipped inside each pass
@@ -299,6 +314,8 @@ func (s *Storage) copyFrom(other *Storage) error {
 			return fmt.Errorf("failed to copy %s: %w", p.name, err)
 		}
 	}
+	// Copied keys keep their original case, so legacy keys may have arrived.
+	s.rebuildLegacyMainKeys()
 	_, _, err := s.MigrateStoreVersions()
 	return err
 }

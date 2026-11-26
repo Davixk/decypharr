@@ -21,12 +21,14 @@ import (
 // Migrating a library off a provider needs both: proof of which copies exist,
 // and a way to drop exactly one of them.
 //
-// ⚠️ CASE TWINS. The main store keys rows by the infohash string exactly as it
-// arrived, while the queue store lowercases. One hash seen in two cases is
-// therefore two rows. Every lookup here is EXACT, and the report names any row
-// whose key differs only in case, because a caller holding an uppercase id
-// (Sonarr and Radarr report downloadId in uppercase) can otherwise act on the
-// wrong one without noticing.
+// ⚠️ CASE TWINS. The main store used to key rows by the infohash string exactly
+// as it arrived, so one hash seen in two cases could become two rows. New rows
+// are now written lowercase and lookups resolve case-tolerantly (exact key
+// first, then lowercase, then a legacy variant — see storage/case_keys.go), but
+// twins written before that persist until the operator runs the case-twin
+// merge. The report therefore names every OTHER row whose key equals the
+// reported one case-insensitively, so a caller holding an uppercase id (Sonarr
+// and Radarr report downloadId in uppercase) can see that two rows exist.
 
 var (
 	// ErrPlacementIsActive refuses to drop the placement the entry reads from.
@@ -70,20 +72,22 @@ type CaseTwin struct {
 	ActiveProvider string `json:"active_provider"`
 }
 
-// EntryPlacements reports an entry's placements by EXACT infohash.
+// EntryPlacements reports an entry's placements, resolving the infohash with
+// the store's case-tolerant rule. The report's InfoHash is the key of the row
+// actually reported, and CaseTwins lists every other row of the same hash.
 //
-// When no row has that exact key, the error wraps storage.ErrEntryNotFound and
-// the twins are still returned, so the caller learns that the hash exists under
-// a different case instead of concluding it is gone.
+// When no row resolves, the error wraps storage.ErrEntryNotFound and any twins
+// found by a case-insensitive scan are still returned, so the caller is never
+// told a hash is gone while a row for it exists.
 func (m *Manager) EntryPlacements(infohash string) (*PlacementReport, []CaseTwin, error) {
-	twins := m.caseTwins(infohash)
 	if exists, _ := m.EntryExists(infohash); !exists {
-		return nil, twins, fmt.Errorf("%w: %s", storage.ErrEntryNotFound, infohash)
+		return nil, m.caseTwins(infohash), fmt.Errorf("%w: %s", storage.ErrEntryNotFound, infohash)
 	}
 	entry, err := m.GetEntry(infohash)
 	if err != nil {
-		return nil, twins, err
+		return nil, m.caseTwins(infohash), err
 	}
+	twins := m.caseTwins(entry.InfoHash)
 
 	report := &PlacementReport{
 		InfoHash:       entry.InfoHash,
@@ -141,7 +145,8 @@ func (m *Manager) EntryPlacements(infohash string) (*PlacementReport, []CaseTwin
 	return report, twins, nil
 }
 
-// caseTwins lists rows whose key equals infohash case-insensitively but not exactly.
+// caseTwins lists rows whose key equals infohash case-insensitively but not
+// exactly; pass the reported row's own key so it is not listed as its own twin.
 // It reads metadata only, never a full row.
 func (m *Manager) caseTwins(infohash string) []CaseTwin {
 	var twins []CaseTwin
