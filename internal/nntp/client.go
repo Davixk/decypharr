@@ -61,6 +61,14 @@ type Client struct {
 	// (≈ buffer ÷ RTT), so it must cover the bandwidth-delay product.
 	sockReadBuf  int
 	sockWriteBuf int
+
+	// Pool lifecycle tuning, resolved at construction from DefaultTimeouts
+	// with an optional cfg.Usenet.ConnIdleTimeout override. Kept per-client
+	// (rather than on the package-level timeouts var) so config reloads that
+	// rebuild the client can't race connections still using the old one.
+	idleTimeout    time.Duration // close pooled conns unused for this long
+	staleThreshold time.Duration // verify-ping on checkout after this much inactivity
+	pingInterval   time.Duration // reaper keepalive-ping cadence for idle conns
 }
 
 // SpeedTestResult holds the result of a provider speed test
@@ -78,6 +86,19 @@ type connectionEntry struct {
 	conn     *Connection
 	provider config.UsenetProvider
 	lastUsed time.Time
+	// lastPing is when the reaper last keepalive-pinged this idle entry.
+	// Kept separate from lastUsed so pings keep the session alive without
+	// counting as use — idle expiry stays keyed to real work only.
+	lastPing time.Time
+}
+
+// lastActivity returns the most recent proof the connection was alive:
+// either real use or a successful keepalive ping.
+func (e *connectionEntry) lastActivity() time.Time {
+	if e.lastPing.After(e.lastUsed) {
+		return e.lastPing
+	}
+	return e.lastUsed
 }
 
 var connectionEntryPool = sync.Pool{
@@ -119,21 +140,31 @@ type TimeoutConfig struct {
 	StaleThreshold time.Duration
 	// Close connections idle longer than this
 	IdleTimeout time.Duration
+	// Keepalive-ping idle pooled connections whose last activity (use or
+	// ping) is older than this, instead of letting them go stale
+	PingInterval time.Duration
 	// How often to check for idle connections
 	ReaperInterval time.Duration
 }
 
 // DefaultTimeouts returns production-tuned timeout values.
-// These are aggressive to prevent "connection reset by peer" errors
-// from long-idle connections.
+//
+// IdleTimeout is deliberately long: players read in bursts (fill their
+// buffer, go quiet for tens of seconds, read again), and closing warm
+// connections between bursts forces a TCP+TLS+AUTH reconnect storm on
+// every resume — measured at ~38k reconnects/week in production with the
+// old 20s value. Stale sessions are handled by keepalive DATE pings
+// (PingInterval, in the reaper) plus a verify-ping on checkout
+// (StaleThreshold), not by closing early.
 var DefaultTimeouts = TimeoutConfig{
 	DialTimeout:       10 * time.Second,
 	KeepAlive:         30 * time.Second,
 	HandshakeTimeout:  10 * time.Second,
 	StreamBodyTimeout: 60 * time.Second,
 	PingTimeout:       1500 * time.Millisecond,
-	StaleThreshold:    10 * time.Second,
-	IdleTimeout:       20 * time.Second,
+	StaleThreshold:    60 * time.Second,
+	IdleTimeout:       5 * time.Minute,
+	PingInterval:      30 * time.Second,
 	ReaperInterval:    5 * time.Second,
 }
 
@@ -157,7 +188,7 @@ func normalizeTimeouts(in TimeoutConfig) TimeoutConfig {
 		in.PingTimeout = 1500 * time.Millisecond
 	}
 	if in.IdleTimeout <= 0 {
-		in.IdleTimeout = 20 * time.Second
+		in.IdleTimeout = 5 * time.Minute
 	}
 	// Keep stale checks meaningful: stale must be >0 and below idle timeout.
 	if in.StaleThreshold <= 0 || in.StaleThreshold >= in.IdleTimeout {
@@ -165,6 +196,10 @@ func normalizeTimeouts(in TimeoutConfig) TimeoutConfig {
 		if in.StaleThreshold <= 0 {
 			in.StaleThreshold = 10 * time.Second
 		}
+	}
+	// Keepalive pings must fire well inside the idle window to be useful.
+	if in.PingInterval <= 0 || in.PingInterval >= in.IdleTimeout {
+		in.PingInterval = min(30*time.Second, in.IdleTimeout/2)
 	}
 	if in.ReaperInterval <= 0 {
 		in.ReaperInterval = 5 * time.Second
@@ -217,6 +252,24 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		speedTestResults: xsync.NewMap[string, SpeedTestResult](),
 		sockReadBuf:      parseSockBuf(cfg.Usenet.SocketReadBuffer),
 		sockWriteBuf:     parseSockBuf(cfg.Usenet.SocketWriteBuffer),
+		idleTimeout:      timeouts.IdleTimeout,
+		staleThreshold:   timeouts.StaleThreshold,
+		pingInterval:     timeouts.PingInterval,
+	}
+	if cfg.Usenet.ConnIdleTimeout != "" {
+		if d, err := utils.ParseDuration(cfg.Usenet.ConnIdleTimeout); err != nil || d <= 0 {
+			cm.logger.Warn().Str("conn_idle_timeout", cfg.Usenet.ConnIdleTimeout).
+				Msg("invalid conn_idle_timeout, using default")
+		} else {
+			cm.idleTimeout = d
+			// Keep the derived thresholds inside the configured window.
+			if cm.staleThreshold >= cm.idleTimeout {
+				cm.staleThreshold = cm.idleTimeout / 2
+			}
+			if cm.pingInterval >= cm.idleTimeout {
+				cm.pingInterval = cm.idleTimeout / 2
+			}
+		}
 	}
 	cm.repairPool = cm.newRepairPool(cfg.Repair.NNTPConnectionPercent)
 
@@ -288,9 +341,10 @@ func (c *Client) isHealthy(entry *connectionEntry) bool {
 	if entry.conn.IsClosed() {
 		return false
 	}
-	// Check if already closed/expired (though normally caught by reaper)
-	// Or check stale threshold
-	if time.Since(entry.lastUsed) > timeouts.StaleThreshold {
+	// Verify with a ping if we haven't heard from this connection recently.
+	// A successful reaper keepalive counts as activity, so freshly-pinged
+	// connections skip the extra checkout round-trip.
+	if time.Since(entry.lastActivity()) > lifetimeOr(c.staleThreshold, timeouts.StaleThreshold) {
 		if err := entry.conn.ping(); err != nil {
 			return false
 		}
@@ -298,11 +352,23 @@ func (c *Client) isHealthy(entry *connectionEntry) bool {
 	return true
 }
 
-func isIdleExpired(lastUsed time.Time, now time.Time) bool {
+// lifetimeOr returns a per-client pool lifetime value, falling back to the
+// package default when the Client was built without NewClient (a zero idle
+// timeout would otherwise expire every pooled connection on checkout).
+func lifetimeOr(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return def
+}
+
+// isIdleExpired reports whether a pooled connection has gone unused (by
+// real work, not keepalive pings) long enough to close.
+func (c *Client) isIdleExpired(lastUsed time.Time, now time.Time) bool {
 	if lastUsed.IsZero() {
 		return false
 	}
-	return now.Sub(lastUsed) > timeouts.IdleTimeout
+	return now.Sub(lastUsed) > lifetimeOr(c.idleTimeout, timeouts.IdleTimeout)
 }
 
 // ExecuteWithFailover executes an operation with automatic provider failover and retry logic.
@@ -798,7 +864,7 @@ func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, prov
 			pp.mu.Unlock()
 
 			now := utils.Now()
-			if isIdleExpired(entry.lastUsed, now) {
+			if c.isIdleExpired(entry.lastUsed, now) {
 				conn := entry.conn
 				releaseConnectionEntry(entry)
 				_ = conn.Close()
@@ -1007,38 +1073,80 @@ func (c *Client) reaper() {
 func (c *Client) reapIdleConnections() {
 	now := utils.Now()
 	for _, pp := range c.pools {
+		var toClose, toPing []*connectionEntry
+
 		pp.mu.Lock()
-
-		// LIFO Stack: Oldest (least recently used) items are at index 0.
-		// Find first non-expired connection; all after it are newer and valid.
-		expiredCount := 0
+		kept := pp.conns[:0]
 		for _, entry := range pp.conns {
-			if isIdleExpired(entry.lastUsed, now) {
-				_ = entry.conn.Close()
-				expiredCount++
-			} else {
-				// Found a valid one - stop here
-				break
+			switch {
+			case c.isIdleExpired(entry.lastUsed, now):
+				toClose = append(toClose, entry)
+			case now.Sub(entry.lastActivity()) > lifetimeOr(c.pingInterval, timeouts.PingInterval):
+				// Candidate for a keepalive ping. Take a connection slot so
+				// the provider's total stays capped while the entry is out of
+				// the pool being pinged — otherwise a checkout burst could
+				// dial replacements and briefly exceed max_connections. If no
+				// slot is free the pool is busy and the conn will either be
+				// used (real activity) or expire soon; skip this sweep.
+				select {
+				case pp.slots <- struct{}{}:
+					toPing = append(toPing, entry)
+				default:
+					kept = append(kept, entry)
+				}
+			default:
+				kept = append(kept, entry)
 			}
 		}
-
-		// Remove expired connections from the front of the slice
-		if expiredCount > 0 {
-			for i := 0; i < expiredCount; i++ {
-				releaseConnectionEntry(pp.conns[i])
-			}
-			// Shift remaining items to front
-			remaining := len(pp.conns) - expiredCount
-			copy(pp.conns, pp.conns[expiredCount:])
-			// Nil out trailing pointers to help GC
-			for i := remaining; i < len(pp.conns); i++ {
-				pp.conns[i] = nil
-			}
-			pp.conns = pp.conns[:remaining]
+		// Nil out trailing pointers to help GC
+		for i := len(kept); i < len(pp.conns); i++ {
+			pp.conns[i] = nil
 		}
-
+		pp.conns = kept
 		pp.mu.Unlock()
+
+		for _, entry := range toClose {
+			conn := entry.conn
+			releaseConnectionEntry(entry)
+			_ = conn.Close()
+		}
+		// Ping outside the pool lock — a DATE round-trip per connection must
+		// not block checkouts.
+		for _, entry := range toPing {
+			c.keepAlive(pp, entry, now)
+		}
 	}
+}
+
+// keepAlive pings an idle connection that was removed from the pool (with a
+// slot held) and returns it on success. Failed pings close the connection —
+// exactly the sessions the old aggressive idle timeout existed to avoid
+// handing out, caught here without sacrificing the warm pool.
+func (c *Client) keepAlive(pp *ProviderPool, entry *connectionEntry, now time.Time) {
+	discard := func() {
+		conn := entry.conn
+		releaseConnectionEntry(entry)
+		_ = conn.Close()
+		<-pp.slots // Release slot
+	}
+
+	if err := entry.conn.ping(); err != nil {
+		c.logger.Debug().Err(err).Str("provider", entry.provider.Host).
+			Msg("keepalive ping failed, closing idle connection")
+		discard()
+		return
+	}
+	entry.lastPing = now
+
+	pp.mu.Lock()
+	if c.closed.Load() || len(pp.conns) >= pp.max {
+		pp.mu.Unlock()
+		discard()
+		return
+	}
+	pp.conns = append(pp.conns, entry)
+	pp.mu.Unlock()
+	<-pp.slots // Release slot - connection is available again
 }
 
 // Stats returns current pool statistics

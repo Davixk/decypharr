@@ -110,6 +110,23 @@ Lower `priority` = higher preference.
 
 Prefetch buffer for smoother playback. Higher = smoother but more memory.
 
+### Connection Idle Timeout
+
+```json
+{
+  "usenet": {
+    "conn_idle_timeout": "5m"
+  }
+}
+```
+
+How long unused NNTP connections stay warm in the pool before being closed
+(default: `5m`). Idle connections are kept healthy with periodic keepalive
+pings and verified before reuse. Players read in bursts with quiet gaps in
+between, so closing connections too early forces a TCP+TLS+AUTH reconnect
+on every resume — visible as playback stutter. Lower this only if your
+provider aggressively drops idle sessions.
+
 ### Processing Limits
 
 ```json
