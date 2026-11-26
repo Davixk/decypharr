@@ -20,7 +20,7 @@ RUN apk add --no-cache clang21=21.1.2-r2 lld21=21.1.2-r1 && \
     xx-apk add --no-cache \
         gcc=15.2.0-r2 \
         g++=15.2.0-r2 \
-        musl-dev=1.2.5-r23 \
+        musl-dev=1.2.5-r24 \
         fuse-dev=2.9.9-r7
 
 COPY go.mod go.sum ./
@@ -72,14 +72,18 @@ LABEL org.opencontainers.image.documentation="https://github.com/sirrobot01/decy
 #
 #   docker run --rm alpine:3.23@<digest> sh -c \
 #     'apk update >/dev/null; apk policy ca-certificates fuse fuse3 rclone shadow su-exec tzdata'
+#
+# 🔴 THE BUILDER STAGE'S PINS ROT TOO, AND CI'S CACHE HIDES IT. Query its base the same
+# way (clang21 lld21 gcc g++ musl-dev fuse-dev). A cached builder layer lets CI pass
+# with dead pins until the cache is evicted; a cold `docker build` is the honest check.
 RUN apk add --no-cache \
-        ca-certificates=20260909-r0 \
+        ca-certificates=20261020-r0 \
         fuse=2.9.9-r7 \
         fuse3=3.18.3-r0 \
         rclone=1.72.1-r4 \
         shadow=4.18.0-r0 \
         su-exec=0.3-r0 \
-        tzdata=2026d-r0 && \
+        tzdata=2026f-r0 && \
     echo "user_allow_other" >> /etc/fuse.conf
 
 # Copy binaries and entrypoint
