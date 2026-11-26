@@ -6,10 +6,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sirrobot01/appendstore"
+	"github.com/sirrobot01/decypharr/internal/config"
+	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"google.golang.org/protobuf/proto"
@@ -347,6 +350,116 @@ func assertPlacements(t *testing.T, m *Manager, hash string, want ...string) {
 	for _, w := range want {
 		if !got[w] {
 			t.Fatalf("%s placements = %v, want %v", hash, got, want)
+		}
+	}
+}
+
+// forbiddenProviderClient fails the test on ANY call: every interface method is
+// either overridden to record and fail, or reaches the nil embedded Client and
+// panics. The merge must never touch a provider.
+type forbiddenProviderClient struct {
+	debrid.Client
+	t     *testing.T
+	name  string
+	calls atomic.Int32
+}
+
+func (c *forbiddenProviderClient) forbid(method string) {
+	c.calls.Add(1)
+	c.t.Errorf("the case-twin merge called %s on provider %s; it must never contact a provider", method, c.name)
+}
+
+func (c *forbiddenProviderClient) SubmitMagnet(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
+	c.forbid("SubmitMagnet")
+	return nil, errors.New("forbidden")
+}
+func (c *forbiddenProviderClient) CheckStatus(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
+	c.forbid("CheckStatus")
+	return nil, errors.New("forbidden")
+}
+func (c *forbiddenProviderClient) DeleteTorrent(string) error {
+	c.forbid("DeleteTorrent")
+	return errors.New("forbidden")
+}
+func (c *forbiddenProviderClient) UpdateTorrent(*debridTypes.Torrent) error {
+	c.forbid("UpdateTorrent")
+	return errors.New("forbidden")
+}
+func (c *forbiddenProviderClient) GetTorrent(string) (*debridTypes.Torrent, error) {
+	c.forbid("GetTorrent")
+	return nil, errors.New("forbidden")
+}
+func (c *forbiddenProviderClient) GetTorrents() ([]*debridTypes.Torrent, error) {
+	c.forbid("GetTorrents")
+	return nil, errors.New("forbidden")
+}
+func (c *forbiddenProviderClient) GetAllTorrents() ([]*debridTypes.Torrent, error) {
+	c.forbid("GetAllTorrents")
+	return nil, errors.New("forbidden")
+}
+func (c *forbiddenProviderClient) GetDownloadLink(string, *debridTypes.File) (debridTypes.DownloadLink, error) {
+	c.forbid("GetDownloadLink")
+	return debridTypes.DownloadLink{}, errors.New("forbidden")
+}
+func (c *forbiddenProviderClient) Config() config.Debrid {
+	c.forbid("Config")
+	return config.Debrid{Name: c.name}
+}
+
+// 🛑 THE MERGE MOVES RECORDS ONLY. Even with a shared AD copy, an extra RD copy
+// and a removed twin, no provider is contacted, dry run or real.
+func TestMergeCaseTwinsMakesNoProviderCalls(t *testing.T) {
+	m := newProviderLifecycleManager(t)
+	ad := &forbiddenProviderClient{t: t, name: "ad"}
+	rd := &forbiddenProviderClient{t: t, name: "rd"}
+	m.clients.Store("ad", ad)
+	m.clients.Store("rd", rd)
+
+	lower := strings.Repeat("3", 39) + "a"
+	upper := strings.ToUpper(lower)
+	stale := dualPlacementEntry(lower) // rd active + the shared ad copy
+	stale.ActiveProvider = ""
+	stale.Name = "Movie (old name).mkv"
+	withLegacyMainRows(t, m, lifecycleEntry(upper, "ad", "ad-1"), stale)
+
+	for _, dryRun := range []bool{true, false} {
+		report, err := m.MergeCaseTwins(dryRun)
+		if err != nil {
+			t.Fatalf("MergeCaseTwins(dry_run=%v): %v", dryRun, err)
+		}
+		if report.Merged != 1 {
+			t.Fatalf("MergeCaseTwins(dry_run=%v) merged %d groups, want 1: %+v", dryRun, report.Merged, report.Results)
+		}
+	}
+	if calls := ad.calls.Load() + rd.calls.Load(); calls != 0 {
+		t.Fatalf("the merge made %d provider call(s)", calls)
+	}
+	assertPlacements(t, m, lower, "ad", "rd")
+}
+
+// After the merge there is one row, every casing reaches it, and it reports no
+// twins.
+func TestEntryPlacementsAfterMergeReportsNoTwins(t *testing.T) {
+	m, _, _ := placementManager(t)
+	lower := strings.Repeat("4", 39) + "f"
+	upper := strings.ToUpper(lower)
+	stale := lifecycleEntry(upper, "ad", "ad-1")
+	stale.ActiveProvider = ""
+	withLegacyMainRows(t, m, dualPlacementEntry(lower), stale)
+
+	if report, _, err := m.EntryPlacements(upper); err != nil || len(report.CaseTwins) != 1 {
+		t.Fatalf("before the merge, %s = %+v, %v; want one twin reported", upper, report, err)
+	}
+	if _, err := m.MergeCaseTwins(false); err != nil {
+		t.Fatalf("MergeCaseTwins: %v", err)
+	}
+	for _, key := range []string{lower, upper} {
+		report, twins, err := m.EntryPlacements(key)
+		if err != nil {
+			t.Fatalf("EntryPlacements(%s): %v", key, err)
+		}
+		if report.InfoHash != lower || len(report.CaseTwins) != 0 || len(twins) != 0 {
+			t.Fatalf("after merge, %s reported %s with twins %+v; want %s and none", key, report.InfoHash, report.CaseTwins, lower)
 		}
 	}
 }

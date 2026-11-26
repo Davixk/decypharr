@@ -129,6 +129,48 @@ func (s *Server) handleGetMigration(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, job, http.StatusOK)
 }
 
+// handleMergeCaseTwins serves POST /api/maintenance/merge-case-twins.
+//
+// dry_run DEFAULTS TO TRUE: a bare POST only reports. A real run requires an
+// explicit dry_run=false (also 0/no/off). Anything unrecognised is refused
+// rather than read as either, so a typo cannot start a real run. The real
+// run's report names the journal that RestoreCaseTwinMergeJournal can undo it
+// from. It never contacts a provider.
+func (s *Server) handleMergeCaseTwins(w http.ResponseWriter, r *http.Request) {
+	dryRun, ok := parseMergeDryRun(r.URL.Query().Get("dry_run"))
+	if !ok {
+		http.Error(w, "dry_run must be true or false", http.StatusBadRequest)
+		return
+	}
+	if !dryRun {
+		s.logger.Warn().Msg("Case-twin merge started via the API (real run)")
+	}
+	report, err := s.manager.MergeCaseTwins(dryRun)
+	if err != nil {
+		if errors.Is(err, storage.ErrCaseTwinMergeRunning) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		s.logger.Error().Err(err).Bool("dry_run", dryRun).Msg("Case-twin merge failed")
+		utils.JSONResponse(w, map[string]any{"error": err.Error(), "report": report}, http.StatusInternalServerError)
+		return
+	}
+	utils.JSONResponse(w, report, http.StatusOK)
+}
+
+// parseMergeDryRun reads dry_run, defaulting to TRUE. Only an explicit false
+// selects a real run; an unrecognised value is rejected (ok=false).
+func parseMergeDryRun(raw string) (dryRun, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
+	default:
+		return true, false
+	}
+}
+
 // writePlacementLookupError answers a lookup that resolved to no row, naming any
 // row a case-insensitive scan still found so the caller can retry with its key.
 func writePlacementLookupError(w http.ResponseWriter, hash string, twins []manager.CaseTwin, err error) {

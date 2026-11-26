@@ -111,6 +111,12 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Post("/torrents/{hash}/switch", s.handleSwitchProvider)
 			r.Get("/migrations/{id}", s.handleGetMigration)
 
+			// One-time case-twin merge -- an OPERATOR action, never run at
+			// startup. dry_run defaults to TRUE (report only, writes nothing);
+			// a real run needs dry_run=false and journals every row it changes.
+			// It moves records only and never contacts a provider.
+			r.Post("/maintenance/merge-case-twins", s.handleMergeCaseTwins)
+
 			// Browse - WebDAV-style hierarchical file browser
 			r.Route("/browse", func(r chi.Router) {
 				// Hierarchical browse endpoints

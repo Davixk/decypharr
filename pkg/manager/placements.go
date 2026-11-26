@@ -160,6 +160,24 @@ func (m *Manager) caseTwins(infohash string) []CaseTwin {
 	return twins
 }
 
+// MergeCaseTwins runs the one-time case-twin merge (storage.MergeCaseTwins):
+// every hash still stored under a non-lowercase key is folded into one
+// lowercase row, keeping the survivor's folder. With dryRun nothing is written.
+//
+// 🛑 OPERATOR ACTION ONLY, and it NEVER contacts a provider. It moves records
+// between rows; no placement is released, so no reference check is needed.
+// Placements are unioned onto the survivor before a twin is deleted, which is
+// why it does not need copyEntryMu either: a release scan running on another
+// hash can never see a copy with fewer referencing rows than before.
+func (m *Manager) MergeCaseTwins(dryRun bool) (*storage.CaseTwinMergeReport, error) {
+	report, err := m.storage.MergeCaseTwins(dryRun)
+	if !dryRun && report != nil && (report.Merged > 0 || report.Rekeyed > 0) {
+		// Cached listings still name the removed keys.
+		m.refreshEntryCache()
+	}
+	return report, err
+}
+
 // DropPlacement removes ONE non-active placement from an entry and releases its
 // provider copy, unless another row still references that copy.
 //

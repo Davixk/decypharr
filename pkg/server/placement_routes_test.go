@@ -27,6 +27,7 @@ func TestPlacementRoutesResolveToTheirOwnPatterns(t *testing.T) {
 		{"DELETE", "/api/torrents/abc123/placements/AllDebrid", "/api/torrents/{hash}/placements/{provider}"},
 		{"POST", "/api/torrents/abc123/switch", "/api/torrents/{hash}/switch"},
 		{"GET", "/api/migrations/job-1", "/api/migrations/{id}"},
+		{"POST", "/api/maintenance/merge-case-twins", "/api/maintenance/merge-case-twins"},
 		// The whole-entry delete is still where it was, and still distinct.
 		{"DELETE", "/api/torrents/radarr/abc123", "/api/torrents/{category}/{hash}"},
 	}
@@ -34,6 +35,33 @@ func TestPlacementRoutesResolveToTheirOwnPatterns(t *testing.T) {
 		rctx := chi.NewRouteContext()
 		if got := mux.Find(rctx, tc.method, tc.path); got != tc.wantPattern {
 			t.Errorf("%s %s resolved to %q, want %q", tc.method, tc.path, got, tc.wantPattern)
+		}
+	}
+}
+
+// 🛑 The case-twin merge rewrites production rows, so ONLY an explicit false may
+// start a real run. A bare POST, and anything unrecognised, must not.
+func TestMergeCaseTwinsDryRunDefaultsToTrue(t *testing.T) {
+	cases := []struct {
+		raw        string
+		wantDryRun bool
+		wantOK     bool
+	}{
+		{"", true, true},
+		{"true", true, true},
+		{" TRUE ", true, true},
+		{"1", true, true},
+		{"false", false, true},
+		{"False", false, true},
+		{"0", false, true},
+		{"off", false, true},
+		{"flase", true, false},
+		{"maybe", true, false},
+	}
+	for _, tc := range cases {
+		dryRun, ok := parseMergeDryRun(tc.raw)
+		if dryRun != tc.wantDryRun || ok != tc.wantOK {
+			t.Errorf("dry_run=%q parsed as (dry %v, ok %v), want (dry %v, ok %v)", tc.raw, dryRun, ok, tc.wantDryRun, tc.wantOK)
 		}
 	}
 }

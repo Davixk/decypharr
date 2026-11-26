@@ -54,6 +54,9 @@ type Storage struct {
 	// to it, so it only shrinks as legacy rows are deleted or merged.
 	legacyMainKeysMu sync.Mutex
 	legacyMainKeys   map[string]map[string]struct{}
+
+	// caseTwinMergeMu admits one case-twin merge or journal restore at a time.
+	caseTwinMergeMu sync.Mutex
 }
 
 type keyedLockPool struct {
